@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package sluice.internal.v1;
+
+option go_package = "github.com/day253/sluice/pkg/grpc/v1;grpcv1";
+
+// ---------------------------------------------------------------------------
+// SluiceInternal — node-to-node streaming for high throughput
+//
+// Only the leader exposes this service.  Worker nodes connect to the
+// leader to batch-claim tasks and receive allocation push updates.
+// ---------------------------------------------------------------------------
+
+service SluiceInternal {
+  // ClaimStream is the hot path for task processing.  Workers on ANY node
+  // open a bidirectional stream to the leader and send individual claim
+  // requests.  The leader accumulates for a configurable batch window
+  // (default 5 ms), then commits the entire batch as a single Raft log
+  // entry.  Claimed tasks are streamed back to the caller.
+  //
+  // This reduces Raft Apply calls from O(tasks) to O(batches).
+  rpc ClaimStream(stream ClaimRequest) returns (stream ClaimBatch);
+
+  // ResultStream batches task completions.  Workers stream completion
+  // events to the leader, which commits them as a single Raft entry per
+  // batch window.
+  rpc ResultStream(stream ResultRequest) returns (stream ResultBatch);
+
+  // AllocationPush replaces polling.  Nodes subscribe and the leader
+  // pushes allocation plans whenever they change.
+  rpc AllocationPush(AllocationSubscribe) returns (stream AllocationPlan);
+}
+
+// ---------------------------------------------------------------------------
+// ClaimStream
+// ---------------------------------------------------------------------------
+
+message ClaimRequest {
+  string task_id   = 1;
+  string tenant_id = 2;
+  string node_id   = 3;
+  bytes  payload   = 4;
+}
+
+message ClaimBatch {
+  repeated string task_ids    = 1;  // successfully claimed
+  repeated string failed_ids  = 2;  // already claimed by another node
+}
+
+// ---------------------------------------------------------------------------
+// ResultStream
+// ---------------------------------------------------------------------------
+
+message ResultRequest {
+  string task_id   = 1;
+  string tenant_id = 2;
+  string status    = 3;  // "done" or "failed"
+  string result    = 4;
+  string error     = 5;
+}
+
+message ResultBatch {
+  repeated string committed_ids = 1;
+}
+
+// ---------------------------------------------------------------------------
+// AllocationPush
+// ---------------------------------------------------------------------------
+
+message AllocationSubscribe {
+  string node_id = 1;  // which node is subscribing
+}
+
+message TenantWorkerCount {
+  string tenant_id = 1;
+  int32  workers   = 2;
+}
+
+message AllocationPlan {
+  string node_id = 1;  // which node this allocation is for
+  repeated TenantWorkerCount tenants = 2;
+}

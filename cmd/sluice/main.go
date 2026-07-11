@@ -23,6 +23,7 @@ var (
 	nodeID       = flag.String("id", "node-1", "Unique node identifier")
 	httpAddr     = flag.String("http", "127.0.0.1:8080", "HTTP API listen address")
 	grpcAddr     = flag.String("grpc", "127.0.0.1:9090", "gRPC listen address (empty to disable)")
+	grpcInternal = flag.String("grpc-internal", "127.0.0.1:9091", "Internal gRPC (empty to disable)")
 	raftAddr     = flag.String("raft", "127.0.0.1:7000", "Raft transport address")
 	dataDir      = flag.String("data", "./data", "Data directory")
 	bootstrap    = flag.Bool("bootstrap", false, "Bootstrap a new single-node cluster")
@@ -54,8 +55,9 @@ func main() {
 	cfg := node.Config{
 		NodeID:       *nodeID,
 		HTTPAddress:  *httpAddr,
-		GRPCAddress:  *grpcAddr,
-		RaftAddress:  *raftAddr,
+		GRPCAddress:         *grpcAddr,
+		GRPCInternalAddress: *grpcInternal,
+		RaftAddress:         *raftAddr,
 		DataDir:      *dataDir,
 		Bootstrap:    *bootstrap,
 		JoinAddress:  *joinAddr,

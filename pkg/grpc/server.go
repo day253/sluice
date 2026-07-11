@@ -58,3 +58,25 @@ func (s *Server) Stop() {
 func (s *Server) Addr() string {
 	return s.addr
 }
+
+// NewInternalServer creates a gRPC server for the internal node-to-node
+// streaming service (ClaimStream, ResultStream, AllocationPush).
+func NewInternalServer(addr string, svc *InternalService, logger *zap.Logger) (*Server, error) {
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("grpc internal listen %s: %w", addr, err)
+	}
+
+	srv := grpc.NewServer(
+		grpc.MaxConcurrentStreams(4096),
+	)
+
+	grpcv1.RegisterSluiceInternalServer(srv, svc)
+
+	return &Server{
+		listener: lis,
+		srv:      srv,
+		logger:   logger,
+		addr:     addr,
+	}, nil
+}

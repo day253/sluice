@@ -61,10 +61,14 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		return f.applyNodeDown(cmd.Data)
 	case OpClaimTask:
 		return f.applyClaimTask(cmd.Data)
+	case OpClaimBatch:
+		return f.applyClaimBatch(cmd.Data)
 	case OpCompleteTask:
 		return f.applyCompleteTask(cmd.Data)
 	case OpFailTask:
 		return f.applyFailTask(cmd.Data)
+	case OpCompleteBatch:
+		return f.applyCompleteBatch(cmd.Data)
 	case OpUpdateAllocation:
 		return f.applyUpdateAllocation(cmd.Data)
 	default:
@@ -269,6 +273,70 @@ func (f *FSM) applyFailTask(data json.RawMessage) interface{} {
 		Status:      types.TaskStatusFailed,
 		Error:       req.Error,
 		CompletedAt: time.Now().UTC(),
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Batch operations (streaming internal API)
+// ---------------------------------------------------------------------------
+
+func (f *FSM) applyClaimBatch(data json.RawMessage) interface{} {
+	var req ClaimBatchData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+
+	result := &ClaimBatchResult{
+		Claimed: make([]string, 0, len(req.Tasks)),
+		Failed:  make([]string, 0),
+	}
+
+	now := time.Now().UTC()
+	for _, t := range req.Tasks {
+		if existing, ok := f.state.Tasks[t.TaskID]; ok {
+			if existing.Status == types.TaskStatusInflight {
+				result.Failed = append(result.Failed, t.TaskID)
+				continue
+			}
+			// Recovery-pending → reclaim.
+			existing.Status = types.TaskStatusInflight
+			existing.NodeID = t.NodeID
+			existing.ClaimedAt = now
+			existing.Payload = t.Payload
+			result.Claimed = append(result.Claimed, t.TaskID)
+			continue
+		}
+		// Fresh claim.
+		f.state.Tasks[t.TaskID] = &types.TaskRecord{
+			TaskID:    t.TaskID,
+			TenantID:  t.TenantID,
+			Status:    types.TaskStatusInflight,
+			NodeID:    t.NodeID,
+			Payload:   t.Payload,
+			CreatedAt: now,
+			ClaimedAt: now,
+		}
+		result.Claimed = append(result.Claimed, t.TaskID)
+	}
+	return result
+}
+
+func (f *FSM) applyCompleteBatch(data json.RawMessage) interface{} {
+	var req CompleteBatchData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, t := range req.Tasks {
+		delete(f.state.Tasks, t.TaskID)
+		f.state.Results[t.TaskID] = &types.TaskResult{
+			TaskID:      t.TaskID,
+			TenantID:    t.TenantID,
+			Status:      types.TaskStatusDone,
+			Result:      t.Result,
+			CompletedAt: now,
+		}
 	}
 	return nil
 }

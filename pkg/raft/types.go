@@ -11,6 +11,8 @@ const (
 	OpClaimTask        = "claim_task"
 	OpCompleteTask     = "complete_task"
 	OpFailTask         = "fail_task"
+	OpClaimBatch       = "claim_batch"
+	OpCompleteBatch    = "complete_batch"
 	OpUpdateAllocation = "update_allocation"
 )
 
@@ -47,6 +49,24 @@ type CompleteTaskData struct {
 // DeleteTenantData is the payload for OpDeleteTenant.
 type DeleteTenantData struct {
 	ID string `json:"id"`
+}
+
+// ClaimBatchData is the payload for OpClaimBatch — claims multiple tasks
+// in a single Raft log entry.
+type ClaimBatchData struct {
+	Tasks []ClaimTaskData `json:"tasks"`
+}
+
+// CompleteBatchData is the payload for OpCompleteBatch — completes
+// multiple tasks in a single Raft log entry.
+type CompleteBatchData struct {
+	Tasks []CompleteTaskData `json:"tasks"`
+}
+
+// ClaimBatchResult is returned by OpClaimBatch.
+type ClaimBatchResult struct {
+	Claimed []string `json:"claimed"`  // task IDs successfully claimed
+	Failed  []string `json:"failed"`   // task IDs that were duplicate/already claimed
 }
 
 // NodeDownData is the payload for OpNodeDown.

@@ -30,8 +30,9 @@ import (
 type Config struct {
 	NodeID       string
 	HTTPAddress  string
-	GRPCAddress  string // gRPC listen address (empty = no gRPC)
-	RaftAddress  string
+	GRPCAddress         string // gRPC listen address (empty = no gRPC)
+	GRPCInternalAddress string // internal gRPC (empty = no internal gRPC)
+	RaftAddress         string
 	DataDir      string
 	Bootstrap    bool
 	JoinAddress  string // HTTP address of an existing node to join
@@ -53,8 +54,10 @@ type Node struct {
 	allocEngine *allocator.Engine
 	tenantMgr   *tenant.Manager
 	apiServer   *api.Server
-	grpcServer  *grpcpkg.Server
-	handler     *api.Handler
+	grpcServer         *grpcpkg.Server
+	grpcInternalServer *grpcpkg.Server
+	grpcInternalSvc    *grpcpkg.InternalService
+	handler            *api.Handler
 
 	// cancellation
 	ctx    context.Context
@@ -149,7 +152,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	)
 	n.apiServer = api.NewServer(cfg.HTTPAddress, n.handler, logger)
 
-	// ---- 8. gRPC server ----
+	// ---- 8. gRPC server (external) ----
 	if cfg.GRPCAddress != "" {
 		grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(),
 			&raftApplierBridge{cluster: cluster}, pool, logger)
@@ -159,6 +162,20 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 			_ = cluster.Shutdown()
 			_ = q.Close()
 			return nil, fmt.Errorf("grpc server: %w", err)
+		}
+	}
+
+	// ---- 9. gRPC internal server (node-to-node streaming) ----
+	if cfg.GRPCInternalAddress != "" {
+		n.grpcInternalSvc = grpcpkg.NewInternalService(cfg.NodeID, cluster.FSM(),
+			&raftApplierBridge{cluster: cluster}, logger)
+		n.grpcInternalServer, err = grpcpkg.NewInternalServer(
+			cfg.GRPCInternalAddress, n.grpcInternalSvc, logger)
+		if err != nil {
+			cancel()
+			_ = cluster.Shutdown()
+			_ = q.Close()
+			return nil, fmt.Errorf("grpc internal server: %w", err)
 		}
 	}
 
@@ -208,6 +225,16 @@ func (n *Node) Start() error {
 		}()
 	}
 
+	// ---- 5c. Start internal gRPC server ----
+	var grpcInternalErrCh <-chan error
+	if n.grpcInternalServer != nil {
+		ch := make(chan error, 1)
+		grpcInternalErrCh = ch
+		go func() {
+			ch <- n.grpcInternalServer.Start()
+		}()
+	}
+
 	// ---- 6. Wait for shutdown signal ----
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -228,6 +255,10 @@ func (n *Node) Start() error {
 	case err := <-grpcErrCh:
 		if err != nil {
 			n.logger.Error("grpc server error", zap.Error(err))
+		}
+	case err := <-grpcInternalErrCh:
+		if err != nil {
+			n.logger.Error("grpc internal server error", zap.Error(err))
 		}
 	case <-n.ctx.Done():
 		n.logger.Info("context cancelled, shutting down")
@@ -250,9 +281,12 @@ func (n *Node) Shutdown(timeout time.Duration) error {
 
 	var errs []error
 
-	// 1. Stop gRPC server first (clients get fast feedback).
+	// 1. Stop gRPC servers first.
 	if n.grpcServer != nil {
 		n.grpcServer.Stop()
+	}
+	if n.grpcInternalServer != nil {
+		n.grpcInternalServer.Stop()
 	}
 
 	// 2. Stop HTTP server.
