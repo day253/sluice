@@ -96,6 +96,11 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 	// ---- 3. Local durable queue ----
 	qPath := cfg.DataDir + "/queue"
+	if err := os.MkdirAll(qPath, 0o755); err != nil {
+		cancel()
+		_ = cluster.Shutdown()
+		return nil, fmt.Errorf("create queue dir: %w", err)
+	}
 	q, err := queue.NewBoltQueue(qPath+"/queue.db", logger)
 	if err != nil {
 		cancel()
@@ -249,6 +254,12 @@ func (n *Node) Shutdown(timeout time.Duration) error {
 
 // watchLeadership tracks Raft leadership changes and notifies the allocator.
 func (n *Node) watchLeadership() {
+	// LeaderCh() only fires on state changes — check initial state first.
+	if n.raftCluster.IsLeader() {
+		n.allocEngine.SetLeader(true)
+		_ = n.allocEngine.ReconcileNow()
+	}
+
 	ch := n.raftCluster.LeaderCh()
 	for {
 		select {
@@ -260,7 +271,6 @@ func (n *Node) watchLeadership() {
 			}
 			n.allocEngine.SetLeader(isLeader)
 			if isLeader {
-				// Immediately reconcile when we become leader.
 				_ = n.allocEngine.ReconcileNow()
 			}
 		}

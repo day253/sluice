@@ -158,7 +158,7 @@ func TestPoolShutdown_DrainsGracefully(t *testing.T) {
 
 	// Slow processor that does NOT respond to cancellation (simulates
 	// a task that must complete).
-	proc := &slowProcessor{delay: 300 * time.Millisecond, ignoreCancel: true}
+	proc := &slowProcessor{delay: 500 * time.Millisecond, ignoreCancel: true}
 	pool := NewPool("n1", q, fsm, raft, proc, zap.NewNop())
 
 	q.Enqueue("a", &queue.TaskEnvelope{TaskID: "slow", TenantID: "a", Payload: json.RawMessage(`{}`)})
@@ -171,7 +171,7 @@ func TestPoolShutdown_DrainsGracefully(t *testing.T) {
 		t.Errorf("shutdown: %v", err)
 	}
 	elapsed := time.Since(start)
-	if elapsed < 200*time.Millisecond {
+	if elapsed < 350*time.Millisecond {
 		t.Errorf("shutdown too fast (%v), should have waited for task", elapsed)
 	}
 }
