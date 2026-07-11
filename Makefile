@@ -1,16 +1,13 @@
-.PHONY: all build test clean deps run-dev run-node1 run-node2 run-node3
+.PHONY: all build test bench clean deps run-dev run-node1 run-node2 run-node3
 
-APP     := rate-limiter
-CMD_DIR := ./cmd/rate-limiter
+APP     := sluice
+CMD_DIR := ./cmd/sluice
 BUILD   := CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/$(APP)
 
 all: build
 
 # ---- Dependencies ----
 deps:
-	@export PATH=$(HOME)/go/bin:$$PATH && \
-	export GOROOT=$(HOME)/go && \
-	export GOPATH=$(HOME)/go/packages && \
 	go mod tidy
 
 # ---- Build ----
@@ -20,10 +17,11 @@ build:
 
 # ---- Test ----
 test:
-	@export PATH=$(HOME)/go/bin:$$PATH && \
-	export GOROOT=$(HOME)/go && \
-	export GOPATH=$(HOME)/go/packages && \
 	go test -v -race -count=1 ./...
+
+# ---- Benchmarks ----
+bench:
+	go test -bench=. -benchtime=1s -benchmem ./pkg/...
 
 # ---- Run (development single-node) ----
 run-dev: build
