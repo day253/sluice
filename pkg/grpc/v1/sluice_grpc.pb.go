@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             v3.21.12
-// source: proto/sluice.proto
+// source: sluice.proto
 
 package grpcv1
 
@@ -27,35 +27,29 @@ const (
 	Sluice_ListTenants_FullMethodName   = "/sluice.v1.Sluice/ListTenants"
 	Sluice_ClusterStatus_FullMethodName = "/sluice.v1.Sluice/ClusterStatus"
 	Sluice_Health_FullMethodName        = "/sluice.v1.Sluice/Health"
-	Sluice_SubmitBatch_FullMethodName   = "/sluice.v1.Sluice/SubmitBatch"
 )
 
 // SluiceClient is the client API for Sluice service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type SluiceClient interface {
-	// Submit a task and receive its result via server-side streaming.
-	// The server streams status updates (pending → inflight → done/failed)
-	// then closes the stream on completion.
-	Submit(ctx context.Context, in *SubmitRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SubmitEvent], error)
+	// Submit a task.  Returns immediately with task_id + status=pending.
+	Submit(ctx context.Context, in *SubmitRequest, opts ...grpc.CallOption) (*SubmitResponse, error)
 	// Get the current status of a task.
 	GetTask(ctx context.Context, in *GetTaskRequest, opts ...grpc.CallOption) (*TaskStatus, error)
-	// Wait for a task to complete (long-polling equivalent).
-	// Returns immediately if already done; blocks with periodic updates otherwise.
-	WaitTask(ctx context.Context, in *WaitTaskRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SubmitEvent], error)
+	// Wait for a task to complete (blocking).  Returns the final status
+	// or DeadlineExceeded on timeout.
+	WaitTask(ctx context.Context, in *WaitTaskRequest, opts ...grpc.CallOption) (*TaskStatus, error)
 	// Admin: upsert a tenant configuration.
 	UpsertTenant(ctx context.Context, in *UpsertTenantRequest, opts ...grpc.CallOption) (*UpsertTenantResponse, error)
 	// Admin: delete a tenant.
 	DeleteTenant(ctx context.Context, in *DeleteTenantRequest, opts ...grpc.CallOption) (*DeleteTenantResponse, error)
-	// Admin: list all tenants.
+	// Admin: list all tenants with inflight counts.
 	ListTenants(ctx context.Context, in *ListTenantsRequest, opts ...grpc.CallOption) (*ListTenantsResponse, error)
-	// Admin: list cluster nodes and allocations.
+	// Admin: cluster nodes and allocations.
 	ClusterStatus(ctx context.Context, in *ClusterStatusRequest, opts ...grpc.CallOption) (*ClusterStatusResponse, error)
 	// Health check.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
-	// Bidirectional streaming for high-throughput task submission.
-	// Clients stream tasks in; server streams results back as they complete.
-	SubmitBatch(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SubmitRequest, SubmitEvent], error)
 }
 
 type sluiceClient struct {
@@ -66,24 +60,15 @@ func NewSluiceClient(cc grpc.ClientConnInterface) SluiceClient {
 	return &sluiceClient{cc}
 }
 
-func (c *sluiceClient) Submit(ctx context.Context, in *SubmitRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SubmitEvent], error) {
+func (c *sluiceClient) Submit(ctx context.Context, in *SubmitRequest, opts ...grpc.CallOption) (*SubmitResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Sluice_ServiceDesc.Streams[0], Sluice_Submit_FullMethodName, cOpts...)
+	out := new(SubmitResponse)
+	err := c.cc.Invoke(ctx, Sluice_Submit_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[SubmitRequest, SubmitEvent]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
+	return out, nil
 }
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Sluice_SubmitClient = grpc.ServerStreamingClient[SubmitEvent]
 
 func (c *sluiceClient) GetTask(ctx context.Context, in *GetTaskRequest, opts ...grpc.CallOption) (*TaskStatus, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -95,24 +80,15 @@ func (c *sluiceClient) GetTask(ctx context.Context, in *GetTaskRequest, opts ...
 	return out, nil
 }
 
-func (c *sluiceClient) WaitTask(ctx context.Context, in *WaitTaskRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SubmitEvent], error) {
+func (c *sluiceClient) WaitTask(ctx context.Context, in *WaitTaskRequest, opts ...grpc.CallOption) (*TaskStatus, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Sluice_ServiceDesc.Streams[1], Sluice_WaitTask_FullMethodName, cOpts...)
+	out := new(TaskStatus)
+	err := c.cc.Invoke(ctx, Sluice_WaitTask_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[WaitTaskRequest, SubmitEvent]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
+	return out, nil
 }
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Sluice_WaitTaskClient = grpc.ServerStreamingClient[SubmitEvent]
 
 func (c *sluiceClient) UpsertTenant(ctx context.Context, in *UpsertTenantRequest, opts ...grpc.CallOption) (*UpsertTenantResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -164,45 +140,27 @@ func (c *sluiceClient) Health(ctx context.Context, in *HealthRequest, opts ...gr
 	return out, nil
 }
 
-func (c *sluiceClient) SubmitBatch(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[SubmitRequest, SubmitEvent], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Sluice_ServiceDesc.Streams[2], Sluice_SubmitBatch_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[SubmitRequest, SubmitEvent]{ClientStream: stream}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Sluice_SubmitBatchClient = grpc.BidiStreamingClient[SubmitRequest, SubmitEvent]
-
 // SluiceServer is the server API for Sluice service.
 // All implementations must embed UnimplementedSluiceServer
 // for forward compatibility.
 type SluiceServer interface {
-	// Submit a task and receive its result via server-side streaming.
-	// The server streams status updates (pending → inflight → done/failed)
-	// then closes the stream on completion.
-	Submit(*SubmitRequest, grpc.ServerStreamingServer[SubmitEvent]) error
+	// Submit a task.  Returns immediately with task_id + status=pending.
+	Submit(context.Context, *SubmitRequest) (*SubmitResponse, error)
 	// Get the current status of a task.
 	GetTask(context.Context, *GetTaskRequest) (*TaskStatus, error)
-	// Wait for a task to complete (long-polling equivalent).
-	// Returns immediately if already done; blocks with periodic updates otherwise.
-	WaitTask(*WaitTaskRequest, grpc.ServerStreamingServer[SubmitEvent]) error
+	// Wait for a task to complete (blocking).  Returns the final status
+	// or DeadlineExceeded on timeout.
+	WaitTask(context.Context, *WaitTaskRequest) (*TaskStatus, error)
 	// Admin: upsert a tenant configuration.
 	UpsertTenant(context.Context, *UpsertTenantRequest) (*UpsertTenantResponse, error)
 	// Admin: delete a tenant.
 	DeleteTenant(context.Context, *DeleteTenantRequest) (*DeleteTenantResponse, error)
-	// Admin: list all tenants.
+	// Admin: list all tenants with inflight counts.
 	ListTenants(context.Context, *ListTenantsRequest) (*ListTenantsResponse, error)
-	// Admin: list cluster nodes and allocations.
+	// Admin: cluster nodes and allocations.
 	ClusterStatus(context.Context, *ClusterStatusRequest) (*ClusterStatusResponse, error)
 	// Health check.
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
-	// Bidirectional streaming for high-throughput task submission.
-	// Clients stream tasks in; server streams results back as they complete.
-	SubmitBatch(grpc.BidiStreamingServer[SubmitRequest, SubmitEvent]) error
 	mustEmbedUnimplementedSluiceServer()
 }
 
@@ -213,14 +171,14 @@ type SluiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedSluiceServer struct{}
 
-func (UnimplementedSluiceServer) Submit(*SubmitRequest, grpc.ServerStreamingServer[SubmitEvent]) error {
-	return status.Error(codes.Unimplemented, "method Submit not implemented")
+func (UnimplementedSluiceServer) Submit(context.Context, *SubmitRequest) (*SubmitResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Submit not implemented")
 }
 func (UnimplementedSluiceServer) GetTask(context.Context, *GetTaskRequest) (*TaskStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTask not implemented")
 }
-func (UnimplementedSluiceServer) WaitTask(*WaitTaskRequest, grpc.ServerStreamingServer[SubmitEvent]) error {
-	return status.Error(codes.Unimplemented, "method WaitTask not implemented")
+func (UnimplementedSluiceServer) WaitTask(context.Context, *WaitTaskRequest) (*TaskStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method WaitTask not implemented")
 }
 func (UnimplementedSluiceServer) UpsertTenant(context.Context, *UpsertTenantRequest) (*UpsertTenantResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpsertTenant not implemented")
@@ -236,9 +194,6 @@ func (UnimplementedSluiceServer) ClusterStatus(context.Context, *ClusterStatusRe
 }
 func (UnimplementedSluiceServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Health not implemented")
-}
-func (UnimplementedSluiceServer) SubmitBatch(grpc.BidiStreamingServer[SubmitRequest, SubmitEvent]) error {
-	return status.Error(codes.Unimplemented, "method SubmitBatch not implemented")
 }
 func (UnimplementedSluiceServer) mustEmbedUnimplementedSluiceServer() {}
 func (UnimplementedSluiceServer) testEmbeddedByValue()                {}
@@ -261,16 +216,23 @@ func RegisterSluiceServer(s grpc.ServiceRegistrar, srv SluiceServer) {
 	s.RegisterService(&Sluice_ServiceDesc, srv)
 }
 
-func _Sluice_Submit_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(SubmitRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
+func _Sluice_Submit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubmitRequest)
+	if err := dec(in); err != nil {
+		return nil, err
 	}
-	return srv.(SluiceServer).Submit(m, &grpc.GenericServerStream[SubmitRequest, SubmitEvent]{ServerStream: stream})
+	if interceptor == nil {
+		return srv.(SluiceServer).Submit(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Sluice_Submit_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SluiceServer).Submit(ctx, req.(*SubmitRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Sluice_SubmitServer = grpc.ServerStreamingServer[SubmitEvent]
 
 func _Sluice_GetTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetTaskRequest)
@@ -290,16 +252,23 @@ func _Sluice_GetTask_Handler(srv interface{}, ctx context.Context, dec func(inte
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Sluice_WaitTask_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(WaitTaskRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
+func _Sluice_WaitTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WaitTaskRequest)
+	if err := dec(in); err != nil {
+		return nil, err
 	}
-	return srv.(SluiceServer).WaitTask(m, &grpc.GenericServerStream[WaitTaskRequest, SubmitEvent]{ServerStream: stream})
+	if interceptor == nil {
+		return srv.(SluiceServer).WaitTask(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Sluice_WaitTask_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SluiceServer).WaitTask(ctx, req.(*WaitTaskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Sluice_WaitTaskServer = grpc.ServerStreamingServer[SubmitEvent]
 
 func _Sluice_UpsertTenant_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(UpsertTenantRequest)
@@ -391,13 +360,6 @@ func _Sluice_Health_Handler(srv interface{}, ctx context.Context, dec func(inter
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Sluice_SubmitBatch_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(SluiceServer).SubmitBatch(&grpc.GenericServerStream[SubmitRequest, SubmitEvent]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Sluice_SubmitBatchServer = grpc.BidiStreamingServer[SubmitRequest, SubmitEvent]
-
 // Sluice_ServiceDesc is the grpc.ServiceDesc for Sluice service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -406,8 +368,16 @@ var Sluice_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*SluiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
+			MethodName: "Submit",
+			Handler:    _Sluice_Submit_Handler,
+		},
+		{
 			MethodName: "GetTask",
 			Handler:    _Sluice_GetTask_Handler,
+		},
+		{
+			MethodName: "WaitTask",
+			Handler:    _Sluice_WaitTask_Handler,
 		},
 		{
 			MethodName: "UpsertTenant",
@@ -430,23 +400,6 @@ var Sluice_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Sluice_Health_Handler,
 		},
 	},
-	Streams: []grpc.StreamDesc{
-		{
-			StreamName:    "Submit",
-			Handler:       _Sluice_Submit_Handler,
-			ServerStreams: true,
-		},
-		{
-			StreamName:    "WaitTask",
-			Handler:       _Sluice_WaitTask_Handler,
-			ServerStreams: true,
-		},
-		{
-			StreamName:    "SubmitBatch",
-			Handler:       _Sluice_SubmitBatch_Handler,
-			ServerStreams: true,
-			ClientStreams: true,
-		},
-	},
-	Metadata: "proto/sluice.proto",
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "sluice.proto",
 }

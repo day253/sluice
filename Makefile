@@ -21,10 +21,10 @@ test:
 
 # ---- Proto ----
 proto:
-	protoc --go_out=pkg/grpc/v1 --go_opt=paths=source_relative \
-		--go-grpc_out=pkg/grpc/v1 --go-grpc_opt=paths=source_relative \
+	protoc -I proto \
+		--go_out=. --go_opt=module=github.com/day253/sluice \
+		--go-grpc_out=. --go-grpc_opt=module=github.com/day253/sluice \
 		proto/sluice.proto proto/sluice_internal.proto
-	rm -rf pkg/grpc/v1/proto  # protoc may create extra subdir
 
 # ---- Benchmarks ----
 bench:

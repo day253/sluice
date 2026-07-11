@@ -59,7 +59,7 @@ func (h *Handler) submitTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event, err := h.svc.SubmitSync(r.Context(), &grpcv1.SubmitRequest{
+	resp, err := h.svc.Submit(r.Context(), &grpcv1.SubmitRequest{
 		TenantId: req.TenantID, Payload: req.Payload,
 		IdempotencyKey: req.IdempotencyKey,
 	})
@@ -69,7 +69,7 @@ func (h *Handler) submitTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.writeJSON(w, http.StatusAccepted, types.TaskResponse{
-		TaskID: event.TaskId, TenantID: event.TenantId, Status: event.Status,
+		TaskID: resp.TaskId, TenantID: resp.TenantId, Status: resp.Status,
 	})
 }
 
@@ -95,21 +95,16 @@ func (h *Handler) waitTask(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	event, err := h.svc.WaitTaskSync(r.Context(), &grpcv1.WaitTaskRequest{
+	resp, err := h.svc.WaitTask(r.Context(), &grpcv1.WaitTaskRequest{
 		TaskId: taskID, TimeoutSeconds: timeout,
 	})
 	if err != nil {
 		h.writeGRPCError(w, err)
 		return
 	}
-	// writeGRPCError already handles DeadlineExceeded → 408
-	if event == nil {
-		h.writeError(w, http.StatusRequestTimeout, "timeout waiting for task")
-		return
-	}
 	h.writeJSON(w, http.StatusOK, types.TaskResponse{
-		TaskID: event.TaskId, TenantID: event.TenantId,
-		Status: event.Status, Result: event.Result, Error: event.Error,
+		TaskID: resp.TaskId, TenantID: resp.TenantId,
+		Status: resp.Status, Result: resp.Result, Error: resp.Error,
 	})
 }
 
