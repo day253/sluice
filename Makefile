@@ -34,7 +34,7 @@ bench:
 run-dev: build
 	./bin/$(APP) \
 		--id=node-1 \
-		--http=127.0.0.1:8080 \
+		--api=127.0.0.1:8080 \
 		--raft=127.0.0.1:7000 \
 		--data=./data/node-1 \
 		--bootstrap \
@@ -45,7 +45,7 @@ run-dev: build
 run-node1: build
 	./bin/$(APP) \
 		--id=node-1 \
-		--http=127.0.0.1:8081 \
+		--api=127.0.0.1:8081 \
 		--raft=127.0.0.1:7001 \
 		--data=./data/node-1 \
 		--bootstrap \
@@ -54,7 +54,7 @@ run-node1: build
 run-node2: build
 	./bin/$(APP) \
 		--id=node-2 \
-		--http=127.0.0.1:8082 \
+		--api=127.0.0.1:8082 \
 		--raft=127.0.0.1:7002 \
 		--data=./data/node-2 \
 		--workers=50
@@ -62,7 +62,7 @@ run-node2: build
 run-node3: build
 	./bin/$(APP) \
 		--id=node-3 \
-		--http=127.0.0.1:8083 \
+		--api=127.0.0.1:8083 \
 		--raft=127.0.0.1:7003 \
 		--data=./data/node-3 \
 		--workers=50

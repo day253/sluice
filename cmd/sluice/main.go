@@ -21,13 +21,11 @@ import (
 
 var (
 	nodeID       = flag.String("id", "node-1", "Unique node identifier")
-	httpAddr     = flag.String("http", "127.0.0.1:8080", "HTTP API listen address")
-	grpcAddr     = flag.String("grpc", "127.0.0.1:9090", "gRPC listen address (empty to disable)")
-	grpcInternal = flag.String("grpc-internal", "127.0.0.1:9091", "Internal gRPC (empty to disable)")
+	apiAddr      = flag.String("api", "127.0.0.1:9090", "API listen address (cmux: HTTP+gRPC single port)")
 	raftAddr     = flag.String("raft", "127.0.0.1:7000", "Raft transport address")
 	dataDir      = flag.String("data", "./data", "Data directory")
 	bootstrap    = flag.Bool("bootstrap", false, "Bootstrap a new single-node cluster")
-	joinAddr     = flag.String("join", "", "HTTP address of an existing node to join")
+	joinAddr     = flag.String("join", "", "Address of an existing node to join")
 	totalWorkers = flag.Int("workers", 100, "Total worker capacity on this node")
 	logLevel     = flag.String("log-level", "info", "Log level: debug, info, warn, error")
 )
@@ -45,7 +43,7 @@ func main() {
 	// Print startup banner.
 	logger.Info("distributed-rate-limiting starting",
 		zap.String("id", *nodeID),
-		zap.String("http", *httpAddr),
+		zap.String("api", *apiAddr),
 		zap.String("raft", *raftAddr),
 		zap.Bool("bootstrap", *bootstrap),
 		zap.Int("workers", *totalWorkers),
@@ -54,10 +52,8 @@ func main() {
 	// ---- Build node config ----
 	cfg := node.Config{
 		NodeID:       *nodeID,
-		HTTPAddress:  *httpAddr,
-		GRPCAddress:         *grpcAddr,
-		GRPCInternalAddress: *grpcInternal,
-		RaftAddress:         *raftAddr,
+		APIAddress:   *apiAddr,
+		RaftAddress:  *raftAddr,
 		DataDir:      *dataDir,
 		Bootstrap:    *bootstrap,
 		JoinAddress:  *joinAddr,

@@ -38,6 +38,15 @@ func NewServer(addr string, handler *Handler, logger *zap.Logger) *Server {
 	}
 }
 
+// NewRouter creates a configured HTTP router for use with cmux or httptest.
+func NewRouter(handler *Handler) *mux.Router {
+	router := mux.NewRouter()
+	router.Use(loggingMiddleware(zap.NewNop()))
+	router.Use(recoveryMiddleware(zap.NewNop()))
+	handler.RegisterRoutes(router)
+	return router
+}
+
 // Start begins listening and serving.  It blocks until the server is stopped
 // via Shutdown or an error occurs.
 func (s *Server) Start() error {

@@ -91,7 +91,7 @@ func newTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster 
 	// ---- Create node 0 (bootstrap) ----
 	node0, err := node.New(node.Config{
 		NodeID:       "node-0",
-		HTTPAddress:  tc.httpAddrs[0],
+		APIAddress: tc.httpAddrs[0],
 		RaftAddress:  tc.raftAddrs[0],
 		DataDir:      tc.dirs[0],
 		Bootstrap:    true,
@@ -116,7 +116,7 @@ func newTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster 
 		nodeID := fmt.Sprintf("node-%d", i)
 		nd, err := node.New(node.Config{
 			NodeID:       nodeID,
-			HTTPAddress:  tc.httpAddrs[i],
+			APIAddress: tc.httpAddrs[i],
 			RaftAddress:  tc.raftAddrs[i],
 			DataDir:      tc.dirs[i],
 			Bootstrap:    false,
