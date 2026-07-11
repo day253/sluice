@@ -31,7 +31,7 @@ import (
 
 // testCluster holds all the state needed for a multi-node integration test.
 type testCluster struct {
-	t       *testing.T
+	tb      testing.TB
 	nodes   []*node.Node
 	dirs    []string
 	raftAddrs []string
@@ -44,16 +44,17 @@ type testCluster struct {
 
 // newTestCluster creates n nodes connected in a single Raft cluster.
 // Node 0 bootstraps; nodes 1..n-1 join by being added as voters on the
-// leader once it is elected.
-func newTestCluster(t *testing.T, n int, totalWorkersPerNode int) *testCluster {
-	t.Helper()
+// leader once it is elected.  Accepts testing.TB so both *testing.T and
+// *testing.B can use it.
+func newTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster {
+	tb.Helper()
 
 	if n < 1 {
-		t.Fatal("cluster must have at least 1 node")
+		tb.Fatal("cluster must have at least 1 node")
 	}
 
 	tc := &testCluster{
-		t:       t,
+		tb:      tb,
 		nodes:   make([]*node.Node, n),
 		dirs:    make([]string, n),
 		raftAddrs: make([]string, n),
@@ -68,21 +69,21 @@ func newTestCluster(t *testing.T, n int, totalWorkersPerNode int) *testCluster {
 	for i := 0; i < n; i++ {
 		raftL, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
-			t.Fatalf("allocate raft port: %v", err)
+			tb.Fatalf("allocate raft port: %v", err)
 		}
 		tc.raftAddrs[i] = raftL.Addr().String()
 		raftL.Close()
 
 		httpL, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
-			t.Fatalf("allocate http port: %v", err)
+			tb.Fatalf("allocate http port: %v", err)
 		}
 		tc.httpAddrs[i] = httpL.Addr().String()
 		httpL.Close()
 
 		dir, err := os.MkdirTemp("", "rl-int-*")
 		if err != nil {
-			t.Fatalf("temp dir: %v", err)
+			tb.Fatalf("temp dir: %v", err)
 		}
 		tc.dirs[i] = dir
 	}
@@ -97,7 +98,7 @@ func newTestCluster(t *testing.T, n int, totalWorkersPerNode int) *testCluster {
 		TotalWorkers: totalWorkersPerNode,
 	}, tc.proc, logger)
 	if err != nil {
-		t.Fatalf("create node-0: %v", err)
+		tb.Fatalf("create node-0: %v", err)
 	}
 	tc.nodes[0] = node0
 
@@ -122,14 +123,14 @@ func newTestCluster(t *testing.T, n int, totalWorkersPerNode int) *testCluster {
 			TotalWorkers: totalWorkersPerNode,
 		}, tc.proc, logger)
 		if err != nil {
-			t.Fatalf("create node-%d: %v", i, err)
+			tb.Fatalf("create node-%d: %v", i, err)
 		}
 		tc.nodes[i] = nd
 
 		// Add as voter through the leader.
 		tc.waitLeader(0, 5*time.Second)
 		if err := node0.RaftCluster().AddVoter(nodeID, tc.raftAddrs[i]); err != nil {
-			t.Fatalf("add voter %s: %v", nodeID, err)
+			tb.Fatalf("add voter %s: %v", nodeID, err)
 		}
 
 		// Register the node in the FSM from the LEADER (raft.Apply
@@ -140,7 +141,7 @@ func newTestCluster(t *testing.T, n int, totalWorkersPerNode int) *testCluster {
 			TotalWorkers: totalWorkersPerNode,
 		})
 		if err := node0.RaftCluster().GetRaft().Apply(cmd, 5*time.Second).Error(); err != nil {
-			t.Fatalf("register %s: %v", nodeID, err)
+			tb.Fatalf("register %s: %v", nodeID, err)
 		}
 
 		// Now start the node — WaitForLeader should succeed quickly
@@ -193,7 +194,7 @@ func (tc *testCluster) waitAnyLeader(timeout time.Duration) int {
 		return false
 	}, timeout, "any node becomes leader")
 	if !found {
-		tc.t.Fatal("no leader found")
+		tc.tb.Fatal("no leader found")
 	}
 	return leaderIdx
 }
@@ -246,7 +247,7 @@ func (tc *testCluster) waitFor(fn func() bool, timeout time.Duration, desc strin
 		}
 		select {
 		case <-deadline:
-			tc.t.Fatalf("timed out waiting for: %s", desc)
+			tc.tb.Fatalf("timed out waiting for: %s", desc)
 		case <-tick.C:
 		}
 	}
@@ -255,13 +256,13 @@ func (tc *testCluster) waitFor(fn func() bool, timeout time.Duration, desc strin
 // addTenant upserts a tenant through node 0 and waits for it to appear in the
 // FSM of every node.
 func (tc *testCluster) addTenant(id string, maxWorkers int) {
-	tc.t.Helper()
+	tc.tb.Helper()
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpUpsertTenant, types.TenantConfig{
 		ID: id, Name: id, MaxWorkers: maxWorkers,
 	})
 	result := tc.nodes[0].RaftCluster().GetRaft().Apply(cmd, 5*time.Second)
 	if err := result.Error(); err != nil {
-		tc.t.Fatalf("addTenant %s: %v", id, err)
+		tc.tb.Fatalf("addTenant %s: %v", id, err)
 	}
 	// Give the allocator time to react.
 	time.Sleep(500 * time.Millisecond)
@@ -270,7 +271,7 @@ func (tc *testCluster) addTenant(id string, maxWorkers int) {
 // submitTask enqueues a task to a specific node's local queue and returns
 // the task ID.  It does NOT go through the HTTP API.
 func (tc *testCluster) submitTask(nodeIdx int, tenantID string, payload string) string {
-	tc.t.Helper()
+	tc.tb.Helper()
 	taskID := fmt.Sprintf("task-%s-%d-%d", tenantID, nodeIdx, time.Now().UnixNano())
 
 	env := &queue.TaskEnvelope{
@@ -280,7 +281,7 @@ func (tc *testCluster) submitTask(nodeIdx int, tenantID string, payload string) 
 		CreatedAt: time.Now(),
 	}
 	if err := tc.nodes[nodeIdx].Queue().Enqueue(tenantID, env); err != nil {
-		tc.t.Fatalf("submit task: %v", err)
+		tc.tb.Fatalf("submit task: %v", err)
 	}
 	return taskID
 }
@@ -301,11 +302,11 @@ func (tc *testCluster) waitProcessed(n int, timeout time.Duration) {
 
 // killNode shuts down a node (simulating a crash).
 func (tc *testCluster) killNode(i int) {
-	tc.t.Helper()
+	tc.tb.Helper()
 	if tc.nodes[i] == nil {
 		return
 	}
-	tc.t.Logf("killing node-%d", i)
+	tc.tb.Logf("killing node-%d", i)
 	_ = tc.nodes[i].Shutdown(2 * time.Second)
 	tc.nodes[i] = nil
 }
@@ -317,7 +318,7 @@ func (tc *testCluster) fsms() *raftpkg.FSM {
 			return nd.RaftCluster().FSM()
 		}
 	}
-	tc.t.Fatal("no running node available")
+	tc.tb.Fatal("no running node available")
 	return nil
 }
 

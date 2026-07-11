@@ -104,3 +104,21 @@ func benchDistribute(b *testing.B, tenants, nodes int) {
 		e.distributeAcrossNodes(tenantAlloc, activeNodes)
 	}
 }
+
+// ---- node-count scaling ----
+
+func BenchmarkDistribute_50nodes(b *testing.B)  { benchDistribute(b, 100, 50) }
+func BenchmarkDistribute_100nodes(b *testing.B) { benchDistribute(b, 100, 100) }
+func BenchmarkDistribute_500nodes(b *testing.B) { benchDistribute(b, 100, 500) }
+
+func BenchmarkReconcile_10nodes(b *testing.B)  { benchReconcileNodes(b, 10) }
+func BenchmarkReconcile_50nodes(b *testing.B)  { benchReconcileNodes(b, 50) }
+func BenchmarkReconcile_100nodes(b *testing.B) { benchReconcileNodes(b, 100) }
+
+func benchReconcileNodes(b *testing.B, nodes int) {
+	e := benchEngine(20, nodes, 100)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = e.Reconcile()
+	}
+}
