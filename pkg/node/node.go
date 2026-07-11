@@ -15,6 +15,7 @@ import (
 
 	"github.com/day253/sluice/pkg/allocator"
 	"github.com/day253/sluice/pkg/api"
+	grpcpkg "github.com/day253/sluice/pkg/grpc"
 	"github.com/day253/sluice/pkg/queue"
 	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/tenant"
@@ -29,6 +30,7 @@ import (
 type Config struct {
 	NodeID       string
 	HTTPAddress  string
+	GRPCAddress  string // gRPC listen address (empty = no gRPC)
 	RaftAddress  string
 	DataDir      string
 	Bootstrap    bool
@@ -51,6 +53,7 @@ type Node struct {
 	allocEngine *allocator.Engine
 	tenantMgr   *tenant.Manager
 	apiServer   *api.Server
+	grpcServer  *grpcpkg.Server
 	handler     *api.Handler
 
 	// cancellation
@@ -146,6 +149,19 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	)
 	n.apiServer = api.NewServer(cfg.HTTPAddress, n.handler, logger)
 
+	// ---- 8. gRPC server ----
+	if cfg.GRPCAddress != "" {
+		grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(),
+			&raftApplierBridge{cluster: cluster}, pool, logger)
+		n.grpcServer, err = grpcpkg.NewServer(cfg.GRPCAddress, grpcSvc, logger)
+		if err != nil {
+			cancel()
+			_ = cluster.Shutdown()
+			_ = q.Close()
+			return nil, fmt.Errorf("grpc server: %w", err)
+		}
+	}
+
 	return n, nil
 }
 
@@ -176,11 +192,21 @@ func (n *Node) Start() error {
 	// ---- 4. Worker reconciliation loop ----
 	go n.watchAllocations()
 
-	// ---- 5. Start HTTP server (blocking in goroutine) ----
+	// ---- 5. Start HTTP server ----
 	httpErrCh := make(chan error, 1)
 	go func() {
 		httpErrCh <- n.apiServer.Start()
 	}()
+
+	// ---- 5b. Start gRPC server (nil chan means disabled) ----
+	var grpcErrCh <-chan error
+	if n.grpcServer != nil {
+		ch := make(chan error, 1)
+		grpcErrCh = ch
+		go func() {
+			ch <- n.grpcServer.Start()
+		}()
+	}
 
 	// ---- 6. Wait for shutdown signal ----
 	sigCh := make(chan os.Signal, 1)
@@ -198,6 +224,10 @@ func (n *Node) Start() error {
 	case err := <-httpErrCh:
 		if err != nil {
 			n.logger.Error("http server error", zap.Error(err))
+		}
+	case err := <-grpcErrCh:
+		if err != nil {
+			n.logger.Error("grpc server error", zap.Error(err))
 		}
 	case <-n.ctx.Done():
 		n.logger.Info("context cancelled, shutting down")
@@ -220,7 +250,12 @@ func (n *Node) Shutdown(timeout time.Duration) error {
 
 	var errs []error
 
-	// 1. Stop HTTP server.
+	// 1. Stop gRPC server first (clients get fast feedback).
+	if n.grpcServer != nil {
+		n.grpcServer.Stop()
+	}
+
+	// 2. Stop HTTP server.
 	if err := n.apiServer.Shutdown(timeout); err != nil {
 		errs = append(errs, fmt.Errorf("api shutdown: %w", err))
 	}

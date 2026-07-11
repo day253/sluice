@@ -1,4 +1,4 @@
-.PHONY: all build test bench clean deps run-dev run-node1 run-node2 run-node3
+.PHONY: all build test bench clean deps proto run-dev run-node1 run-node2 run-node3
 
 APP     := sluice
 CMD_DIR := ./cmd/sluice
@@ -18,6 +18,13 @@ build:
 # ---- Test ----
 test:
 	go test -v -race -count=1 ./...
+
+# ---- Proto ----
+proto:
+	protoc --go_out=pkg/grpc/v1 --go_opt=paths=source_relative \
+		--go-grpc_out=pkg/grpc/v1 --go-grpc_opt=paths=source_relative \
+		proto/sluice.proto
+	rm -rf pkg/grpc/v1/proto  # protoc may create extra subdir
 
 # ---- Benchmarks ----
 bench:

@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package sluice.v1;
+
+option go_package = "github.com/day253/sluice/pkg/grpc/v1;grpcv1";
+
+// ---------------------------------------------------------------------------
+// Sluice — distributed multi-tenant rate-limiting service
+// ---------------------------------------------------------------------------
+
+service Sluice {
+  // Submit a task and receive its result via server-side streaming.
+  // The server streams status updates (pending → inflight → done/failed)
+  // then closes the stream on completion.
+  rpc Submit(SubmitRequest) returns (stream SubmitEvent);
+
+  // Get the current status of a task.
+  rpc GetTask(GetTaskRequest) returns (TaskStatus);
+
+  // Wait for a task to complete (long-polling equivalent).
+  // Returns immediately if already done; blocks with periodic updates otherwise.
+  rpc WaitTask(WaitTaskRequest) returns (stream SubmitEvent);
+
+  // Admin: upsert a tenant configuration.
+  rpc UpsertTenant(UpsertTenantRequest) returns (UpsertTenantResponse);
+
+  // Admin: delete a tenant.
+  rpc DeleteTenant(DeleteTenantRequest) returns (DeleteTenantResponse);
+
+  // Admin: list all tenants.
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+
+  // Admin: list cluster nodes and allocations.
+  rpc ClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+
+  // Health check.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Bidirectional streaming for high-throughput task submission.
+  // Clients stream tasks in; server streams results back as they complete.
+  rpc SubmitBatch(stream SubmitRequest) returns (stream SubmitEvent);
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+message SubmitRequest {
+  string tenant_id = 1;
+  bytes  payload   = 2;  // arbitrary JSON payload
+  string idempotency_key = 3;
+}
+
+message SubmitEvent {
+  string task_id   = 1;
+  string tenant_id = 2;
+  string status    = 3;  // "pending", "inflight", "done", "failed"
+  string result    = 4;  // present when status=done
+  string error     = 5;  // present when status=failed
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+}
+
+message TaskStatus {
+  string task_id   = 1;
+  string tenant_id = 2;
+  string status    = 3;
+  string result    = 4;
+  string error     = 5;
+}
+
+message WaitTaskRequest {
+  string task_id = 1;
+  int32  timeout_seconds = 2;  // 0 = default (30s)
+}
+
+message UpsertTenantRequest {
+  string tenant_id   = 1;
+  string name        = 2;
+  int32  max_workers = 3;
+}
+
+message UpsertTenantResponse {
+  bool ok = 1;
+}
+
+message DeleteTenantRequest {
+  string tenant_id = 1;
+}
+
+message DeleteTenantResponse {
+  bool ok = 1;
+}
+
+message ListTenantsRequest {}
+
+message TenantInfo {
+  string tenant_id   = 1;
+  string name        = 2;
+  int32  max_workers = 3;
+  int32  inflight    = 4;  // current inflight tasks
+}
+
+message ListTenantsResponse {
+  repeated TenantInfo tenants = 1;
+}
+
+message ClusterStatusRequest {}
+
+message NodeInfo {
+  string node_id       = 1;
+  string address       = 2;
+  string raft_address  = 3;
+  string status        = 4;  // "up" | "down"
+  int32  total_workers = 5;
+}
+
+message TenantAllocation {
+  string tenant_id = 1;
+  int32  workers   = 2;
+}
+
+message NodeAllocation {
+  string node_id = 1;
+  repeated TenantAllocation tenants = 2;
+}
+
+message ClusterStatusResponse {
+  repeated NodeInfo       nodes       = 1;
+  repeated NodeAllocation allocations = 2;
+  string leader_address              = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status  = 1;
+  string node_id = 2;
+  string leader  = 3;
+}
