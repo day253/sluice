@@ -98,6 +98,13 @@ func (p *Pool) Reconcile(desired map[string]int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// Mark absent tenants as desired=0 so their workers get killed.
+	for tid, grp := range p.groups {
+		if _, ok := desired[tid]; !ok {
+			grp.desired = 0
+		}
+	}
+
 	// Spawn or kill workers per tenant.
 	for tenantID, want := range desired {
 		grp, ok := p.groups[tenantID]
@@ -106,8 +113,10 @@ func (p *Pool) Reconcile(desired map[string]int) {
 			p.groups[tenantID] = grp
 		}
 		grp.desired = want
-
-		delta := want - grp.current
+	}
+	// Also handle absent tenants (desired=0 set above).
+	for _, grp := range p.groups {
+		delta := grp.desired - grp.current
 		if delta > 0 {
 			p.spawnWorkers(grp, delta)
 		} else if delta < 0 {
@@ -115,9 +124,9 @@ func (p *Pool) Reconcile(desired map[string]int) {
 		}
 	}
 
-	// Remove groups that have been scaled to zero and are not in desired.
+	// Remove groups that have been fully drained.
 	for tenantID, grp := range p.groups {
-		if _, ok := desired[tenantID]; !ok && grp.desired == 0 {
+		if grp.desired == 0 && grp.current == 0 {
 			delete(p.groups, tenantID)
 		}
 	}
