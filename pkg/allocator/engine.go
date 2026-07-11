@@ -20,8 +20,8 @@ import (
 
 	"go.uber.org/zap"
 
-	raftpkg "github.com/distributed-rate-limiting/pkg/raft"
-	"github.com/distributed-rate-limiting/pkg/types"
+	raftpkg "github.com/day253/sluice/pkg/raft"
+	"github.com/day253/sluice/pkg/types"
 )
 
 const (

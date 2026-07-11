@@ -1,4 +1,4 @@
-module github.com/distributed-rate-limiting
+module github.com/day253/sluice
 
 go 1.26.0
 
@@ -7,6 +7,7 @@ require (
 	github.com/gorilla/mux v1.8.1
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
+	go.etcd.io/bbolt v1.3.5
 	go.uber.org/zap v1.28.0
 )
 
@@ -21,7 +22,6 @@ require (
 	github.com/hashicorp/golang-lru v0.5.0 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
-	go.etcd.io/bbolt v1.3.5 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect
 )

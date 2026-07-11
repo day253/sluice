@@ -12,7 +12,7 @@ import (
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"go.uber.org/zap"
 
-	"github.com/distributed-rate-limiting/pkg/types"
+	"github.com/day253/sluice/pkg/types"
 )
 
 // ---------------------------------------------------------------------------

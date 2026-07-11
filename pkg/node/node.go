@@ -13,12 +13,12 @@ import (
 	hashicorpraft "github.com/hashicorp/raft"
 	"go.uber.org/zap"
 
-	"github.com/distributed-rate-limiting/pkg/allocator"
-	"github.com/distributed-rate-limiting/pkg/api"
-	"github.com/distributed-rate-limiting/pkg/queue"
-	raftpkg "github.com/distributed-rate-limiting/pkg/raft"
-	"github.com/distributed-rate-limiting/pkg/tenant"
-	"github.com/distributed-rate-limiting/pkg/worker"
+	"github.com/day253/sluice/pkg/allocator"
+	"github.com/day253/sluice/pkg/api"
+	"github.com/day253/sluice/pkg/queue"
+	raftpkg "github.com/day253/sluice/pkg/raft"
+	"github.com/day253/sluice/pkg/tenant"
+	"github.com/day253/sluice/pkg/worker"
 )
 
 // ---------------------------------------------------------------------------

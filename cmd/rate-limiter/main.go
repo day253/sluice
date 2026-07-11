@@ -12,7 +12,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/distributed-rate-limiting/pkg/node"
+	"github.com/day253/sluice/pkg/node"
 )
 
 // ---------------------------------------------------------------------------

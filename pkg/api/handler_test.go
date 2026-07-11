@@ -12,10 +12,10 @@ import (
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
-	raftpkg "github.com/distributed-rate-limiting/pkg/raft"
-	"github.com/distributed-rate-limiting/pkg/queue"
-	"github.com/distributed-rate-limiting/pkg/types"
-	"github.com/distributed-rate-limiting/pkg/worker"
+	raftpkg "github.com/day253/sluice/pkg/raft"
+	"github.com/day253/sluice/pkg/queue"
+	"github.com/day253/sluice/pkg/types"
+	"github.com/day253/sluice/pkg/worker"
 )
 
 // ---------------------------------------------------------------------------

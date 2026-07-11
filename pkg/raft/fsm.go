@@ -10,7 +10,7 @@ import (
 	"github.com/hashicorp/raft"
 	"go.uber.org/zap"
 
-	"github.com/distributed-rate-limiting/pkg/types"
+	"github.com/day253/sluice/pkg/types"
 )
 
 // FSM is the Raft finite state machine.  All mutations to cluster state flow
