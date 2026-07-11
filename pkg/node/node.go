@@ -141,21 +141,16 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 		logger,
 	)
 
-	// ---- 7. API handler & server ----
-	n.handler = api.NewHandler(
-		cfg.NodeID,
-		q,
-		cluster.FSM(),
-		&raftApplierBridge{cluster: cluster},
-		pool,
-		logger,
-	)
+	// ---- 7. gRPC service (shared by HTTP + gRPC server) ----
+	grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(),
+		&raftApplierBridge{cluster: cluster}, pool, logger)
+
+	// ---- 8. HTTP API (adapts gRPC service) ----
+	n.handler = api.NewHandler(cfg.NodeID, grpcSvc, logger)
 	n.apiServer = api.NewServer(cfg.HTTPAddress, n.handler, logger)
 
-	// ---- 8. gRPC server (external) ----
+	// ---- 9. gRPC server (external) ----
 	if cfg.GRPCAddress != "" {
-		grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(),
-			&raftApplierBridge{cluster: cluster}, pool, logger)
 		n.grpcServer, err = grpcpkg.NewServer(cfg.GRPCAddress, grpcSvc, logger)
 		if err != nil {
 			cancel()

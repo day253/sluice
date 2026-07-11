@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
+	grpcpkg "github.com/day253/sluice/pkg/grpc"
 	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/queue"
 	"github.com/day253/sluice/pkg/types"
@@ -52,7 +53,8 @@ func setupHandler(t *testing.T) (*Handler, *raftpkg.FSM, *queue.MemoryQueue) {
 	// Seed a tenant so task submission works.
 	applyOp(fsm, raftpkg.OpUpsertTenant, types.TenantConfig{ID: "company-a", MaxWorkers: 100})
 
-	handler := NewHandler("n1", q, fsm, raft, pool, zap.NewNop())
+	grpcSvc := grpcpkg.NewService("n1", q, fsm, raft, pool, zap.NewNop())
+	handler := NewHandler("n1", grpcSvc, zap.NewNop())
 	return handler, fsm, q
 }
 

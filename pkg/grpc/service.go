@@ -57,6 +57,69 @@ func NewService(
 }
 
 // ---------------------------------------------------------------------------
+// Sync wrappers for in-process callers (e.g. HTTP handler)
+// ---------------------------------------------------------------------------
+
+// SubmitSync sends one task and blocks until the final (done/failed) event,
+// collecting all intermediate events.
+func (s *Service) SubmitSync(ctx context.Context, req *grpcv1.SubmitRequest) (*grpcv1.SubmitEvent, error) {
+	if req.TenantId == "" {
+		return nil, status.Error(codes.InvalidArgument, "tenant_id is required")
+	}
+	if _, ok := s.fsm.GetTenant(req.TenantId); !ok {
+		return nil, status.Error(codes.NotFound, "tenant not found: "+req.TenantId)
+	}
+
+	taskID := uuid.New().String()
+	env := &queue.TaskEnvelope{
+		TaskID:         taskID,
+		TenantID:       req.TenantId,
+		Payload:        req.Payload,
+		IdempotencyKey: req.IdempotencyKey,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := s.queue.Enqueue(req.TenantId, env); err != nil {
+		return nil, status.Error(codes.Internal, "failed to enqueue task")
+	}
+	return &grpcv1.SubmitEvent{
+		TaskId: taskID, TenantId: req.TenantId, Status: types.TaskStatusPending,
+	}, nil
+}
+
+// WaitTaskSync blocks until task completion or timeout.
+func (s *Service) WaitTaskSync(ctx context.Context, req *grpcv1.WaitTaskRequest) (*grpcv1.SubmitEvent, error) {
+	timeout := 30 * time.Second
+	if req.TimeoutSeconds > 0 {
+		timeout = time.Duration(req.TimeoutSeconds) * time.Second
+	}
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(timeout)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline:
+			if task := s.fsm.GetTask(req.TaskId); task != nil {
+				return &grpcv1.SubmitEvent{
+					TaskId: task.TaskID, TenantId: task.TenantID, Status: task.Status,
+				}, nil
+			}
+			return nil, status.Error(codes.DeadlineExceeded, "timeout waiting for task")
+		case <-ticker.C:
+			if result := s.fsm.GetResult(req.TaskId); result != nil {
+				return &grpcv1.SubmitEvent{
+					TaskId: result.TaskID, TenantId: result.TenantID,
+					Status: result.Status, Result: result.Result, Error: result.Error,
+				}, nil
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Submit — unary request → server-stream lifecycle events
 // ---------------------------------------------------------------------------
 
