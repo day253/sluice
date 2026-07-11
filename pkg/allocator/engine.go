@@ -1,6 +1,15 @@
 // Package allocator implements the max-min fairness worker allocation
-// algorithm.  It runs on the Raft leader and writes the computed allocation
-// plan to the Raft log so every node sees the same view.
+// algorithm with starvation-aware idle detection.  It runs on the Raft
+// leader and writes the computed allocation plan to the Raft log so every
+// node sees the same view.
+//
+// Idle detection: when a tenant has zero inflight tasks for
+// idleThreshold consecutive reconciliation cycles, it is marked "idle"
+// and its worker allocation is reduced to the catch-all minimum (1).
+// The released workers are redistributed to active tenants using
+// max-min fairness.  The idle tenant's single keep-alive worker ensures
+// new tasks are picked up immediately; the tenant's full allocation is
+// restored on the next reconciliation cycle.
 package allocator
 
 import (
@@ -13,6 +22,13 @@ import (
 
 	raftpkg "github.com/distributed-rate-limiting/pkg/raft"
 	"github.com/distributed-rate-limiting/pkg/types"
+)
+
+const (
+	// idleThreshold is how many consecutive zero-load cycles a tenant must
+	// experience before being classified as idle (with the default 3 s
+	// interval this ≈ 9 s of inactivity).
+	idleThreshold = 3
 )
 
 // ---------------------------------------------------------------------------
@@ -31,6 +47,9 @@ type Engine struct {
 	mu       sync.Mutex
 	isLeader bool
 
+	// per-tenant idle tracking (leader-local, not replicated)
+	idleCycles map[string]int // tenantID → consecutive cycles with 0 inflight
+
 	// configuration
 	minWorkersPerTenant int
 }
@@ -47,6 +66,7 @@ func NewEngine(
 		fsm:                 fsm,
 		raft:                raft,
 		logger:              logger,
+		idleCycles:          make(map[string]int),
 		minWorkersPerTenant: 1,
 	}
 }
@@ -63,6 +83,8 @@ func (e *Engine) SetLeader(leader bool) {
 	e.isLeader = leader
 	if leader {
 		e.logger.Info("allocator: became leader — will run reconciliation")
+		// Reset idle tracking on leadership change.
+		e.idleCycles = make(map[string]int)
 	}
 }
 
@@ -103,7 +125,7 @@ func (e *Engine) Start(ctx context.Context, interval time.Duration) {
 // ReconcileNow triggers an immediate reconciliation (if leader).
 func (e *Engine) ReconcileNow() error {
 	if !e.IsLeader() {
-		return nil // silently ignore on non-leader
+		return nil
 	}
 	return e.Reconcile()
 }
@@ -112,7 +134,8 @@ func (e *Engine) ReconcileNow() error {
 // Reconcile
 // ---------------------------------------------------------------------------
 
-// Reconcile computes the fair allocation and writes it to Raft.
+// Reconcile computes the fair allocation, applies idle detection, and writes
+// the final plan to Raft.
 func (e *Engine) Reconcile() error {
 	state := e.fsm.GetState()
 
@@ -132,16 +155,27 @@ func (e *Engine) Reconcile() error {
 	tenantList := e.tenantList(state.Tenants)
 	if len(tenantList) == 0 {
 		e.logger.Debug("allocator: no tenants configured")
+		// Reset idle tracking when there are no tenants.
+		e.idleCycles = make(map[string]int)
 		return nil
 	}
 
-	// 3. Max-min fairness per tenant.
-	tenantAlloc := e.maxMinFairness(tenantList, totalClusterWorkers)
+	// 3. Build load snapshot: inflight tasks per tenant (FSM-level).
+	inflightCount := e.fsm.CountInflightPerTenant()
 
-	// 4. Distribute each tenant's workers across active nodes.
-	nodeAllocs := e.distributeAcrossNodes(tenantAlloc, activeNodes)
+	// 4. Update idle-cycle counters and classify tenants.
+	idleSet := e.updateIdleState(tenantList, inflightCount)
 
-	// 5. Write to Raft.
+	// 5. Compute standard max-min fairness (base allocation).
+	baseAlloc := e.maxMinFairness(tenantList, totalClusterWorkers)
+
+	// 6. Apply idle penalty and redistribute released workers.
+	finalAlloc := e.applyIdleAdjustment(tenantList, baseAlloc, idleSet)
+
+	// 7. Distribute each tenant's workers across active nodes.
+	nodeAllocs := e.distributeAcrossNodes(finalAlloc, activeNodes)
+
+	// 8. Write to Raft.
 	allocMap := make(map[string]*types.NodeAllocation, len(nodeAllocs))
 	for _, na := range nodeAllocs {
 		allocMap[na.NodeID] = na
@@ -158,12 +192,122 @@ func (e *Engine) Reconcile() error {
 		return err
 	}
 
+	// Log idle tenants and any status changes.
+	idleCount := 0
+	idleNames := make([]string, 0)
+	for _, t := range tenantList {
+		if idleSet[t.ID] {
+			idleCount++
+			if len(idleNames) < 5 { // cap log noise
+				idleNames = append(idleNames, t.ID)
+			}
+		}
+	}
+
 	e.logger.Info("allocator: plan committed",
 		zap.Int("nodes", len(activeNodes)),
 		zap.Int("tenants", len(tenantList)),
+		zap.Int("idle_tenants", idleCount),
+		zap.Strings("idle_examples", idleNames),
 		zap.Int("total_workers", totalClusterWorkers),
 	)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Idle detection
+// ---------------------------------------------------------------------------
+
+// updateIdleState increments or resets the idle-cycle counters and returns
+// the set of tenants currently classified as idle.
+func (e *Engine) updateIdleState(tenants []*types.TenantConfig, inflightCount map[string]int) map[string]bool {
+	idleSet := make(map[string]bool, len(tenants))
+
+	for _, t := range tenants {
+		if inflightCount[t.ID] > 0 {
+			// Has work — reset the counter.
+			if e.idleCycles[t.ID] >= idleThreshold {
+				e.logger.Info("allocator: tenant woke up from idle",
+					zap.String("tenant", t.ID),
+				)
+			}
+			e.idleCycles[t.ID] = 0
+		} else {
+			e.idleCycles[t.ID]++
+			if e.idleCycles[t.ID] == idleThreshold {
+				e.logger.Info("allocator: tenant marked idle",
+					zap.String("tenant", t.ID),
+					zap.Int("cycles", e.idleCycles[t.ID]),
+				)
+			}
+		}
+
+		if e.idleCycles[t.ID] >= idleThreshold {
+			idleSet[t.ID] = true
+		}
+	}
+
+	// Clean up counters for tenants that no longer exist.
+	for tid := range e.idleCycles {
+		found := false
+		for _, t := range tenants {
+			if t.ID == tid {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(e.idleCycles, tid)
+		}
+	}
+
+	return idleSet
+}
+
+// ---------------------------------------------------------------------------
+// Idle penalty + redistribution
+// ---------------------------------------------------------------------------
+
+// applyIdleAdjustment takes the base max-min allocation and reduces idle
+// tenants to a single catch-all worker.  The released capacity is
+// redistributed among the active tenants using a second max-min pass.
+func (e *Engine) applyIdleAdjustment(
+	tenants []*types.TenantConfig,
+	baseAlloc map[string]int,
+	idleSet map[string]bool,
+) map[string]int {
+	final := make(map[string]int, len(tenants))
+	released := 0
+
+	// Split tenants.
+	var active []*types.TenantConfig
+	for _, t := range tenants {
+		if idleSet[t.ID] {
+			// Idle: keep only the catch-all minimum.
+			final[t.ID] = 1
+			if baseAlloc[t.ID] > 1 {
+				released += baseAlloc[t.ID] - 1
+			}
+		} else {
+			active = append(active, t)
+			final[t.ID] = baseAlloc[t.ID]
+		}
+	}
+
+	if released == 0 || len(active) == 0 {
+		return final
+	}
+
+	// Redistribute released workers among active tenants.
+	// We treat each active tenant's remaining headroom (MaxWorkers - current)
+	// as the cap for a secondary max-min pass.
+	extraAlloc := e.maxMinFairness(active, released)
+
+	for _, t := range active {
+		final[t.ID] += extraAlloc[t.ID]
+	}
+
+	return final
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +333,6 @@ func (e *Engine) maxMinFairness(tenants []*types.TenantConfig, total int) map[st
 
 	// Phase 2: progressive filling for unsatisfied tenants.
 	for remaining > 0 {
-		// Collect tenants that still have headroom.
 		var unsatisfied []*types.TenantConfig
 		for _, t := range tenants {
 			if alloc[t.ID] < t.MaxWorkers {
@@ -197,16 +340,11 @@ func (e *Engine) maxMinFairness(tenants []*types.TenantConfig, total int) map[st
 			}
 		}
 		if len(unsatisfied) == 0 {
-			// Everyone is at their limit — distribute remaining worker slots
-			// by ignoring caps.  (Shouldn't normally happen in oversubscribed
-			// scenarios, but handles edge cases gracefully.)
 			break
 		}
 
 		fair := remaining / len(unsatisfied)
 		if fair == 0 {
-			// Fewer workers left than tenants — give 1 to each in order
-			// until exhausted.
 			for _, t := range unsatisfied {
 				if remaining == 0 {
 					break
@@ -231,7 +369,6 @@ func (e *Engine) maxMinFairness(tenants []*types.TenantConfig, total int) map[st
 		}
 		remaining -= roundAllocated
 
-		// Safety valve — if no progress was made, exit.
 		if roundAllocated == 0 {
 			break
 		}
@@ -297,12 +434,4 @@ func (e *Engine) tenantList(tenants map[string]*types.TenantConfig) []*types.Ten
 		list = append(list, t)
 	}
 	return list
-}
-
-// min returns the smaller of two integers.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

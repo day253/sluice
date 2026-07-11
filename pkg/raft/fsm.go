@@ -431,6 +431,31 @@ func (f *FSM) FindPendingTasks(tenantID string) []*types.TaskRecord {
 	return out
 }
 
+// CountInflightPerTenant returns the number of inflight tasks per tenant.
+// This is used by the allocator as a load signal for idle detection.
+func (f *FSM) CountInflightPerTenant() map[string]int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make(map[string]int)
+	for _, t := range f.state.Tasks {
+		out[t.TenantID]++
+	}
+	return out
+}
+
+// CountPendingPerTenant returns the number of recovery-pending tasks per tenant.
+func (f *FSM) CountPendingPerTenant() map[string]int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make(map[string]int)
+	for _, t := range f.state.Tasks {
+		if t.Status == types.TaskStatusPending {
+			out[t.TenantID]++
+		}
+	}
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
