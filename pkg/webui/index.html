@@ -113,7 +113,7 @@ async function refresh(){
 
     // Update inflight chart
     const c1=charts['ch-inf'];
-    if(c1){c1.data.labels=H.labels.slice(-50);c1.data.datasets[0].data=H.inf.slice(-300);c1.update('none');document.getElementById('inf-debug').textContent=H.inf.length+'pts'}
+    if(c1){c1.data.labels=H.labels.slice(-50);c1.data.datasets[0].data=H.inf.slice(-300);c1.update();document.getElementById('inf-debug').textContent=H.inf.length+'pts'}
     else document.getElementById('inf-debug').textContent='no-chart';
 
     // Allocations
@@ -127,7 +127,7 @@ async function refresh(){
 
     // Update usage chart
     const c2=charts['ch-usage'];
-    if(c2){const tids=Object.keys(H.usage).slice(0,6);c2.data.datasets=tids.map((tid,i)=>({label:tid+'%',borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data:H.usage[tid]?H.usage[tid].slice(-200):[]}));c2.update('none');document.getElementById('usage-debug').textContent=Object.keys(H.usage).length+' tenants'}
+    if(c2){const tids=Object.keys(H.usage).slice(0,6);c2.data.datasets=tids.map((tid,i)=>({label:tid+'%',borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data:H.usage[tid]?H.usage[tid].slice(-200):[]}));c2.update();document.getElementById('usage-debug').textContent=Object.keys(H.usage).length+'t/'+(H.usage[tids[0]]||[]).length+'pts'}
     else document.getElementById('usage-debug').textContent='no-chart';
 
     // Tenant list
@@ -160,8 +160,8 @@ async function loadHistory(){
       else if(d.name.startsWith('alloc:')){const tid=d.name.replace('alloc:','');H.usage[tid]=d.secs.filter(x=>x>=0).slice(-200)}
     });
     // Restore charts
-    const c1=charts['ch-inf'];if(c1&&H.inf.length){c1.data.datasets[0].data=H.inf;c1.update('none')}
-    const c2=charts['ch-usage'];if(c2){const tids=Object.keys(H.usage);if(tids.length){c2.data.datasets=tids.slice(0,6).map((tid,i)=>({label:tid+'%',borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data:H.usage[tid]||[]}));c2.update('none')}}
+    const c1=charts['ch-inf'];if(c1&&H.inf.length){c1.data.datasets[0].data=H.inf;c1.update()}
+    const c2=charts['ch-usage'];if(c2){const tids=Object.keys(H.usage);if(tids.length){c2.data.datasets=tids.slice(0,6).map((tid,i)=>({label:tid+'%',borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data:H.usage[tid]||[]}));c2.update()}}
   }catch(e){console.error('loadHistory:',e)}
 }
 
