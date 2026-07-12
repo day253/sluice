@@ -8,6 +8,8 @@ import (
 
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
+
+	"github.com/day253/sluice/pkg/webui"
 )
 
 // Server is the HTTP API server.
@@ -39,12 +41,14 @@ func NewServer(addr string, handler *Handler, logger *zap.Logger) *Server {
 }
 
 // NewRouter creates a configured HTTP router for use with cmux or httptest.
-func NewRouter(handler *Handler) *mux.Router {
+// The router is wrapped with the web dashboard: / serves the UI, /api/*
+// delegates to the REST handler.
+func NewRouter(handler *Handler) http.Handler {
 	router := mux.NewRouter()
 	router.Use(loggingMiddleware(zap.NewNop()))
 	router.Use(recoveryMiddleware(zap.NewNop()))
 	handler.RegisterRoutes(router)
-	return router
+	return webui.Handler(router)
 }
 
 // Start begins listening and serving.  It blocks until the server is stopped

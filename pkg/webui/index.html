@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sluice Dashboard</title>
+<style>
+:root {
+  --bg: #0d1117; --card: #161b22; --border: #30363d;
+  --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+  --green: #3fb950; --red: #f85149; --yellow: #d2991d;
+  --orange: #db6d28;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font:14px/1.5 -apple-system,sans-serif; }
+header { background:var(--card); border-bottom:1px solid var(--border); padding:12px 24px; display:flex; align-items:center; gap:16px; }
+header h1 { font-size:18px; color:var(--accent); }
+header .status { font-size:12px; padding:2px 8px; border-radius:4px; }
+.status-ok { background:#1a3a1a; color:var(--green); }
+.status-warn { background:#3a2a0a; color:var(--yellow); }
+main { max-width:1400px; margin:0 auto; padding:24px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; }
+.card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:16px; }
+.card h3 { font-size:14px; color:var(--muted); margin-bottom:12px; text-transform:uppercase; letter-spacing:0.5px; }
+.stat { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid var(--border); }
+.stat:last-child { border-bottom:none; }
+.stat .val { font-weight:600; }
+.val.green { color:var(--green); } .val.red { color:var(--red); }
+.val.yellow { color:var(--yellow); } .val.blue { color:var(--accent); }
+.nodes { display:flex; gap:8px; flex-wrap:wrap; }
+.node-chip { padding:4px 12px; border-radius:12px; font-size:12px; }
+.node-up { background:#1a3a1a; color:var(--green); }
+.node-down { background:#3a1a1a; color:var(--red); }
+.tenant-bar { height:6px; border-radius:3px; background:var(--border); margin:4px 0; }
+.tenant-bar-fill { height:100%; border-radius:3px; background:var(--accent); transition:width .3s; }
+.tenant-bar-fill.idle { background:var(--muted); }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--border); }
+th { color:var(--muted); font-weight:500; }
+.actions { display:flex; gap:8px; margin-top:16px; }
+.btn { padding:6px 16px; border-radius:6px; border:1px solid var(--border); background:var(--card); color:var(--text); cursor:pointer; font-size:13px; }
+.btn:hover { border-color:var(--accent); }
+.btn-primary { background:var(--accent); color:#fff; border:none; }
+input, select { padding:6px 12px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text); font-size:13px; width:200px; }
+.refresh { font-size:12px; color:var(--muted); }
+.error { background:#3a1a1a; color:var(--red); padding:12px; border-radius:6px; display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#9776; Sluice</h1>
+  <span id="health-badge" class="status">...</span>
+  <span class="refresh" id="refresh-info"></span>
+  <div style="flex:1"></div>
+  <span style="color:var(--muted);font-size:12px" id="leader-info"></span>
+</header>
+<main>
+  <div class="error" id="error-banner"></div>
+
+  <!-- Overview -->
+  <div class="grid" style="margin-bottom:24px">
+    <div class="card">
+      <h3>Cluster</h3>
+      <div class="stat"><span>Nodes</span><span class="val blue" id="node-count">-</span></div>
+      <div class="stat"><span>Leader</span><span class="val" id="leader-addr">-</span></div>
+      <div class="stat"><span>Total Workers</span><span class="val blue" id="total-workers">-</span></div>
+    </div>
+    <div class="card">
+      <h3>Tasks</h3>
+      <div class="stat"><span>Inflight</span><span class="val yellow" id="task-inflight">-</span></div>
+      <div class="stat"><span>Completed</span><span class="val green" id="task-done">-</span></div>
+      <div class="stat"><span>Failed</span><span class="val red" id="task-failed">-</span></div>
+    </div>
+    <div class="card">
+      <h3>Tenants</h3>
+      <div class="stat"><span>Active</span><span class="val green" id="tenant-active">-</span></div>
+      <div class="stat"><span>Idle</span><span class="val" id="tenant-idle" style="color:var(--muted)">-</span></div>
+      <div class="stat"><span>Total</span><span class="val blue" id="tenant-total">-</span></div>
+    </div>
+    <div class="card">
+      <h3>Node List</h3>
+      <div class="nodes" id="node-list"></div>
+    </div>
+  </div>
+
+  <!-- Tenant worker usage -->
+  <div class="card" style="margin-bottom:16px">
+    <h3>Worker Allocation</h3>
+    <div id="tenant-bars"></div>
+  </div>
+
+  <!-- Manage tenants -->
+  <div class="card">
+    <h3>Manage Tenants</h3>
+    <div class="actions">
+      <input id="new-tenant-id" placeholder="tenant-id">
+      <input id="new-tenant-name" placeholder="Name">
+      <input id="new-tenant-workers" placeholder="Max Workers" type="number" min="1" value="50">
+      <button class="btn btn-primary" onclick="addTenant()">Add / Update</button>
+      <button class="btn" onclick="removeTenant()">Delete</button>
+    </div>
+  </div>
+</main>
+
+<script>
+const API = '';
+
+async function fetchJSON(path) {
+  try {
+    const r = await fetch(API + path);
+    if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+    return r.json();
+  } catch(e) { showError(e.message); return null; }
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.textContent = 'Error: ' + msg;
+  el.style.display = 'block';
+  setTimeout(() => el.style.display = 'none', 5000);
+}
+
+async function refresh() {
+  const [health, nodes, tenants, allocs] = await Promise.all([
+    fetchJSON('/api/v1/health'),
+    fetchJSON('/api/v1/admin/nodes'),
+    fetchJSON('/api/v1/admin/tenants'),
+    fetchJSON('/api/v1/admin/allocations'),
+  ]);
+
+  // Health
+  const badge = document.getElementById('health-badge');
+  if (health) {
+    badge.textContent = health.status === 'ok' ? 'HEALTHY' : 'UNHEALTHY';
+    badge.className = health.status === 'ok' ? 'status status-ok' : 'status status-warn';
+    document.getElementById('leader-info').textContent = 'Leader: ' + (health.leader || 'none');
+  }
+
+  // Nodes
+  if (nodes) {
+    document.getElementById('leader-addr').textContent = nodes.leader || '-';
+    const list = document.getElementById('node-list');
+    const entries = nodes.nodes || [];
+    document.getElementById('node-count').textContent = entries.length;
+    let totalW = 0;
+    list.innerHTML = entries.map(n => {
+      totalW += n.total_workers || 0;
+      return `<span class="node-chip ${n.status==='up'?'node-up':'node-down'}">${n.node_id} (${n.total_workers}w)</span>`;
+    }).join('');
+    document.getElementById('total-workers').textContent = totalW;
+  }
+
+  // Tenants + tasks
+  if (tenants) {
+    const tenantArr = Object.values(tenants);
+    document.getElementById('tenant-total').textContent = tenantArr.length;
+    let totalInflight = 0, active = 0;
+    tenantArr.forEach(t => {
+      const inf = t.inflight || 0;
+      totalInflight += inf;
+      if (inf > 0) active++;
+    });
+    document.getElementById('task-inflight').textContent = totalInflight;
+    document.getElementById('tenant-active').textContent = active;
+    document.getElementById('tenant-idle').textContent = tenantArr.length - active;
+
+    // Worker allocation bars
+    if (allocs && allocs.nodes) {
+      const maxW = {};
+      tenantArr.forEach(t => maxW[t.id] = t.max_workers);
+      const totals = {};
+      allocs.nodes.forEach(na => {
+        Object.entries(na.tenants || {}).forEach(([tid, cnt]) => {
+          totals[tid] = (totals[tid] || 0) + cnt;
+        });
+      });
+      document.getElementById('tenant-bars').innerHTML = Object.entries(totals)
+        .sort((a,b) => b[1] - a[1])
+        .map(([tid, cnt]) => {
+          const max = maxW[tid] || cnt;
+          const pct = Math.round(cnt / Math.max(max, 1) * 100);
+          const isIdle = cnt <= 1 && max > 1;
+          return `<div style="margin-bottom:8px">
+            <div style="display:flex;justify-content:space-between;font-size:12px">
+              <span><b>${tid}</b> ${isIdle ? '(idle)' : ''}</span>
+              <span>${cnt} / ${maxW[tid]} workers</span>
+            </div>
+            <div class="tenant-bar">
+              <div class="tenant-bar-fill${isIdle ? ' idle' : ''}" style="width:${pct}%"></div>
+            </div>
+          </div>`;
+        }).join('') || '<span style="color:var(--muted)">No tenants</span>';
+    }
+  }
+
+  document.getElementById('refresh-info').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+}
+
+async function addTenant() {
+  const id = document.getElementById('new-tenant-id').value.trim();
+  const name = document.getElementById('new-tenant-name').value.trim();
+  const workers = parseInt(document.getElementById('new-tenant-workers').value) || 50;
+  if (!id) return showError('tenant-id required');
+  const r = await fetch(API + '/api/v1/admin/tenants/' + id, {
+    method:'PUT', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name, max_workers:workers})
+  });
+  if (r.ok) { refresh(); } else { showError('Failed to upsert tenant: ' + r.status); }
+}
+
+async function removeTenant() {
+  const id = document.getElementById('new-tenant-id').value.trim();
+  if (!id) return showError('tenant-id required');
+  const r = await fetch(API + '/api/v1/admin/tenants/' + id, { method:'DELETE' });
+  if (r.ok) { refresh(); } else { showError('Failed to delete tenant: ' + r.status); }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
