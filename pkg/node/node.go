@@ -51,7 +51,8 @@ type Node struct {
 	allocEngine *allocator.Engine
 	tenantMgr   *tenant.Manager
 	muxServer   *grpcpkg.MultiplexServer
-	apiServer   *api.Server // legacy; nil when muxServer is used
+	apiServer   *api.Server
+	claimClient *grpcpkg.ClaimClient
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -110,7 +111,8 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 	// ---- Worker pool (only leader processes) ----
 	n.pool = worker.NewPool(cfg.NodeID, q, cluster.FSM(), bridge, processor, logger)
-	n.pool.SetWorkerGuard(func() bool { return cluster.IsLeader() })
+	n.claimClient = grpcpkg.NewClaimClient(cfg.NodeID, logger)
+	n.pool.SetClaimer(n.claimClient)
 
 	// ---- Allocator engine ----
 	n.allocEngine = allocator.NewEngine(cfg.NodeID, cluster.FSM(), bridge, logger)
@@ -236,7 +238,11 @@ func (n *Node) Shutdown(timeout time.Duration) error {
 		errs = append(errs, fmt.Errorf("queue close: %w", err))
 	}
 
-	// 4. Raft.
+	// 4. Claim client.
+	if n.claimClient != nil {
+		n.claimClient.Close()
+	}
+	// 5. Raft.
 	if err := n.raftCluster.Shutdown(); err != nil {
 		errs = append(errs, fmt.Errorf("raft shutdown: %w", err))
 	}
@@ -253,6 +259,14 @@ func (n *Node) Shutdown(timeout time.Duration) error {
 // ---------------------------------------------------------------------------
 
 func (n *Node) watchLeadership() {
+	updateClaim := func() {
+		if addr := n.raftCluster.LeaderAddr(); addr != "" {
+			apiAddr := addr[:len(addr)-5] + ":9090"
+			n.claimClient.SetLeader(apiAddr)
+		}
+	}
+	updateClaim()
+
 	if n.raftCluster.IsLeader() {
 		n.allocEngine.SetLeader(true)
 		_ = n.allocEngine.ReconcileNow()
@@ -271,6 +285,7 @@ func (n *Node) watchLeadership() {
 			if isLeader {
 				_ = n.allocEngine.ReconcileNow()
 			}
+			updateClaim()
 		}
 	}
 }

@@ -110,28 +110,46 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 		if len(batch) == 0 {
 			return
 		}
-		s.logger.Debug("internal: flushing claim batch", zap.Int("size", len(batch)))
 		stopTimer()
 
-		cmd := raftpkg.MustMarshalCommand(raftpkg.OpClaimBatch, raftpkg.ClaimBatchData{
-			Tasks: batch,
-		})
-		result := s.raft.Apply(cmd, 5000)
-		if err := result.Error(); err != nil {
-			s.logger.Error("claim batch raft apply failed", zap.Error(err))
-			batch = batch[:0]
-			return
+		// Filter: only grant claims for nodes that are allocated.
+		alloc := s.fsm.GetAllAllocations()
+		granted := make([]raftpkg.ClaimTaskData, 0, len(batch))
+		var failedIDs []string
+
+		for _, t := range batch {
+			na, ok := alloc[t.NodeID]
+			if !ok || na.Tenants[t.TenantID] <= 0 {
+				failedIDs = append(failedIDs, t.TaskID)
+				continue
+			}
+			granted = append(granted, t)
 		}
 
-		resp, ok := result.Response().(*raftpkg.ClaimBatchResult)
-		if !ok {
-			batch = batch[:0]
-			return
+		if len(granted) > 0 {
+			cmd := raftpkg.MustMarshalCommand(raftpkg.OpClaimBatch, raftpkg.ClaimBatchData{
+				Tasks: granted,
+			})
+			result := s.raft.Apply(cmd, 5000)
+			if err := result.Error(); err != nil {
+				s.logger.Error("claim batch raft apply failed", zap.Error(err))
+				// Fail all claims.
+				for _, t := range batch {
+					failedIDs = append(failedIDs, t.TaskID)
+				}
+			} else if resp, ok := result.Response().(*raftpkg.ClaimBatchResult); ok {
+				failedIDs = append(failedIDs, resp.Failed...)
+			}
+		}
+
+		claimedIDs := make([]string, 0, len(granted))
+		for _, t := range granted {
+			claimedIDs = append(claimedIDs, t.TaskID)
 		}
 
 		_ = stream.Send(&grpcv1.ClaimBatch{
-			TaskIds:   resp.Claimed,
-			FailedIds: resp.Failed,
+			TaskIds:   claimedIDs,
+			FailedIds: failedIDs,
 		})
 		batch = batch[:0]
 	}
