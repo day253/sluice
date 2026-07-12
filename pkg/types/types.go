@@ -27,10 +27,10 @@ const (
 // NodeInfo represents a cluster node registered in the Raft FSM.
 type NodeInfo struct {
 	ID            string    `json:"id"`
-	Address       string    `json:"address"`        // HTTP API address
-	RaftAddress   string    `json:"raft_address"`   // Raft transport address
-	Status        string    `json:"status"`         // "up" | "down"
-	TotalWorkers  int       `json:"total_workers"`  // worker capacity of this node
+	Address       string    `json:"address"`       // HTTP API address
+	RaftAddress   string    `json:"raft_address"`  // Raft transport address
+	Status        string    `json:"status"`        // "up" | "down"
+	TotalWorkers  int       `json:"total_workers"` // worker capacity of this node
 	LastHeartbeat time.Time `json:"last_heartbeat"`
 }
 
@@ -94,8 +94,9 @@ type FSMState struct {
 	Nodes       map[string]*NodeInfo       `json:"nodes"`
 	Tenants     map[string]*TenantConfig   `json:"tenants"`
 	Allocations map[string]*NodeAllocation `json:"allocations"`
-	Tasks       map[string]*TaskRecord     `json:"tasks"`   // inflight + recovery-pending
-	Results     map[string]*TaskResult     `json:"results"`  // completed tasks (LRU, externally pruned)
+	Tasks       map[string]*TaskRecord     `json:"tasks"`        // unfinished task snapshot
+	Results     map[string]*TaskResult     `json:"results"`      // bounded recent result cache
+	ResultOrder []string                   `json:"result_order"` // oldest to newest
 	Version     uint64                     `json:"version"`
 }
 
@@ -132,12 +133,12 @@ type TaskResponse struct {
 
 // AllocationResponse is returned by the admin allocations endpoint.
 type AllocationResponse struct {
-	Nodes   []*NodeAllocation       `json:"nodes"`
+	Nodes   []*NodeAllocation        `json:"nodes"`
 	Tenants map[string]*TenantConfig `json:"tenants"`
 }
 
 // ErrorResponse is a generic error payload.
 type ErrorResponse struct {
-	Error   string `json:"error"`
-	Code    int    `json:"code"`
+	Error string `json:"error"`
+	Code  int    `json:"code"`
 }

@@ -79,7 +79,7 @@ func BenchmarkFSM_ReadConcurrent(b *testing.B) {
 		for pb.Next() {
 			fsm.GetTenant("t1")
 			fsm.GetActiveNodes()
-			fsm.CountInflightPerTenant()
+			fsm.CountUnfinishedPerTenant()
 		}
 	})
 }

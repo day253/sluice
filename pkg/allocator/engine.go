@@ -29,6 +29,9 @@ const (
 	// experience before being classified as idle (with the default 3 s
 	// interval this ≈ 9 s of inactivity).
 	idleThreshold = 3
+	// taskClaimLease bounds how long an inflight task may remain without a
+	// completion. Expired claims are returned to pending by the leader.
+	taskClaimLease = 5 * time.Minute
 )
 
 // ---------------------------------------------------------------------------
@@ -137,6 +140,9 @@ func (e *Engine) ReconcileNow() error {
 // Reconcile computes the fair allocation, applies idle detection, and writes
 // the final plan to Raft.
 func (e *Engine) Reconcile() error {
+	if err := e.requeueStaleTasks(); err != nil {
+		return err
+	}
 	state := e.fsm.GetState()
 
 	// 1. Determine active nodes and total cluster capacity.
@@ -161,7 +167,7 @@ func (e *Engine) Reconcile() error {
 	}
 
 	// 3. Build load snapshot: inflight tasks per tenant (FSM-level).
-	inflightCount := e.fsm.CountInflightPerTenant()
+	inflightCount := e.fsm.CountUnfinishedPerTenant()
 
 	// 4. Update idle-cycle counters and classify tenants.
 	idleSet := e.updateIdleState(tenantList, inflightCount)
@@ -211,6 +217,19 @@ func (e *Engine) Reconcile() error {
 		zap.Strings("idle_examples", idleNames),
 		zap.Int("total_workers", totalClusterWorkers),
 	)
+	return nil
+}
+
+func (e *Engine) requeueStaleTasks() error {
+	taskIDs := e.fsm.FindStaleInflightTaskIDs(time.Now().UTC().Add(-taskClaimLease))
+	if len(taskIDs) == 0 {
+		return nil
+	}
+	result := e.raft.Apply(raftpkg.MustMarshalCommand(raftpkg.OpRequeueTasks, raftpkg.RequeueTasksData{TaskIDs: taskIDs}), 5000)
+	if err := result.Error(); err != nil {
+		return err
+	}
+	e.logger.Warn("allocator: expired task claims returned to pending", zap.Int("tasks", len(taskIDs)))
 	return nil
 }
 

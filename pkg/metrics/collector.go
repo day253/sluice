@@ -42,41 +42,29 @@ func (c *Collector) Start(ctx context.Context) {
 }
 
 func (c *Collector) collect() {
-	state := c.fsm.GetState()
+	snapshot := c.fsm.GetMetricsSnapshot()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// ---- inflight per tenant ----
-	perTenant := map[string]int64{}
-	for _, t := range state.Tasks {
-		perTenant[t.TenantID]++
+	// ---- unfinished task history ----
+	var totalUnfinished int64
+	for tenantID, count := range snapshot.Unfinished {
+		totalUnfinished += count
+		c.ensure("unfinished:"+tenantID, map[string]string{"tenant": tenantID}).Record(count)
 	}
-	totalInflight := int64(len(state.Tasks))
-	c.ensure("inflight:total", nil).Record(totalInflight)
-	for tid, cnt := range perTenant {
-		c.ensure("inflight:"+tid, map[string]string{"tenant": tid}).Record(cnt)
-	}
+	c.ensure("unfinished:total", nil).Record(totalUnfinished)
 
-	// ---- allocation per tenant ----
-	allocCounts := map[string]int64{}
-	for _, alloc := range state.Allocations {
-		for tid, cnt := range alloc.Tenants {
-			allocCounts[tid] += int64(cnt)
-		}
+	// ---- allocated worker history ----
+	var totalAllocatedWorkers int64
+	for tenantID, count := range snapshot.AllocatedWorkersByTenant {
+		c.ensure("allocated-workers:tenant:"+tenantID, map[string]string{"tenant": tenantID}).Record(count)
 	}
-	for tid, cnt := range allocCounts {
-		c.ensure("alloc:"+tid, map[string]string{"tenant": tid}).Record(cnt)
+	for nodeID, count := range snapshot.AllocatedWorkersByNode {
+		totalAllocatedWorkers += count
+		c.ensure("allocated-workers:node:"+nodeID, map[string]string{"node": nodeID}).Record(count)
 	}
-
-	// ---- active nodes ----
-	active := int64(0)
-	for _, n := range state.Nodes {
-		if n.Status == "up" {
-			active++
-		}
-	}
-	c.ensure("nodes:active", nil).Record(active)
+	c.ensure("allocated-workers:total", nil).Record(totalAllocatedWorkers)
 
 	// ---- Tick all vars ----
 	for _, v := range c.vars {

@@ -2,8 +2,10 @@ package raft
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"go.uber.org/zap"
@@ -176,6 +178,33 @@ func TestTaskClaimCompleteFailed(t *testing.T) {
 	}
 }
 
+func TestRecentResultsStayBounded(t *testing.T) {
+	fsm := newTestFSM(t)
+	now := time.Now().UTC()
+
+	for i := 0; i <= maxRetainedTaskResults; i++ {
+		taskID := fmt.Sprintf("task-%05d", i)
+		fsm.state.Tasks[taskID] = &types.TaskRecord{TaskID: taskID, TenantID: "t1"}
+		fsm.finishTask(CompleteTaskData{TaskID: taskID, TenantID: "t1", Result: "ok"}, types.TaskStatusDone, now)
+	}
+
+	if got := len(fsm.state.Results); got != maxRetainedTaskResults {
+		t.Fatalf("retained results = %d, want %d", got, maxRetainedTaskResults)
+	}
+	if fsm.GetResult("task-00000") != nil {
+		t.Fatal("oldest result should have been evicted")
+	}
+	if fsm.GetResult(fmt.Sprintf("task-%05d", maxRetainedTaskResults)) == nil {
+		t.Fatal("newest result should still be queryable")
+	}
+
+	// A retried completion no longer has a live task and must not add a result.
+	fsm.finishTask(CompleteTaskData{TaskID: "task-00001", TenantID: "t1"}, types.TaskStatusDone, now)
+	if got := len(fsm.state.Results); got != maxRetainedTaskResults {
+		t.Fatalf("duplicate completion changed retained results to %d", got)
+	}
+}
+
 func TestTaskClaimDuplicateRejected(t *testing.T) {
 	fsm := newTestFSM(t)
 
@@ -224,6 +253,25 @@ func TestNodeDownRequeuesInflightTasks(t *testing.T) {
 	pending := fsm.FindPendingTasks("t1")
 	if len(pending) != 2 {
 		t.Errorf("expected 2 pending tasks for t1, got %d", len(pending))
+	}
+}
+
+func TestExpiredClaimCanBeRequeued(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "stale-task", TenantID: "t1", NodeID: "n1", Payload: `{}`,
+	})
+	fsm.state.Tasks["stale-task"].ClaimedAt = time.Now().UTC().Add(-10 * time.Minute)
+
+	taskIDs := fsm.FindStaleInflightTaskIDs(time.Now().UTC().Add(-5 * time.Minute))
+	if len(taskIDs) != 1 || taskIDs[0] != "stale-task" {
+		t.Fatalf("stale task IDs = %v, want [stale-task]", taskIDs)
+	}
+	applyCmd(t, fsm, OpRequeueTasks, RequeueTasksData{TaskIDs: taskIDs})
+
+	task := fsm.GetTask("stale-task")
+	if task == nil || task.Status != types.TaskStatusPending || task.NodeID != "" || !task.ClaimedAt.IsZero() {
+		t.Fatalf("requeued task = %+v, want clean pending task", task)
 	}
 }
 
@@ -317,7 +365,7 @@ func TestConcurrentReads(t *testing.T) {
 				fsm.GetTenant("t1")
 				fsm.GetAllTenants()
 				fsm.GetActiveNodes()
-				fsm.CountInflightPerTenant()
+				fsm.CountUnfinishedPerTenant()
 			}
 			done <- struct{}{}
 		}()

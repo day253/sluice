@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"time"
 
@@ -12,6 +13,10 @@ import (
 
 	"github.com/day253/sluice/pkg/types"
 )
+
+// maxRetainedTaskResults bounds the queryable result window in Raft snapshots.
+// Aggregate task counters remain durable after an individual result is evicted.
+const maxRetainedTaskResults = 10000
 
 // FSM is the Raft finite state machine.  All mutations to cluster state flow
 // through Apply(), which is called by the Raft library on the leader's
@@ -71,6 +76,8 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		return f.applyFailTask(cmd.Data)
 	case OpCompleteBatch:
 		return f.applyCompleteBatch(cmd.Data)
+	case OpRequeueTasks:
+		return f.applyRequeueTasks(cmd.Data)
 	case OpUpdateAllocation:
 		return f.applyUpdateAllocation(cmd.Data)
 	default:
@@ -118,6 +125,23 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	}
 	if state.Results == nil {
 		state.Results = make(map[string]*types.TaskResult)
+	}
+	if len(state.ResultOrder) == 0 && len(state.Results) > 0 {
+		state.ResultOrder = make([]string, 0, len(state.Results))
+		for taskID := range state.Results {
+			state.ResultOrder = append(state.ResultOrder, taskID)
+		}
+		sort.Slice(state.ResultOrder, func(i, j int) bool {
+			a, b := state.Results[state.ResultOrder[i]], state.Results[state.ResultOrder[j]]
+			if a.CompletedAt.Equal(b.CompletedAt) {
+				return a.TaskID < b.TaskID
+			}
+			return a.CompletedAt.Before(b.CompletedAt)
+		})
+	}
+	for len(state.ResultOrder) > maxRetainedTaskResults {
+		delete(state.Results, state.ResultOrder[0])
+		state.ResultOrder = state.ResultOrder[1:]
 	}
 
 	f.state = &state
@@ -272,14 +296,7 @@ func (f *FSM) applyCompleteTask(data json.RawMessage) interface{} {
 		return err
 	}
 
-	delete(f.state.Tasks, req.TaskID)
-	f.state.Results[req.TaskID] = &types.TaskResult{
-		TaskID:      req.TaskID,
-		TenantID:    req.TenantID,
-		Status:      types.TaskStatusDone,
-		Result:      req.Result,
-		CompletedAt: time.Now().UTC(),
-	}
+	f.finishTask(req, types.TaskStatusDone, time.Now().UTC())
 	return nil
 }
 
@@ -289,14 +306,7 @@ func (f *FSM) applyFailTask(data json.RawMessage) interface{} {
 		return err
 	}
 
-	delete(f.state.Tasks, req.TaskID)
-	f.state.Results[req.TaskID] = &types.TaskResult{
-		TaskID:      req.TaskID,
-		TenantID:    req.TenantID,
-		Status:      types.TaskStatusFailed,
-		Error:       req.Error,
-		CompletedAt: time.Now().UTC(),
-	}
+	f.finishTask(req, types.TaskStatusFailed, time.Now().UTC())
 	return nil
 }
 
@@ -352,16 +362,65 @@ func (f *FSM) applyCompleteBatch(data json.RawMessage) interface{} {
 	}
 	now := time.Now().UTC()
 	for _, t := range req.Tasks {
-		delete(f.state.Tasks, t.TaskID)
-		f.state.Results[t.TaskID] = &types.TaskResult{
-			TaskID:      t.TaskID,
-			TenantID:    t.TenantID,
-			Status:      types.TaskStatusDone,
-			Result:      t.Result,
-			CompletedAt: now,
-		}
+		f.finishTask(t, types.TaskStatusDone, now)
 	}
 	return nil
+}
+
+func (f *FSM) applyRequeueTasks(data json.RawMessage) interface{} {
+	var req RequeueTasksData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+	requeued := 0
+	for _, taskID := range req.TaskIDs {
+		task, ok := f.state.Tasks[taskID]
+		if !ok || task.Status != types.TaskStatusInflight {
+			continue
+		}
+		task.Status = types.TaskStatusPending
+		task.NodeID = ""
+		task.ClaimedAt = time.Time{}
+		requeued++
+	}
+	if requeued > 0 {
+		f.logger.Warn("fsm: stale task claims re-queued", zap.Int("tasks", requeued))
+	}
+	return nil
+}
+
+// finishTask moves one task out of the current unfinished snapshot, updates
+// durable counters, and retains only a bounded recent result for status reads.
+// A repeated completion is ignored so counters remain idempotent.
+func (f *FSM) finishTask(req CompleteTaskData, status string, completedAt time.Time) {
+	task, exists := f.state.Tasks[req.TaskID]
+	if !exists {
+		return
+	}
+	delete(f.state.Tasks, req.TaskID)
+
+	tenantID := task.TenantID
+	if tenantID == "" {
+		tenantID = req.TenantID
+	}
+	result := &types.TaskResult{
+		TaskID:      req.TaskID,
+		TenantID:    tenantID,
+		Status:      status,
+		CompletedAt: completedAt,
+	}
+	if status == types.TaskStatusFailed {
+		result.Error = req.Error
+	} else {
+		result.Result = req.Result
+	}
+	f.state.Results[req.TaskID] = result
+	f.state.ResultOrder = append(f.state.ResultOrder, req.TaskID)
+	if len(f.state.ResultOrder) > maxRetainedTaskResults {
+		oldest := f.state.ResultOrder[0]
+		f.state.ResultOrder = f.state.ResultOrder[1:]
+		delete(f.state.Results, oldest)
+	}
 }
 
 func (f *FSM) applyUpdateAllocation(data json.RawMessage) interface{} {
@@ -522,9 +581,23 @@ func (f *FSM) FindPendingTasks(tenantID string) []*types.TaskRecord {
 	return out
 }
 
-// CountInflightPerTenant returns the number of inflight + pending tasks per
+// FindStaleInflightTaskIDs returns tasks whose claim lease predates before.
+func (f *FSM) FindStaleInflightTaskIDs(before time.Time) []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var taskIDs []string
+	for taskID, task := range f.state.Tasks {
+		if task.Status == types.TaskStatusInflight && !task.ClaimedAt.IsZero() && task.ClaimedAt.Before(before) {
+			taskIDs = append(taskIDs, taskID)
+		}
+	}
+	sort.Strings(taskIDs)
+	return taskIDs
+}
+
+// CountUnfinishedPerTenant returns the number of inflight + pending tasks per
 // tenant. Used by the allocator for idle detection and by the Web UI.
-func (f *FSM) CountInflightPerTenant() map[string]int {
+func (f *FSM) CountUnfinishedPerTenant() map[string]int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	out := make(map[string]int)
@@ -547,6 +620,46 @@ func (f *FSM) CountPendingPerTenant() map[string]int {
 	return out
 }
 
+// MetricsSnapshot is a lightweight view used by the 1-second collector. It
+// intentionally excludes task payloads and recent result bodies.
+type MetricsSnapshot struct {
+	Unfinished               map[string]int64
+	AllocatedWorkersByTenant map[string]int64
+	AllocatedWorkersByNode   map[string]int64
+}
+
+// GetMetricsSnapshot returns current gauges and cumulative counters under one
+// read lock, without deep-copying the full FSM state on every metrics tick.
+func (f *FSM) GetMetricsSnapshot() MetricsSnapshot {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	snapshot := MetricsSnapshot{
+		Unfinished:               make(map[string]int64, len(f.state.Tenants)),
+		AllocatedWorkersByTenant: make(map[string]int64, len(f.state.Tenants)),
+		AllocatedWorkersByNode:   make(map[string]int64, len(f.state.Nodes)),
+	}
+	for tenantID := range f.state.Tenants {
+		snapshot.Unfinished[tenantID] = 0
+		snapshot.AllocatedWorkersByTenant[tenantID] = 0
+	}
+	for nodeID := range f.state.Nodes {
+		snapshot.AllocatedWorkersByNode[nodeID] = 0
+	}
+	for _, task := range f.state.Tasks {
+		snapshot.Unfinished[task.TenantID]++
+	}
+	for nodeID, allocation := range f.state.Allocations {
+		for tenantID, count := range allocation.Tenants {
+			snapshot.AllocatedWorkersByNode[nodeID] += int64(count)
+			if _, configured := f.state.Tenants[tenantID]; configured {
+				snapshot.AllocatedWorkersByTenant[tenantID] += int64(count)
+			}
+		}
+	}
+	return snapshot
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -558,6 +671,7 @@ func (f *FSM) copyState() *types.FSMState {
 		Allocations: make(map[string]*types.NodeAllocation, len(f.state.Allocations)),
 		Tasks:       make(map[string]*types.TaskRecord, len(f.state.Tasks)),
 		Results:     make(map[string]*types.TaskResult, len(f.state.Results)),
+		ResultOrder: append([]string(nil), f.state.ResultOrder...),
 		Version:     f.state.Version,
 	}
 	for k, v := range f.state.Nodes {

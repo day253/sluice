@@ -14,6 +14,7 @@ const (
 	OpFailTask         = "fail_task"
 	OpClaimBatch       = "claim_batch"
 	OpCompleteBatch    = "complete_batch"
+	OpRequeueTasks     = "requeue_tasks"
 	OpUpdateAllocation = "update_allocation"
 )
 
@@ -72,10 +73,15 @@ type CompleteBatchData struct {
 	Tasks []CompleteTaskData `json:"tasks"`
 }
 
+// RequeueTasksData moves expired inflight claims back to pending.
+type RequeueTasksData struct {
+	TaskIDs []string `json:"task_ids"`
+}
+
 // ClaimBatchResult is returned by OpClaimBatch.
 type ClaimBatchResult struct {
-	Claimed []string `json:"claimed"`  // task IDs successfully claimed
-	Failed  []string `json:"failed"`   // task IDs that were duplicate/already claimed
+	Claimed []string `json:"claimed"` // task IDs successfully claimed
+	Failed  []string `json:"failed"`  // task IDs that were duplicate/already claimed
 }
 
 // NodeDownData is the payload for OpNodeDown.

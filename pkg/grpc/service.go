@@ -252,14 +252,13 @@ func leaderAPIAddress(raftAddr string, nodes map[string]*types.NodeInfo) (string
 
 func (s *Service) ListTenants(ctx context.Context, req *grpcv1.ListTenantsRequest) (*grpcv1.ListTenantsResponse, error) {
 	tenants := s.fsm.GetAllTenants()
-	inflight := s.fsm.CountInflightPerTenant()
-	pending := s.fsm.CountPendingPerTenant()
+	outstanding := s.fsm.CountUnfinishedPerTenant()
 	resp := &grpcv1.ListTenantsResponse{}
 	for _, t := range tenants {
 		resp.Tenants = append(resp.Tenants, &grpcv1.TenantInfo{
 			TenantId: t.ID, Name: t.Name,
 			MaxWorkers: int32(t.MaxWorkers),
-			Inflight:   int32(inflight[t.ID] + pending[t.ID]),
+			Inflight:   int32(outstanding[t.ID]),
 		})
 	}
 	return resp, nil
