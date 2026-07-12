@@ -9,30 +9,40 @@ data:
     #!/bin/sh
     set -e
     ORDINAL=$(echo "${POD_NAME##*-}" | grep -o '[0-9]*$' || echo "0")
-    API="0.0.0.0:{{ .Values.apiPort }}"
-    RAFT="${POD_IP}:{{ .Values.raftPort }}"
-    DATA="/data"
     NAMESPACE="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+    API="0.0.0.0:{{ .Values.apiPort }}"
+    RAFT="0.0.0.0:{{ .Values.raftPort }}"
+    DATA="/data"
     TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
     SVC="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
 
-    resolve_bootstrap_ip() {
+    resolve_service_ip() {
+      SERVICE_NAME="$1"
       wget -qO- --header="Authorization: Bearer ${TOKEN}" --no-check-certificate \
-        "${SVC}/api/v1/namespaces/${NAMESPACE}/pods/{{ include "sluice.fullname" . }}-0" 2>/dev/null \
-        | sed -n 's/.*"podIP"\s*:\s*"\([0-9.]*\)".*/\1/p'
+        "${SVC}/api/v1/namespaces/${NAMESPACE}/services/${SERVICE_NAME}" 2>/dev/null \
+        | sed -n 's/.*"clusterIP"\s*:\s*"\([0-9.]*\)".*/\1/p'
     }
+
+    SELF_IP=$(resolve_service_ip "${POD_NAME}-raft")
+    while [ -z "$SELF_IP" ]; do
+      echo "   waiting for stable Raft service IP..."
+      sleep 2
+      SELF_IP=$(resolve_service_ip "${POD_NAME}-raft")
+    done
+    RAFT_ADVERTISE="${SELF_IP}:{{ .Values.raftPort }}"
 
     if [ "$ORDINAL" = "0" ]; then
       echo "==> Bootstrapping as ${POD_NAME} on ${RAFT}"
       exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
+        --raft-advertise="${RAFT_ADVERTISE}" \
         --data="${DATA}" --bootstrap --workers={{ .Values.workersPerNode }} \
         --log-level={{ .Values.logLevel }}
     else
-      BOOTSTRAP_IP=$(resolve_bootstrap_ip)
+      BOOTSTRAP_IP=$(resolve_service_ip "{{ include "sluice.fullname" . }}-0-raft")
       while [ -z "$BOOTSTRAP_IP" ]; do
         echo "   waiting for sluice-0 IP via K8s API..."
         sleep 2
-        BOOTSTRAP_IP=$(resolve_bootstrap_ip)
+        BOOTSTRAP_IP=$(resolve_service_ip "{{ include "sluice.fullname" . }}-0-raft")
       done
       echo "==> Joining via ${BOOTSTRAP_IP}:{{ .Values.apiPort }}"
       for i in $(seq 1 30); do
@@ -40,6 +50,7 @@ data:
         echo "   waiting for leader... ${i}"; sleep 2
       done
       exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
+        --raft-advertise="${RAFT_ADVERTISE}" \
         --data="${DATA}" --join="${BOOTSTRAP_IP}:{{ .Values.apiPort }}" \
         --workers={{ .Values.workersPerNode }} --log-level={{ .Values.logLevel }}
     fi

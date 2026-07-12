@@ -34,3 +34,28 @@ spec:
       targetPort: {{ .Values.apiPort }}
   selector:
     {{- include "sluice.labels" . | nindent 4 }}
+
+{{- range $ordinal := until (int .Values.replicas) }}
+---
+# Stable per-Pod address for Raft. ClusterIP is used directly because some
+# environments intercept cluster DNS with fake-IP responses.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sluice.fullname" $ }}-{{ $ordinal }}-raft
+  labels:
+    {{- include "sluice.labels" $ | nindent 4 }}
+spec:
+  type: ClusterIP
+  publishNotReadyAddresses: true
+  ports:
+    - name: api
+      port: {{ $.Values.apiPort }}
+      targetPort: {{ $.Values.apiPort }}
+    - name: raft
+      port: {{ $.Values.raftPort }}
+      targetPort: {{ $.Values.raftPort }}
+  selector:
+    {{- include "sluice.labels" $ | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ include "sluice.fullname" $ }}-{{ $ordinal }}
+{{- end }}

@@ -17,8 +17,8 @@ import (
 	"github.com/day253/sluice/pkg/api"
 	grpcpkg "github.com/day253/sluice/pkg/grpc"
 	"github.com/day253/sluice/pkg/metrics"
-	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/queue"
+	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/tenant"
 	"github.com/day253/sluice/pkg/types"
 	"github.com/day253/sluice/pkg/worker"
@@ -29,13 +29,14 @@ import (
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	NodeID       string
-	APIAddress   string // cmux: HTTP+gRPC on single port (e.g. :9090)
-	RaftAddress  string
-	DataDir      string
-	Bootstrap    bool
-	JoinAddress  string
-	TotalWorkers int
+	NodeID          string
+	APIAddress      string // cmux: HTTP+gRPC on single port (e.g. :9090)
+	RaftAddress     string // stable address advertised to peers
+	RaftBindAddress string // local listen address; defaults to RaftAddress
+	DataDir         string
+	Bootstrap       bool
+	JoinAddress     string
+	TotalWorkers    int
 }
 
 // ---------------------------------------------------------------------------
@@ -81,11 +82,12 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 	// ---- Raft cluster ----
 	raftCfg := raftpkg.ClusterConfig{
-		NodeID:      cfg.NodeID,
-		RaftAddress: cfg.RaftAddress,
-		DataDir:     cfg.DataDir + "/raft",
-		Bootstrap:   cfg.Bootstrap,
-		Logger:      logger,
+		NodeID:          cfg.NodeID,
+		RaftAddress:     cfg.RaftAddress,
+		RaftBindAddress: cfg.RaftBindAddress,
+		DataDir:         cfg.DataDir + "/raft",
+		Bootstrap:       cfg.Bootstrap,
+		Logger:          logger,
 	}
 	cluster, err := raftpkg.NewCluster(raftCfg)
 	if err != nil {
@@ -324,11 +326,11 @@ func (n *Node) watchAllocations() {
 // Accessors
 // ---------------------------------------------------------------------------
 
-func (n *Node) RaftCluster() *raftpkg.Cluster { return n.raftCluster }
+func (n *Node) RaftCluster() *raftpkg.Cluster  { return n.raftCluster }
 func (n *Node) Queue() queue.Queue             { return n.queue }
 func (n *Node) Pool() *worker.Pool             { return n.pool }
-func (n *Node) AllocEngine() *allocator.Engine  { return n.allocEngine }
-func (n *Node) TenantManager() *tenant.Manager  { return n.tenantMgr }
+func (n *Node) AllocEngine() *allocator.Engine { return n.allocEngine }
+func (n *Node) TenantManager() *tenant.Manager { return n.tenantMgr }
 
 // ---------------------------------------------------------------------------
 // raftApplierBridge
@@ -343,15 +345,15 @@ func (b *raftApplierBridge) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult
 	return &applyResultBridge{future: future}
 }
 
-func (b *raftApplierBridge) IsLeader() bool      { return b.cluster.IsLeader() }
-func (b *raftApplierBridge) LeaderAddr() string   { return b.cluster.LeaderAddr() }
+func (b *raftApplierBridge) IsLeader() bool     { return b.cluster.IsLeader() }
+func (b *raftApplierBridge) LeaderAddr() string { return b.cluster.LeaderAddr() }
 
 type applyResultBridge struct {
 	future hashicorpraft.ApplyFuture
 }
 
 func (r *applyResultBridge) Error() error          { return r.future.Error() }
-func (r *applyResultBridge) Response() interface{}  { return r.future.Response() }
+func (r *applyResultBridge) Response() interface{} { return r.future.Response() }
 
 // metricsAdapter bridges metrics.Collector → api.MetricsData for HTTP.
 type metricsAdapter struct{ c *metrics.Collector }

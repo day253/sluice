@@ -1,0 +1,9 @@
+.git
+.gitignore
+bin
+data
+*.out
+*.test
+.DS_Store
+.idea
+.vscode

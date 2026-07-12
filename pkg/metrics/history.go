@@ -47,6 +47,8 @@ type VarHistory struct {
 	// Day ring — 30 most recent days.
 	dayRing [30]int64
 	dayIdx  int
+	dayAcc  int64
+	dayCnt  int
 
 	// Last tick time.
 	lastTick time.Time
@@ -63,10 +65,14 @@ func (v *VarHistory) Record(val int64) {
 
 // Tick advances time windows.  Call once per second.
 func (v *VarHistory) Tick() {
+	v.tickAt(time.Now())
+}
+
+func (v *VarHistory) tickAt(now time.Time) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	now := time.Now().Truncate(time.Second)
+	now = now.Truncate(time.Second)
 	if !v.lastTick.IsZero() && !now.After(v.lastTick) {
 		return
 	}
@@ -110,22 +116,23 @@ func (v *VarHistory) Tick() {
 			v.hourIdx = (v.hourIdx + 1) % 24
 			v.hourAcc = 0
 			v.hourCnt = 0
+			v.dayAcc += hourAvg
+			v.dayCnt++
 
 			// ---- Every 24 hours, commit a day ----
 			if v.hourIdx == 0 {
 				dayAvg := int64(0)
-				if v.dayCnt() > 0 {
-					dayAvg = v.dayAcc()
+				if v.dayCnt > 0 {
+					dayAvg = v.dayAcc / int64(v.dayCnt)
 				}
 				v.dayRing[v.dayIdx] = dayAvg
 				v.dayIdx = (v.dayIdx + 1) % 30
+				v.dayAcc = 0
+				v.dayCnt = 0
 			}
 		}
 	}
 }
-
-func (v *VarHistory) dayAcc() int64  { return v.hourAcc }
-func (v *VarHistory) dayCnt() int    { return v.hourCnt }
 
 // Query returns all rings in chronological order.
 func (v *VarHistory) Query() VarData {

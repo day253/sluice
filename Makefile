@@ -1,4 +1,4 @@
-.PHONY: all build test bench clean deps proto docker push-docker multipass multipass-clean run-dev run-node1 run-node2 run-node3
+.PHONY: all build test bench clean deps proto docker push-docker remote-deploy multipass multipass-clean run-dev run-node1 run-node2 run-node3
 
 APP      := sluice
 CMD_DIR  := ./cmd/sluice
@@ -41,6 +41,11 @@ docker: build
 
 push-docker: docker
 	docker push ghcr.io/day253/sluice:latest
+
+# Build and deploy on the fixed remote MicroK8s host.
+# Override with DEPLOY_HOST/DEPLOY_USER/DEPLOY_DIR when needed.
+remote-deploy:
+	./scripts/deploy-remote.sh
 
 # ---- microk8s (local Kubernetes) ----
 microk8s-install:

@@ -21,11 +21,12 @@ import (
 
 // ClusterConfig holds all parameters needed to bootstrap a Raft node.
 type ClusterConfig struct {
-	NodeID      string // unique node identifier
-	RaftAddress string // e.g. "192.168.1.10:7000" — Raft RPC
-	DataDir     string // directory for Raft logs, stable store, snapshots
-	Bootstrap   bool   // true = create a single-node cluster
-	Logger      *zap.Logger
+	NodeID          string // unique node identifier
+	RaftAddress     string // stable Raft RPC address advertised to peers
+	RaftBindAddress string // local listen address; defaults to RaftAddress
+	DataDir         string // directory for Raft logs, stable store, snapshots
+	Bootstrap       bool   // true = create a single-node cluster
+	Logger          *zap.Logger
 }
 
 // ---------------------------------------------------------------------------
@@ -93,7 +94,11 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve raft address %s: %w", cfg.RaftAddress, err)
 	}
-	transport, err := raft.NewTCPTransport(cfg.RaftAddress, addr, 3, 10*time.Second, os.Stderr)
+	bindAddress := cfg.RaftBindAddress
+	if bindAddress == "" {
+		bindAddress = cfg.RaftAddress
+	}
+	transport, err := raft.NewTCPTransport(bindAddress, addr, 3, 10*time.Second, os.Stderr)
 	if err != nil {
 		return nil, fmt.Errorf("tcp transport: %w", err)
 	}
@@ -129,8 +134,11 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 		cfgFuture := rf.BootstrapCluster(raft.Configuration{
 			Servers: []raft.Server{
 				{
-					ID:      raft.ServerID(cfg.NodeID),
-					Address: transport.LocalAddr(),
+					ID: raft.ServerID(cfg.NodeID),
+					// Keep the configured address instead of the local bind address.
+					// In Kubernetes this is a stable per-Pod Service IP; persisting
+					// the resolved Pod IP breaks Raft after a rollout.
+					Address: raft.ServerAddress(cfg.RaftAddress),
 				},
 			},
 		})
@@ -226,10 +234,10 @@ func (c *Cluster) RemoveServer(nodeID string) error {
 // JoinRequest is sent via HTTP to an existing cluster member to request
 // joining the Raft cluster.
 type JoinRequest struct {
-	NodeID      string `json:"node_id"`
-	RaftAddress string `json:"raft_address"`
-	HTTPAddress string `json:"http_address"`
-	TotalWorkers int   `json:"total_workers"`
+	NodeID       string `json:"node_id"`
+	RaftAddress  string `json:"raft_address"`
+	HTTPAddress  string `json:"http_address"`
+	TotalWorkers int    `json:"total_workers"`
 }
 
 // JoinResponse is the reply from the leader.

@@ -8,16 +8,21 @@ package grpc
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+	googlegrpc "google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	grpcv1 "github.com/day253/sluice/pkg/grpc/v1"
-	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/queue"
+	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/types"
 	"github.com/day253/sluice/pkg/worker"
 )
@@ -35,6 +40,11 @@ type Service struct {
 	raft   raftpkg.RaftApplier
 	pool   *worker.Pool
 	logger *zap.Logger
+
+	forwardMu     sync.Mutex
+	forwardAddr   string
+	forwardConn   *googlegrpc.ClientConn
+	forwardClient grpcv1.SluiceClient
 }
 
 func NewService(
@@ -61,6 +71,15 @@ func (s *Service) Submit(ctx context.Context, req *grpcv1.SubmitRequest) (*grpcv
 	}
 	if _, ok := s.fsm.GetTenant(req.TenantId); !ok {
 		return nil, status.Error(codes.NotFound, "tenant not found: "+req.TenantId)
+	}
+	if !s.raft.IsLeader() {
+		client, err := s.leaderClient()
+		if err != nil {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
+		forwardCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return client.Submit(forwardCtx, req)
 	}
 
 	taskID := uuid.New().String()
@@ -149,6 +168,15 @@ func (s *Service) UpsertTenant(ctx context.Context, req *grpcv1.UpsertTenantRequ
 	if req.MaxWorkers < 1 {
 		return nil, status.Error(codes.InvalidArgument, "max_workers must be >= 1")
 	}
+	if !s.raft.IsLeader() {
+		client, err := s.leaderClient()
+		if err != nil {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
+		forwardCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return client.UpsertTenant(forwardCtx, req)
+	}
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpUpsertTenant, types.TenantConfig{
 		ID: req.TenantId, Name: req.Name, MaxWorkers: int(req.MaxWorkers),
 	})
@@ -159,11 +187,67 @@ func (s *Service) UpsertTenant(ctx context.Context, req *grpcv1.UpsertTenantRequ
 }
 
 func (s *Service) DeleteTenant(ctx context.Context, req *grpcv1.DeleteTenantRequest) (*grpcv1.DeleteTenantResponse, error) {
+	if !s.raft.IsLeader() {
+		client, err := s.leaderClient()
+		if err != nil {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
+		forwardCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return client.DeleteTenant(forwardCtx, req)
+	}
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpDeleteTenant, raftpkg.DeleteTenantData{ID: req.TenantId})
 	if err := s.raft.Apply(cmd, 5000).Error(); err != nil {
 		return nil, status.Errorf(codes.Internal, "raft apply: %v", err)
 	}
 	return &grpcv1.DeleteTenantResponse{Ok: true}, nil
+}
+
+// leaderClient returns a cached gRPC client to the current leader. External
+// requests arrive through a load-balanced Kubernetes Service, so followers
+// must forward writes instead of calling raft.Apply locally.
+func (s *Service) leaderClient() (grpcv1.SluiceClient, error) {
+	addr, err := leaderAPIAddress(s.raft.LeaderAddr(), s.fsm.GetAllNodes())
+	if err != nil {
+		return nil, err
+	}
+
+	s.forwardMu.Lock()
+	defer s.forwardMu.Unlock()
+	if s.forwardClient != nil && s.forwardAddr == addr {
+		return s.forwardClient, nil
+	}
+	if s.forwardConn != nil {
+		_ = s.forwardConn.Close()
+	}
+	conn, err := googlegrpc.NewClient(addr, googlegrpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("connect to leader %s: %w", addr, err)
+	}
+	s.forwardAddr = addr
+	s.forwardConn = conn
+	s.forwardClient = grpcv1.NewSluiceClient(conn)
+	return s.forwardClient, nil
+}
+
+func leaderAPIAddress(raftAddr string, nodes map[string]*types.NodeInfo) (string, error) {
+	if raftAddr == "" {
+		return "", fmt.Errorf("raft leader is not available")
+	}
+	for _, node := range nodes {
+		if node.RaftAddress != raftAddr || node.Address == "" {
+			continue
+		}
+		host, _, err := net.SplitHostPort(node.Address)
+		if err == nil && host != "" && host != "0.0.0.0" && host != "::" {
+			return node.Address, nil
+		}
+	}
+	host, _, err := net.SplitHostPort(raftAddr)
+	if err != nil {
+		return "", fmt.Errorf("parse raft leader address %q: %w", raftAddr, err)
+	}
+	return net.JoinHostPort(host, "9090"), nil
 }
 
 func (s *Service) ListTenants(ctx context.Context, req *grpcv1.ListTenantsRequest) (*grpcv1.ListTenantsResponse, error) {

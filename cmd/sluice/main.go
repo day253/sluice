@@ -23,14 +23,15 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	nodeID       = flag.String("id", "node-1", "Unique node identifier")
-	apiAddr      = flag.String("api", "127.0.0.1:9090", "API listen address (cmux: HTTP+gRPC single port)")
-	raftAddr     = flag.String("raft", "127.0.0.1:7000", "Raft transport address")
-	dataDir      = flag.String("data", "./data", "Data directory")
-	bootstrap    = flag.Bool("bootstrap", false, "Bootstrap a new single-node cluster")
-	joinAddr     = flag.String("join", "", "Address of an existing node to join")
-	totalWorkers = flag.Int("workers", 100, "Total worker capacity on this node")
-	logLevel     = flag.String("log-level", "info", "Log level: debug, info, warn, error")
+	nodeID        = flag.String("id", "node-1", "Unique node identifier")
+	apiAddr       = flag.String("api", "127.0.0.1:9090", "API listen address (cmux: HTTP+gRPC single port)")
+	raftAddr      = flag.String("raft", "127.0.0.1:7000", "Raft transport address")
+	raftAdvertise = flag.String("raft-advertise", "", "Stable Raft address advertised to peers (defaults to --raft)")
+	dataDir       = flag.String("data", "./data", "Data directory")
+	bootstrap     = flag.Bool("bootstrap", false, "Bootstrap a new single-node cluster")
+	joinAddr      = flag.String("join", "", "Address of an existing node to join")
+	totalWorkers  = flag.Int("workers", 100, "Total worker capacity on this node")
+	logLevel      = flag.String("log-level", "info", "Log level: debug, info, warn, error")
 )
 
 // ---------------------------------------------------------------------------
@@ -53,14 +54,19 @@ func main() {
 	)
 
 	// ---- Build node config ----
+	advertisedRaftAddr := *raftAdvertise
+	if advertisedRaftAddr == "" {
+		advertisedRaftAddr = *raftAddr
+	}
 	cfg := node.Config{
-		NodeID:       *nodeID,
-		APIAddress:   *apiAddr,
-		RaftAddress:  *raftAddr,
-		DataDir:      *dataDir,
-		Bootstrap:    *bootstrap,
-		JoinAddress:  *joinAddr,
-		TotalWorkers: *totalWorkers,
+		NodeID:          *nodeID,
+		APIAddress:      *apiAddr,
+		RaftAddress:     advertisedRaftAddr,
+		RaftBindAddress: *raftAddr,
+		DataDir:         *dataDir,
+		Bootstrap:       *bootstrap,
+		JoinAddress:     *joinAddr,
+		TotalWorkers:    *totalWorkers,
 	}
 
 	// ---- Use the demo processor (replace with your own) ----
