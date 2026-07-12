@@ -3,10 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 
 	"go.uber.org/zap"
@@ -150,14 +152,29 @@ func newLogger(level string) *zap.Logger {
 
 // joinExistingCluster sends a join request to an existing member.
 func joinExistingCluster(joinAddr string, cfg node.Config, logger *zap.Logger) error {
-	// In a real implementation this would make an HTTP POST to
-	// http://<joinAddr>/api/v1/cluster/join with the node's details.
-	// For now we log that joining is handled externally (e.g. via
-	// the admin API or manual raft.AddVoter).
-	logger.Info("join requested — use admin API or raft CLI to add this node as a voter",
-		zap.String("join_addr", joinAddr),
-		zap.String("my_raft_addr", cfg.RaftAddress),
-		zap.String("my_node_id", cfg.NodeID),
+	body, err := json.Marshal(map[string]interface{}{
+		"node_id":       cfg.NodeID,
+		"raft_address":  cfg.RaftAddress,
+		"http_address":  cfg.APIAddress,
+		"total_workers": cfg.TotalWorkers,
+	})
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(
+		"http://"+joinAddr+"/api/v1/cluster/join",
+		"application/json",
+		bytes.NewReader(body),
 	)
+	if err != nil {
+		return fmt.Errorf("join request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("join rejected: status %d", resp.StatusCode)
+	}
+	logger.Info("successfully joined cluster via " + joinAddr)
 	return nil
 }

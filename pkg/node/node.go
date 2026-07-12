@@ -19,6 +19,7 @@ import (
 	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/queue"
 	"github.com/day253/sluice/pkg/tenant"
+	"github.com/day253/sluice/pkg/types"
 	"github.com/day253/sluice/pkg/worker"
 )
 
@@ -122,6 +123,17 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 	// ---- HTTP handler (adapts gRPC service) ----
 	httpHandler := api.NewHandler(cfg.NodeID, grpcSvc, logger)
+	httpHandler.SetJoinFunc(func(nodeID, raftAddr, httpAddr string, workers int) error {
+		if err := cluster.AddVoter(nodeID, raftAddr); err != nil {
+			return err
+		}
+		// Also register in FSM (AddVoter only updates Raft config).
+		cmd := raftpkg.MustMarshalCommand(raftpkg.OpNodeUp, types.NodeInfo{
+			ID: nodeID, Address: httpAddr, RaftAddress: raftAddr,
+			Status: types.NodeStatusUp, TotalWorkers: workers,
+		})
+		return cluster.GetRaft().Apply(cmd, 5*time.Second).Error()
+	})
 
 	// ---- API server (cmux or legacy HTTP) ----
 	if cfg.APIAddress != "" {

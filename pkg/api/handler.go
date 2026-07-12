@@ -21,14 +21,20 @@ import (
 // Handler adapts the gRPC Sluice service to HTTP REST.  Every endpoint
 // converts the HTTP request to a gRPC call and the response back to JSON.
 type Handler struct {
-	nodeID string
-	svc    *grpcpkg.Service
-	logger *zap.Logger
+	nodeID     string
+	svc        *grpcpkg.Service
+	joinFunc   func(nodeID, raftAddr, httpAddr string, workers int) error
+	logger     *zap.Logger
 }
 
 // NewHandler creates an HTTP handler backed by the given gRPC service.
 func NewHandler(nodeID string, svc *grpcpkg.Service, logger *zap.Logger) *Handler {
 	return &Handler{nodeID: nodeID, svc: svc, logger: logger}
+}
+
+// SetJoinFunc configures the handler to handle cluster-join requests.
+func (h *Handler) SetJoinFunc(fn func(nodeID, raftAddr, httpAddr string, workers int) error) {
+	h.joinFunc = fn
 }
 
 // RegisterRoutes attaches all endpoints to the given router.
@@ -190,7 +196,28 @@ func (h *Handler) getAllocations(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func (h *Handler) joinCluster(w http.ResponseWriter, r *http.Request) {
-	h.logger.Info("join request received via HTTP")
+	var req struct {
+		NodeID       string `json:"node_id"`
+		RaftAddress  string `json:"raft_address"`
+		HTTPAddress  string `json:"http_address"`
+		TotalWorkers int    `json:"total_workers"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.NodeID == "" || req.RaftAddress == "" {
+		h.writeError(w, http.StatusBadRequest, "node_id and raft_address required")
+		return
+	}
+	if h.joinFunc == nil {
+		h.writeError(w, http.StatusInternalServerError, "join not configured")
+		return
+	}
+	if err := h.joinFunc(req.NodeID, req.RaftAddress, req.HTTPAddress, req.TotalWorkers); err != nil {
+		h.writeError(w, http.StatusInternalServerError, "join failed: "+err.Error())
+		return
+	}
 	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 }
 
