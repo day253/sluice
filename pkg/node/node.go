@@ -357,12 +357,13 @@ func (r *applyResultBridge) Response() interface{}  { return r.future.Response()
 type metricsAdapter struct{ c *metrics.Collector }
 
 func (a metricsAdapter) Query(name string) ([]api.MetricsData, int) {
-	data, n := a.c.Query(name)
+	data := a.c.QueryNamed(name)
 	out := make([]api.MetricsData, len(data))
 	for i, d := range data {
 		out[i] = api.MetricsData{
-			Name: d.Name, Labels: d.Labels, Values: d.Values,
+			Name: d.Name, Labels: d.Labels,
+			Secs: d.Secs, Mins: d.Mins, Hours: d.Hours, Days: d.Days,
 		}
 	}
-	return out, n
+	return out, len(out)
 }

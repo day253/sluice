@@ -31,7 +31,10 @@ type Handler struct {
 type MetricsData struct {
 	Name   string            `json:"name"`
 	Labels map[string]string `json:"labels,omitempty"`
-	Values []int64           `json:"values"`
+	Secs   []int64           `json:"secs"`
+	Mins   []int64           `json:"mins"`
+	Hours  []int64           `json:"hours"`
+	Days   []int64           `json:"days"`
 }
 
 // NewHandler creates an HTTP handler backed by the given gRPC service.

@@ -166,8 +166,8 @@ async function refresh(){
 async function loadHistory(){
   try{const r=await fetch('/api/v1/metrics');if(!r.ok)return;const data=await r.json();
     data.forEach(d=>{
-      if(d.name==='inflight:total'){H.inf=d.values.filter(x=>x>=0).slice(-300);H.labels=d.values.map((_,i)=>new Date(Date.now()-(d.values.length-i)*1000).toLocaleTimeString()).slice(-300)}
-      else if(d.name.startsWith('alloc:')){const tid=d.name.replace('alloc:','');H.usage[tid]=d.values.filter(x=>x>=0).slice(-200)}
+      if(d.name==='inflight:total'){H.inf=(d.secs||d.values||[]).filter(x=>x>=0).slice(-300);H.labels=H.inf.map((_,i)=>new Date(Date.now()-(H.inf.length-i)*1000).toLocaleTimeString()).slice(-300)}
+      else if(d.name.startsWith('alloc:')){const tid=d.name.replace('alloc:','');H.usage[tid]=(d.secs||d.values||[]).filter(x=>x>=0).slice(-200)}
     });
     if(H.inf.length){updateInfChart()}
     const totals={};Object.entries(H.usage).forEach(([tid,arr])=>{if(arr.length)totals[tid]=arr[arr.length-1]});

@@ -10,33 +10,25 @@ import (
 	raftpkg "github.com/day253/sluice/pkg/raft"
 )
 
-const maxHistory = 600 // 10 minutes at 1s interval
-
-type varData struct {
-	Name   string            `json:"name"`
-	Labels map[string]string `json:"labels,omitempty"`
-	Values []int64           `json:"values"`
-}
-
-// Collector samples FSM metrics every second into a ring buffer.
+// Collector samples FSM metrics every second into VarHistory ring buffers.
 type Collector struct {
 	fsm    *raftpkg.FSM
 	logger *zap.Logger
 
 	mu   sync.RWMutex
-	vars map[string]*varData
+	vars map[string]*VarHistory
 }
 
 func NewCollector(fsm *raftpkg.FSM, logger *zap.Logger) *Collector {
 	return &Collector{
 		fsm:    fsm,
 		logger: logger,
-		vars:   make(map[string]*varData),
+		vars:   make(map[string]*VarHistory),
 	}
 }
 
 func (c *Collector) Start(ctx context.Context) {
-	c.logger.Info("metrics: collector started (1s interval)")
+	c.logger.Info("metrics: collector started (1s tick)")
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -61,9 +53,9 @@ func (c *Collector) collect() {
 		perTenant[t.TenantID]++
 	}
 	totalInflight := int64(len(state.Tasks))
-	push(c, "inflight:total", nil, totalInflight)
+	c.ensure("inflight:total", nil).Record(totalInflight)
 	for tid, cnt := range perTenant {
-		push(c, "inflight:"+tid, map[string]string{"tenant": tid}, cnt)
+		c.ensure("inflight:"+tid, map[string]string{"tenant": tid}).Record(cnt)
 	}
 
 	// ---- allocation per tenant ----
@@ -74,7 +66,7 @@ func (c *Collector) collect() {
 		}
 	}
 	for tid, cnt := range allocCounts {
-		push(c, "alloc:"+tid, map[string]string{"tenant": tid}, cnt)
+		c.ensure("alloc:"+tid, map[string]string{"tenant": tid}).Record(cnt)
 	}
 
 	// ---- active nodes ----
@@ -84,43 +76,73 @@ func (c *Collector) collect() {
 			active++
 		}
 	}
-	push(c, "nodes:active", nil, active)
+	c.ensure("nodes:active", nil).Record(active)
 
-	// ---- total workers ----
-	totalW := int64(0)
-	for _, n := range state.Nodes {
-		totalW += int64(n.TotalWorkers)
+	// ---- Tick all vars ----
+	for _, v := range c.vars {
+		v.Tick()
 	}
-	push(c, "workers:total", nil, totalW)
 }
 
-func push(c *Collector, name string, labels map[string]string, val int64) {
-	v, ok := c.vars[name]
-	if !ok {
-		v = &varData{Name: name, Labels: labels}
-		c.vars[name] = v
+func (c *Collector) ensure(name string, labels map[string]string) *VarHistory {
+	if v, ok := c.vars[name]; ok {
+		return v
 	}
-	v.Values = append(v.Values, val)
-	if len(v.Values) > maxHistory {
-		v.Values = v.Values[len(v.Values)-maxHistory:]
-	}
+	v := &VarHistory{}
+	c.vars[name] = v
+	return v
 }
 
 // Query returns historical data.  If name is empty, returns all.
-func (c *Collector) Query(name string) ([]varData, int) {
+func (c *Collector) Query(name string) ([]VarData, int) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	if name != "" {
 		if v, ok := c.vars[name]; ok {
-			return []varData{*v}, 1
+			return []VarData{v.Query()}, 1
 		}
 		return nil, 0
 	}
 
-	out := make([]varData, 0, len(c.vars))
-	for _, v := range c.vars {
-		out = append(out, *v)
+	out := make([]VarData, 0, len(c.vars))
+	// Return with names for the API.
+	for n, v := range c.vars {
+		d := v.Query()
+		// We lose the name here — need NamedVarData.
+		_ = n
+		_ = d
+		out = append(out, d)
 	}
 	return out, len(out)
+}
+
+// NamedVarData is the API response type with metric name + rings.
+type NamedVarData struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels,omitempty"`
+	Secs   []int64           `json:"secs"`
+	Mins   []int64           `json:"mins"`
+	Hours  []int64           `json:"hours"`
+	Days   []int64           `json:"days"`
+}
+
+// QueryNamed returns named historical data.
+func (c *Collector) QueryNamed(name string) []NamedVarData {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if name != "" {
+		if v, ok := c.vars[name]; ok {
+			return []NamedVarData{{Name: name, Secs: v.Query().Secs, Mins: v.Query().Mins, Hours: v.Query().Hours, Days: v.Query().Days}}
+		}
+		return nil
+	}
+
+	out := make([]NamedVarData, 0, len(c.vars))
+	for n, v := range c.vars {
+		d := v.Query()
+		out = append(out, NamedVarData{Name: n, Secs: d.Secs, Mins: d.Mins, Hours: d.Hours, Days: d.Days})
+	}
+	return out
 }
