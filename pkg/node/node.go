@@ -16,6 +16,7 @@ import (
 	"github.com/day253/sluice/pkg/allocator"
 	"github.com/day253/sluice/pkg/api"
 	grpcpkg "github.com/day253/sluice/pkg/grpc"
+	"github.com/day253/sluice/pkg/metrics"
 	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/queue"
 	"github.com/day253/sluice/pkg/tenant"
@@ -53,6 +54,7 @@ type Node struct {
 	muxServer   *grpcpkg.MultiplexServer
 	apiServer   *api.Server
 	claimClient *grpcpkg.ClaimClient
+	collector   *metrics.Collector
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -124,8 +126,12 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(), bridge, n.pool, logger)
 	internalSvc := grpcpkg.NewInternalService(cfg.NodeID, cluster.FSM(), bridge, logger)
 
+	// ---- Metrics collector (server-side history) ----
+	n.collector = metrics.NewCollector(cluster.FSM(), logger)
+
 	// ---- HTTP handler (adapts gRPC service) ----
 	httpHandler := api.NewHandler(cfg.NodeID, grpcSvc, logger)
+	httpHandler.SetCollector(metricsAdapter{n.collector})
 	httpHandler.SetJoinFunc(func(nodeID, raftAddr, httpAddr string, workers int) error {
 		if err := cluster.AddVoter(nodeID, raftAddr); err != nil {
 			return err
@@ -176,6 +182,7 @@ func (n *Node) Start() error {
 	}
 
 	n.allocEngine.Start(n.ctx, 3*time.Second)
+	go n.collector.Start(n.ctx)
 	go n.watchLeadership()
 	go n.watchAllocations()
 
@@ -345,3 +352,18 @@ type applyResultBridge struct {
 
 func (r *applyResultBridge) Error() error          { return r.future.Error() }
 func (r *applyResultBridge) Response() interface{}  { return r.future.Response() }
+
+// metricsAdapter bridges metrics.Collector → api.MetricsData for HTTP.
+type metricsAdapter struct{ c *metrics.Collector }
+
+func (a metricsAdapter) Query(name string) ([]api.MetricsData, int) {
+	data, n := a.c.Query(name)
+	out := make([]api.MetricsData, len(data))
+	for i, d := range data {
+		out[i] = api.MetricsData{
+			Name: d.Name, Labels: d.Labels,
+			Secs: d.Secs, Mins: d.Mins, Hours: d.Hours, Days: d.Days,
+		}
+	}
+	return out, n
+}

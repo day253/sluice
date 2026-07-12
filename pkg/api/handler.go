@@ -24,12 +24,27 @@ type Handler struct {
 	nodeID     string
 	svc        *grpcpkg.Service
 	joinFunc   func(nodeID, raftAddr, httpAddr string, workers int) error
+	collector  interface{ Query(name string) ([]MetricsData, int) }
 	logger     *zap.Logger
+}
+
+type MetricsData struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels,omitempty"`
+	Secs   []int64           `json:"secs"`
+	Mins   []int64           `json:"mins"`
+	Hours  []int64           `json:"hours"`
+	Days   []int64           `json:"days"`
 }
 
 // NewHandler creates an HTTP handler backed by the given gRPC service.
 func NewHandler(nodeID string, svc *grpcpkg.Service, logger *zap.Logger) *Handler {
 	return &Handler{nodeID: nodeID, svc: svc, logger: logger}
+}
+
+// SetCollector sets the metrics collector for /api/v1/metrics endpoint.
+func (h *Handler) SetCollector(c interface{ Query(name string) ([]MetricsData, int) }) {
+	h.collector = c
 }
 
 // SetJoinFunc configures the handler to handle cluster-join requests.
@@ -51,6 +66,8 @@ func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/admin/allocations", h.getAllocations).Methods("GET")
 
 	r.HandleFunc("/api/v1/cluster/join", h.joinCluster).Methods("POST")
+	r.HandleFunc("/api/v1/metrics", h.metrics).Methods("GET")
+	r.HandleFunc("/api/v1/metrics/{name}", h.metrics).Methods("GET")
 	r.HandleFunc("/api/v1/health", h.health).Methods("GET")
 }
 
@@ -228,6 +245,16 @@ func (h *Handler) joinCluster(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
+	if h.collector == nil {
+		h.writeJSON(w, http.StatusOK, []interface{}{})
+		return
+	}
+	name := mux.Vars(r)["name"]
+	data, _ := h.collector.Query(name)
+	h.writeJSON(w, http.StatusOK, data)
 }
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
