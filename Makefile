@@ -1,8 +1,9 @@
 .PHONY: all build test bench clean deps proto docker push-docker multipass multipass-clean run-dev run-node1 run-node2 run-node3
 
-APP     := sluice
-CMD_DIR := ./cmd/sluice
-BUILD   := CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/$(APP)
+APP      := sluice
+CMD_DIR  := ./cmd/sluice
+OP_DIR   := ./cmd/operator
+BUILD    := CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/$(APP)
 
 all: build
 
@@ -14,6 +15,10 @@ deps:
 build:
 	@mkdir -p bin
 	$(BUILD) $(CMD_DIR)
+
+build-operator:
+	@mkdir -p bin
+	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/sluice-operator $(OP_DIR)
 
 # ---- Test ----
 test:

@@ -1,0 +1,139 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sluiceclusters.sluice.day253.github.com
+spec:
+  group: sluice.day253.github.com
+  names:
+    kind: SluiceCluster
+    listKind: SluiceClusterList
+    plural: sluiceclusters
+    singular: sluicecluster
+    shortNames: [sc]
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [replicas]
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+                  maximum: 11
+                image:
+                  type: string
+                workersPerNode:
+                  type: integer
+                  default: 100
+                logLevel:
+                  type: string
+                  enum: [debug, info, warn, error]
+                persistence:
+                  type: object
+                  properties:
+                    size:
+                      type: string
+                resources:
+                  type: object
+                  properties:
+                    requests:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    limits:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              properties:
+                readyReplicas:
+                  type: integer
+                leader:
+                  type: string
+                nodes:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      status:
+                        type: string
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Replicas
+          type: integer
+          jsonPath: .spec.replicas
+        - name: Ready
+          type: integer
+          jsonPath: .status.readyReplicas
+        - name: Leader
+          type: string
+          jsonPath: .status.leader
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: tenants.sluice.day253.github.com
+spec:
+  group: sluice.day253.github.com
+  names:
+    kind: Tenant
+    listKind: TenantList
+    plural: tenants
+    singular: tenant
+    shortNames: [tnt]
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [maxWorkers]
+              properties:
+                maxWorkers:
+                  type: integer
+                  minimum: 1
+                clusterRef:
+                  type: string
+                  description: Name of SluiceCluster this tenant belongs to
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Active, Idle, Deleting]
+                inflight:
+                  type: integer
+                allocatedWorkers:
+                  type: integer
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: MaxWorkers
+          type: integer
+          jsonPath: .spec.maxWorkers
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Inflight
+          type: integer
+          jsonPath: .status.inflight
+        - name: Cluster
+          type: string
+          jsonPath: .spec.clusterRef
