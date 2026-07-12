@@ -16,9 +16,7 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /sluice /usr/local/bin/sluice
-COPY k8s/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
 
 EXPOSE 9090 7000
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/sluice"]

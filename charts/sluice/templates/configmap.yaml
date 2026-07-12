@@ -10,22 +10,36 @@ data:
     set -e
     ORDINAL=$(echo "${POD_NAME##*-}" | grep -o '[0-9]*$' || echo "0")
     API="0.0.0.0:{{ .Values.apiPort }}"
-    RAFT="0.0.0.0:{{ .Values.raftPort }}"
+    RAFT="${POD_IP}:{{ .Values.raftPort }}"
     DATA="/data"
+    NAMESPACE="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+    TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+    SVC="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+
+    resolve_bootstrap_ip() {
+      wget -qO- --header="Authorization: Bearer ${TOKEN}" --no-check-certificate \
+        "${SVC}/api/v1/namespaces/${NAMESPACE}/pods/{{ include "sluice.fullname" . }}-0" 2>/dev/null \
+        | sed -n 's/.*"podIP"\s*:\s*"\([0-9.]*\)".*/\1/p'
+    }
 
     if [ "$ORDINAL" = "0" ]; then
-      echo "==> Bootstrapping cluster as ${POD_NAME}"
+      echo "==> Bootstrapping as ${POD_NAME} on ${RAFT}"
       exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
         --data="${DATA}" --bootstrap --workers={{ .Values.workersPerNode }} \
         --log-level={{ .Values.logLevel }}
     else
-      JOIN="{{ include "sluice.fullname" . }}-0.{{ include "sluice.headless-svc" . }}:{{ .Values.apiPort }}"
-      echo "==> Joining cluster via ${JOIN}"
+      BOOTSTRAP_IP=$(resolve_bootstrap_ip)
+      while [ -z "$BOOTSTRAP_IP" ]; do
+        echo "   waiting for sluice-0 IP via K8s API..."
+        sleep 2
+        BOOTSTRAP_IP=$(resolve_bootstrap_ip)
+      done
+      echo "==> Joining via ${BOOTSTRAP_IP}:{{ .Values.apiPort }}"
       for i in $(seq 1 30); do
-        if wget -qO- "http://${JOIN}/api/v1/health" 2>/dev/null; then break; fi
+        wget -qO- "http://${BOOTSTRAP_IP}:{{ .Values.apiPort }}/api/v1/health" 2>/dev/null && break
         echo "   waiting for leader... ${i}"; sleep 2
       done
       exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
-        --data="${DATA}" --join="${JOIN}" --workers={{ .Values.workersPerNode }} \
-        --log-level={{ .Values.logLevel }}
+        --data="${DATA}" --join="${BOOTSTRAP_IP}:{{ .Values.apiPort }}" \
+        --workers={{ .Values.workersPerNode }} --log-level={{ .Values.logLevel }}
     fi
