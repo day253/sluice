@@ -1,0 +1,36 @@
+# Headless service for StatefulSet DNS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sluice.headless-svc" . }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: api
+      port: {{ .Values.apiPort }}
+      targetPort: {{ .Values.apiPort }}
+    - name: raft
+      port: {{ .Values.raftPort }}
+      targetPort: {{ .Values.raftPort }}
+  selector:
+    {{- include "sluice.labels" . | nindent 4 }}
+
+---
+# ClusterIP service for client access (load-balanced).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sluice.fullname" . }}
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: api
+      port: {{ .Values.apiPort }}
+      targetPort: {{ .Values.apiPort }}
+  selector:
+    {{- include "sluice.labels" . | nindent 4 }}

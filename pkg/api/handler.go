@@ -157,10 +157,14 @@ func (h *Handler) listTenants(w http.ResponseWriter, r *http.Request) {
 		h.writeGRPCError(w, err)
 		return
 	}
-	out := make(map[string]*types.TenantConfig, len(resp.Tenants))
+	// Return with inflight count included.
+	out := make(map[string]map[string]interface{}, len(resp.Tenants))
 	for _, t := range resp.Tenants {
-		out[t.TenantId] = &types.TenantConfig{
-			ID: t.TenantId, Name: t.Name, MaxWorkers: int(t.MaxWorkers),
+		out[t.TenantId] = map[string]interface{}{
+			"id":          t.TenantId,
+			"name":        t.Name,
+			"max_workers": t.MaxWorkers,
+			"inflight":    t.Inflight,
 		}
 	}
 	h.writeJSON(w, http.StatusOK, out)

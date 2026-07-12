@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -101,20 +102,12 @@ type DemoProcessor struct {
 
 // Process implements worker.Processor.
 func (p *DemoProcessor) Process(ctx context.Context, taskID, tenantID string, payload json.RawMessage) (string, error) {
-	p.logger.Info("processing task",
-		zap.String("task_id", taskID),
-		zap.String("tenant", tenantID),
-		zap.String("payload", string(payload)),
-	)
-
-	// Simulate work.
+	// Simulate real work (50-200ms) so the allocator can observe inflight.
 	select {
 	case <-ctx.Done():
 		return "", fmt.Errorf("task cancelled")
-	default:
+	case <-time.After(time.Duration(50+time.Now().UnixNano()%150) * time.Millisecond):
 	}
-
-	// The demo just returns the payload as the result.
 	return fmt.Sprintf(`{"echo": %s}`, string(payload)), nil
 }
 

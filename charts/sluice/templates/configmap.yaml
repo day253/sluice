@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sluice.fullname" . }}-entrypoint
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+data:
+  entrypoint.sh: |
+    #!/bin/sh
+    set -e
+    ORDINAL=$(echo "${POD_NAME##*-}" | grep -o '[0-9]*$' || echo "0")
+    API="0.0.0.0:{{ .Values.apiPort }}"
+    RAFT="0.0.0.0:{{ .Values.raftPort }}"
+    DATA="/data"
+
+    if [ "$ORDINAL" = "0" ]; then
+      echo "==> Bootstrapping cluster as ${POD_NAME}"
+      exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
+        --data="${DATA}" --bootstrap --workers={{ .Values.workersPerNode }} \
+        --log-level={{ .Values.logLevel }}
+    else
+      JOIN="{{ include "sluice.fullname" . }}-0.{{ include "sluice.headless-svc" . }}:{{ .Values.apiPort }}"
+      echo "==> Joining cluster via ${JOIN}"
+      for i in $(seq 1 30); do
+        if wget -qO- "http://${JOIN}/api/v1/health" 2>/dev/null; then break; fi
+        echo "   waiting for leader... ${i}"; sleep 2
+      done
+      exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
+        --data="${DATA}" --join="${JOIN}" --workers={{ .Values.workersPerNode }} \
+        --log-level={{ .Values.logLevel }}
+    fi

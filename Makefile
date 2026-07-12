@@ -37,7 +37,43 @@ docker: build
 push-docker: docker
 	docker push ghcr.io/day253/sluice:latest
 
-# ---- Multipass ----
+# ---- microk8s (local Kubernetes) ----
+microk8s-install:
+	sudo snap install microk8s --classic
+	sudo usermod -aG microk8s $$USER
+	microk8s status --wait-ready
+	microk8s enable dns registry hostpath-storage
+	@echo "Log out and back in for group changes to take effect"
+
+microk8s-deploy: docker
+	docker tag ghcr.io/day253/sluice:latest localhost:32000/sluice:latest
+	docker push localhost:32000/sluice:latest
+	helm upgrade --install sluice ./charts/sluice \
+		--set image.repository=localhost:32000/sluice \
+		--set image.tag=latest \
+		--set image.pullPolicy=Always \
+		--set affinity.enabled=false
+
+microk8s-status:
+	kubectl get pods,svc,statefulset -l app.kubernetes.io/name=sluice
+
+microk8s-clean:
+	helm uninstall sluice 2>/dev/null; true
+
+microk8s-logs:
+	kubectl logs -l app.kubernetes.io/name=sluice --tail=50
+
+microk8s-portforward:
+	kubectl port-forward svc/sluice 9090:9090
+
+# ---- Helm ----
+helm-lint:
+	helm lint ./charts/sluice
+
+helm-template:
+	helm template sluice ./charts/sluice
+
+# ---- Multipass (legacy) ----
 multipass: build
 	./multipass/setup.sh
 

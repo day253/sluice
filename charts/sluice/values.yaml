@@ -1,0 +1,46 @@
+# Number of Raft nodes (odd recommended: 3, 5, 7).
+replicas: 3
+
+image:
+  repository: ghcr.io/day253/sluice
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# API port (cmux: HTTP + gRPC on single port).
+apiPort: 9090
+# Raft transport port.
+raftPort: 7000
+
+# Workers per node.
+workersPerNode: 100
+
+# Log level: debug, info, warn, error.
+logLevel: info
+
+# Persistent storage for Raft logs and task queues.
+persistence:
+  enabled: true
+  size: 1Gi
+  # storageClass: ""  # default StorageClass
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Readiness / liveness probes.
+probes:
+  enabled: true
+  initialDelaySeconds: 10
+  periodSeconds: 5
+
+# Pod anti-affinity: prefer spreading across nodes.
+affinity:
+  enabled: true
+
+# Toleration / nodeSelector (for microk8s single-node, disable affinity).
+tolerations: []
+nodeSelector: {}

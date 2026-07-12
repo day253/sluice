@@ -1,313 +1,193 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sluice Dashboard</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sluice</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <style>
-:root { --bs-body-bg: #f8f9fb; --bs-body-color: #1a1a2e; }
-body { background: var(--bs-body-bg); color: var(--bs-body-color); font-size: 14px; }
-.navbar { box-shadow: 0 1px 4px rgba(0,0,0,.06); }
-.navbar-brand { font-weight: 700; letter-spacing: -.5px; }
-.badge-up { background: #d1fae5; color: #065f46; }
-.badge-down { background: #fee2e2; color: #991b1b; }
-.badge-warn { background: #fef3c7; color: #92400e; }
-.badge-idle { background: #f1f5f9; color: #64748b; }
-.stat-card { border: 1px solid #e5e7eb; border-radius: 12px; transition: box-shadow .2s; }
-.stat-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,.06); }
-.stat-value { font-size: 28px; font-weight: 700; }
-.stat-label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: .5px; }
-.chart-wrap { position: relative; height: 200px; }
-.tab-content { min-height: 400px; }
-.node-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-.node-dot.up { background: #10b981; }
-.node-dot.down { background: #ef4444; }
-.tenant-bar-wrap { height: 24px; background: #e5e7eb; border-radius: 6px; overflow: hidden; }
-.tenant-bar-fill { height: 100%; border-radius: 6px; transition: width .5s; }
-.tenant-bar-fill.idle { opacity: .4; }
-.table-sm td, .table-sm th { padding: .5rem .75rem; vertical-align: middle; }
-.toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 1050; }
-.fade-out { opacity: 0; transition: opacity .5s; }
-.timeline-item { padding: 6px 0; border-bottom: 1px solid #f3f4f6; font-size: 13px; }
-.timeline-item:last-child { border-bottom: none; }
-.timeline-time { color: #9ca3af; margin-right: 8px; font-variant-numeric: tabular-nums; }
+body { background:#f8f9fb; color:#1a1a2e; font-size:14px; }
+.navbar { box-shadow:0 1px 4px rgba(0,0,0,.06); }
+.navbar-brand { font-weight:700; letter-spacing:-.5px; }
+.badge-up { background:#d1fae5; color:#065f46; }
+.badge-down { background:#fee2e2; color:#991b1b; }
+.badge-idle { background:#f1f5f9; color:#64748b; }
+.stat-value { font-size:26px; font-weight:700; }
+.stat-label { font-size:11px; color:#6b7280; text-transform:uppercase; letter-spacing:.5px; }
+.chart-wrap { position:relative; height:220px; }
+.tenant-bar { height:20px; background:#e5e7eb; border-radius:6px; overflow:hidden; }
+.tenant-bar-fill { height:100%; border-radius:6px; transition:width .5s; }
+.tenant-bar-fill.idle { opacity:.35; }
+.timeline { max-height:200px; overflow-y:auto; font-size:12px; }
+.timeline-item { padding:4px 0; border-bottom:1px solid #f3f4f6; }
+.timeline-time { color:#9ca3af; margin-right:8px; }
 </style>
-<script>
-// ---- Data store ----
-const MAX_PTS = 300, COLORS = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#06b6d4','#84cc16'];
-const history = { inflight: [], workers: [], tenants: {}, events: [] };
-let dataVersion = 0, stale = false;
-
-function push(arr, v) { arr.push(v); if (arr.length > MAX_PTS) arr.shift(); }
-function downsample(arr, maxPts) {
-  if (arr.length <= maxPts) return arr;
-  const step = Math.ceil(arr.length / maxPts), out = [];
-  for (let i = 0; i < arr.length; i += step) {
-    let sum = 0; const end = Math.min(i + step, arr.length);
-    for (let j = i; j < end; j++) sum += arr[j].y;
-    out.push({x: arr[i].x, y: Math.round(sum / (end - i))});
-  }
-  return out;
-}
-
-function addEvent(msg) {
-  history.events.unshift({time: new Date().toLocaleTimeString(), msg});
-  if (history.events.length > 100) history.events.length = 100;
-}
-
-// ---- Charts ----
-let charts = {};
-function initChart(id, label, color, type='line') {
-  const ctx = document.getElementById(id);
-  if (!ctx) return;
-  if (charts[id]) charts[id].destroy();
-  charts[id] = new Chart(ctx, {
-    type, data: { datasets: [{ label, borderColor: color, backgroundColor: color+'15',
-      borderWidth: 2, pointRadius: 0, tension: .4, fill: true, data: [] }] },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      animation: { duration: 300 },
-      scales: { x: { type: 'time', time: { unit: 'minute', displayFormats: { second:'HH:mm:ss', minute:'HH:mm' } },
-        grid: { display: false }, ticks: { maxTicksLimit: 8, font: { size: 10 } } },
-        y: { beginAtZero: true, grid: { color: '#f3f4f6' }, ticks: { font: { size: 10 }, maxTicksLimit: 5 } } },
-      plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } },
-      interaction: { mode: 'nearest', axis: 'x', intersect: false }
-    }
-  });
-}
-
-function updateChart(id, data) {
-  const c = charts[id]; if (!c) return;
-  c.data.datasets[0].data = data;
-  c.update('none');
-}
-
-// ---- API fetch ----
-async function refreshAll() {
-  try {
-    const [health, nodes, tenants, allocs] = await Promise.all([
-      fetch('/api/v1/health').then(r => r.json()),
-      fetch('/api/v1/admin/nodes').then(r => r.json()),
-      fetch('/api/v1/admin/tenants').then(r => r.json()),
-      fetch('/api/v1/admin/allocations').then(r => r.json()),
-    ]);
-    stale = false; dataVersion++;
-    document.getElementById('err-banner').style.display = 'none';
-    render(health, nodes, tenants, allocs);
-  } catch(e) {
-    if (dataVersion === 0) document.getElementById('err-banner').style.display = 'block';
-    stale = true;
-    // Just mark stale — existing data stays visible
-  }
-}
-
-// ---- Render ----
-function render(health, nodes, tenants, allocs) {
-  const t = new Date();
-  // Health badge
-  const badge = document.getElementById('health-badge');
-  if (health) {
-    const ok = health.status === 'ok';
-    badge.textContent = ok ? 'HEALTHY' : 'DEGRADED';
-    badge.className = 'badge ' + (ok ? 'badge-up' : 'badge-warn');
-    document.getElementById('leader-info').textContent = health.leader || '';
-    document.getElementById('node-id-info').textContent = health.node_id || '';
-  }
-
-  // Stats
-  const nodeArr = nodes?.nodes || [];
-  document.getElementById('stat-nodes').textContent = nodeArr.length + (stale ? ' (stale)' : '');
-  let totalW = 0; nodeArr.forEach(n => totalW += n.total_workers || 0);
-  document.getElementById('stat-workers').textContent = totalW;
-
-  const tenantArr = tenants ? Object.values(tenants) : [];
-  document.getElementById('stat-tenants').textContent = tenantArr.length;
-  let inflight = 0, active = 0;
-  tenantArr.forEach(t => { const inf = t.inflight || 0; inflight += inf; if (inf > 0) active++; });
-  document.getElementById('stat-inflight').textContent = inflight;
-  document.getElementById('stat-active').textContent = active;
-
-  // Time-series
-  push(history.inflight, {x: t, y: inflight});
-  push(history.workers, {x: t, y: totalW});
-  updateChart('chart-inflight', downsample(history.inflight, 300));
-  updateChart('chart-workers', downsample(history.workers, 300));
-
-  // Node list
-  document.getElementById('node-list').innerHTML = nodeArr.map(n =>
-    `<tr><td><span class="node-dot ${n.status==='up'?'up':'down'}"></span>${n.node_id}</td>
-     <td>${n.status}</td><td>${n.total_workers}</td><td class="text-truncate" style="max-width:160px">${n.raft_address||'-'}</td></tr>`
-  ).join('') || '<tr><td colspan="4" class="text-muted">No nodes</td></tr>';
-
-  // Tenant allocations
-  if (allocs?.nodes) {
-    const totals = {};
-    allocs.nodes.forEach(na => {
-      Object.entries(na.tenants || {}).forEach(([tid, cnt]) => totals[tid] = (totals[tid]||0) + cnt);
-    });
-    const rows = Object.entries(totals).sort((a,b) => b[1]-a[1]);
-    document.getElementById('tenant-table').innerHTML = rows.map(([tid, cnt]) => {
-      const max = tenantArr.find(t => t.id === tid)?.max_workers || cnt;
-      const pct = Math.round(cnt / Math.max(max, 1) * 100);
-      const idle = cnt <= 1 && max > 1;
-      const color = idle ? '#9ca3af' : COLORS[rows.findIndex(r => r[0]===tid) % COLORS.length];
-      return `<tr>
-        <td><b>${tid}</b>${idle?' <span class="badge badge-idle">idle</span>':''}</td>
-        <td style="width:50%"><div class="tenant-bar-wrap"><div class="tenant-bar-fill${idle?' idle':''}" style="width:${pct}%;background:${color}"></div></div></td>
-        <td class="text-end">${cnt}<span class="text-muted">/${max}</span></td></tr>`;
-    }).join('') || '<tr><td colspan="3" class="text-muted">No tenants configured</td></tr>';
-
-    // Per-tenant time-series
-    Object.entries(totals).forEach(([tid, cnt]) => {
-      if (!history.tenants[tid]) history.tenants[tid] = [];
-      push(history.tenants[tid], {x: t, y: cnt});
-    });
-    // Update tenant chart with first 4 tenants
-    const chartTenants = Object.keys(history.tenants).slice(0, 4);
-    const c = charts['chart-tenants'];
-    if (c) {
-      c.data.datasets = chartTenants.map((tid, i) => ({
-        label: tid, borderColor: COLORS[i % COLORS.length],
-        backgroundColor: COLORS[i % COLORS.length] + '10',
-        borderWidth: 2, pointRadius: 0, tension: .4, fill: false,
-        data: downsample(history.tenants[tid] || [], 200)
-      }));
-      if (c.data.datasets.length === 0) c.data.datasets = [{label:'',data:[],borderColor:'#ccc'}];
-      c.update('none');
-    }
-  }
-
-  // Events
-  if (tenantArr.length > 0 && history.events.length === 0) addEvent('Data connected — ' + tenantArr.length + ' tenants');
-  document.getElementById('timeline-list').innerHTML = history.events.slice(0, 30).map(e =>
-    `<div class="timeline-item"><span class="timeline-time">${e.time}</span>${e.msg}</div>`
-  ).join('') || '<div class="text-muted p-3">Waiting for events...</div>';
-
-  document.getElementById('refresh-time').textContent = t.toLocaleTimeString();
-}
-
-// ---- Init ----
-document.addEventListener('DOMContentLoaded', () => {
-  initChart('chart-inflight', 'Inflight Tasks', '#f59e0b');
-  initChart('chart-workers', 'Workers Allocated', '#3b82f6');
-  initChart('chart-tenants', 'Tenant Workers', null, 'line');
-  refreshAll();
-  setInterval(refreshAll, 3000);
-});
-
-// Tenant actions (inline)
-async function act(verb, id) {
-  const name = prompt('Name:', id) || id;
-  const w = parseInt(prompt('Max Workers:', '50')) || 50;
-  try {
-    if (verb === 'upsert') await fetch('/api/v1/admin/tenants/' + id, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name, max_workers:w})});
-    else if (verb === 'delete' && confirm('Delete ' + id + '?')) await fetch('/api/v1/admin/tenants/' + id, {method:'DELETE'});
-    else if (verb === 'task') await fetch('/api/v1/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({tenant_id:id, payload:'test-'+Date.now()})});
-    addEvent(verb + ' ' + id);
-    refreshAll();
-  } catch(e) { alert(e.message); }
-}
-</script>
 </head>
 <body>
-
 <nav class="navbar bg-white border-bottom sticky-top">
   <div class="container-fluid">
     <span class="navbar-brand">&#9961; Sluice</span>
     <span id="health-badge" class="badge">...</span>
     <span class="ms-2 text-muted small" id="leader-info"></span>
-    <div class="ms-auto text-muted small">
-      <span id="node-id-info"></span> &middot;
-      Updated: <span id="refresh-time">--:--:--</span>
-    </div>
+    <div class="ms-auto text-muted small"><span id="node-id"></span> &middot; <span id="refresh-time">--:--:--</span></div>
   </div>
 </nav>
-
-<div id="err-banner" class="alert alert-warning rounded-0 m-0 text-center" style="display:none">
-  Server unreachable — showing cached data. Retrying every 3s.
-</div>
+<div id="err-banner" class="alert alert-warning rounded-0 m-0 text-center" style="display:none">Server unreachable — retrying...</div>
+<div id="loading-banner" class="alert alert-info rounded-0 m-0 text-center">Loading cluster data...</div>
 
 <div class="container-fluid px-4 py-3">
-  <!-- Stat row -->
-  <div class="row g-3 mb-3">
-    <div class="col-6 col-md-3"><div class="stat-card card p-3">
-      <div class="stat-label">Nodes</div><div class="stat-value text-primary" id="stat-nodes">-</div>
-    </div></div>
-    <div class="col-6 col-md-3"><div class="stat-card card p-3">
-      <div class="stat-label">Total Workers</div><div class="stat-value text-primary" id="stat-workers">-</div>
-    </div></div>
-    <div class="col-6 col-md-3"><div class="stat-card card p-3">
-      <div class="stat-label">Tenants</div><div class="stat-value" id="stat-tenants">-</div>
-    </div></div>
-    <div class="col-6 col-md-3"><div class="stat-card card p-3">
-      <div class="stat-label">Inflight / Active</div><div class="stat-value"><span id="stat-inflight" class="text-warning">-</span> <small class="text-muted fs-6">/ <span id="stat-active" class="text-success">-</span></small></div>
-    </div></div>
+  <!-- Stats -->
+  <div class="row g-2 mb-3">
+    <div class="col-6 col-md-2"><div class="card p-2 text-center"><div class="stat-label">Nodes</div><div class="stat-value text-primary" id="s-nodes">-</div></div></div>
+    <div class="col-6 col-md-2"><div class="card p-2 text-center"><div class="stat-label">Workers</div><div class="stat-value text-primary" id="s-workers">-</div></div></div>
+    <div class="col-6 col-md-2"><div class="card p-2 text-center"><div class="stat-label">Tenants</div><div class="stat-value" id="s-tenants">-</div></div></div>
+    <div class="col-6 col-md-2"><div class="card p-2 text-center"><div class="stat-label">Inflight</div><div class="stat-value text-warning" id="s-inflight">-</div></div></div>
+    <div class="col-6 col-md-2"><div class="card p-2 text-center"><div class="stat-label">Active</div><div class="stat-value text-success" id="s-active">-</div></div></div>
   </div>
 
-  <!-- Tabs -->
-  <ul class="nav nav-tabs mb-3" role="tablist">
-    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-overview">Overview</button></li>
-    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-tenants">Tenants</button></li>
-    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-timeline">Timeline</button></li>
-    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-cluster">Cluster</button></li>
-  </ul>
+  <!-- Charts row -->
+  <div class="row g-3 mb-3">
+    <div class="col-md-6"><div class="card"><div class="card-body">
+      <h6 class="text-muted text-uppercase small mb-2">Inflight Tasks</h6>
+      <div class="chart-wrap"><canvas id="chart-inflight"></canvas></div>
+    </div></div></div>
+    <div class="col-md-6"><div class="card"><div class="card-body">
+      <h6 class="text-muted text-uppercase small mb-2">Per-Tenant Workers</h6>
+      <div class="chart-wrap"><canvas id="chart-tenants"></canvas></div>
+    </div></div></div>
+  </div>
 
-  <div class="tab-content">
-    <!-- Overview -->
-    <div class="tab-pane fade show active" id="tab-overview">
-      <div class="row g-3">
-        <div class="col-md-6"><div class="card"><div class="card-body">
-          <h6 class="card-title text-muted text-uppercase small">Inflight Tasks</h6>
-          <div class="chart-wrap"><canvas id="chart-inflight"></canvas></div>
-        </div></div></div>
-        <div class="col-md-6"><div class="card"><div class="card-body">
-          <h6 class="card-title text-muted text-uppercase small">Workers Allocated</h6>
-          <div class="chart-wrap"><canvas id="chart-workers"></canvas></div>
-        </div></div></div>
-        <div class="col-12"><div class="card"><div class="card-body">
-          <h6 class="card-title text-muted text-uppercase small">Per-Tenant Workers</h6>
-          <div class="chart-wrap" style="height:250px"><canvas id="chart-tenants"></canvas></div>
-        </div></div></div>
+  <!-- Tenant list + Activity -->
+  <div class="row g-3 mb-3">
+    <div class="col-md-7"><div class="card"><div class="card-body">
+      <div class="d-flex align-items-center gap-2 mb-3">
+        <h6 class="text-muted text-uppercase small mb-0">Tenants</h6>
+        <input class="form-control form-control-sm" id="new-tid" placeholder="id" style="max-width:100px">
+        <input class="form-control form-control-sm" id="new-name" placeholder="name" style="max-width:100px">
+        <input class="form-control form-control-sm" id="new-maxw" type="number" value="50" min="1" style="max-width:70px">
+        <button class="btn btn-sm btn-primary" onclick="act('upsert')">Add</button>
+        <button class="btn btn-sm btn-outline-danger" onclick="act('delete')">Del</button>
+        <button class="btn btn-sm btn-outline-secondary ms-auto" onclick="act('task')">+Task</button>
       </div>
-    </div>
-
-    <!-- Tenants -->
-    <div class="tab-pane fade" id="tab-tenants">
-      <div class="card"><div class="card-body">
-        <div class="d-flex gap-2 mb-3">
-          <input class="form-control form-control-sm" id="new-tid" placeholder="tenant-id" style="max-width:160px">
-          <input class="form-control form-control-sm" id="new-name" placeholder="Name" style="max-width:160px">
-          <input class="form-control form-control-sm" id="new-maxw" type="number" value="50" min="1" style="max-width:100px">
-          <button class="btn btn-sm btn-primary" onclick="act('upsert',document.getElementById('new-tid').value)">Add / Update</button>
-          <button class="btn btn-sm btn-outline-danger" onclick="act('delete',document.getElementById('new-tid').value)">Delete</button>
-          <button class="btn btn-sm btn-outline-secondary ms-auto" onclick="act('task',document.getElementById('new-tid').value||'acme-corp')">Submit Test Task</button>
-        </div>
-        <table class="table table-sm"><thead><tr><th>Tenant</th><th>Allocation</th><th class="text-end">Workers</th></tr></thead>
-        <tbody id="tenant-table"></tbody></table>
-      </div></div>
-    </div>
-
-    <!-- Timeline -->
-    <div class="tab-pane fade" id="tab-timeline">
-      <div class="card"><div class="card-body">
-        <h6 class="card-title text-muted text-uppercase small">Activity Log</h6>
-        <div id="timeline-list" class="text-muted p-3">Loading...</div>
-      </div></div>
-    </div>
-
-    <!-- Cluster -->
-    <div class="tab-pane fade" id="tab-cluster">
-      <div class="card"><div class="card-body">
-        <h6 class="card-title text-muted text-uppercase small">Node List</h6>
-        <table class="table table-sm"><thead><tr><th>Node</th><th>Status</th><th>Workers</th><th>Raft Address</th></tr></thead>
-        <tbody id="node-list"></tbody></table>
-      </div></div>
-    </div>
+      <div id="tenant-list"></div>
+    </div></div></div>
+    <div class="col-md-5"><div class="card"><div class="card-body">
+      <h6 class="text-muted text-uppercase small mb-2">Timeline</h6>
+      <div class="timeline" id="timeline"><div class="text-muted p-2">Loading...</div></div>
+    </div></div></div>
   </div>
 </div>
 
+<script>
+const MAX=300, C=['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899'];
+let history={inflight:[],workers:[],tenants:{},events:[],labels:[]},charts={},ver=0,stale=0;
+
+function push(a,v){a.push(v);if(a.length>MAX)a.shift()}
+function downsample(arr,n){
+  if(arr.length<=n)return arr;
+  const step=Math.ceil(arr.length/n),out=[];
+  for(let i=0;i<arr.length;i+=step){let s=0;const e=Math.min(i+step,arr.length);for(let j=i;j<e;j++)s+=arr[j];out.push(s/(e-i))}
+  return out;
+}
+
+function initChart(id,label,color){
+  if(typeof Chart==='undefined')return;
+  const c=document.getElementById(id);if(!c)return;
+  if(charts[id])charts[id].destroy();
+  charts[id]=new Chart(c,{type:'line',data:{datasets:[{label,borderColor:color,backgroundColor:color+'15',borderWidth:2,pointRadius:0,tension:.4,fill:true,data:[]}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:{duration:300},
+      scales:{x:{grid:{display:false},ticks:{maxTicksLimit:8,font:{size:10},callback:(v,i)=>history.labels?.[i]||''}},
+        y:{beginAtZero:true,grid:{color:'#f3f4f6'},ticks:{maxTicksLimit:4,font:{size:10}}}},
+      plugins:{legend:{display:false},tooltip:{callbacks:{title:ctx=>history.labels?.[ctx[0].dataIndex]||''}}},
+      interaction:{mode:'nearest',axis:'x',intersect:false}}});
+}
+
+async function refresh(){
+  let ok=false;
+  try{
+    const r=await Promise.allSettled([fetch('/api/v1/health'),fetch('/api/v1/admin/nodes'),fetch('/api/v1/admin/tenants'),fetch('/api/v1/admin/allocations')]);
+    const [hr,nr,tr,ar]=r.map(x=>x.status==='fulfilled'?x.value:null);
+
+    let h=null,n=null,t=null,a=null;
+    try{if(hr&&hr.ok)h=await hr.json()}catch(e){}
+    try{if(nr&&nr.ok)n=await nr.json()}catch(e){}
+    try{if(tr&&tr.ok)t=await tr.json()}catch(e){}
+    try{if(ar&&ar.ok)a=await ar.json()}catch(e){}
+
+    if(!h&&!n&&!t&&!a){stale++;if(ver===0)document.getElementById('err-banner').style.display='block';return}
+    stale=0;ver++;ok=true;
+    document.getElementById('err-banner').style.display='none';
+    document.getElementById('loading-banner').style.display='none';
+
+    // Health
+    if(h){const ok2=h.status==='ok';document.getElementById('health-badge').textContent=ok2?'HEALTHY':'DOWN';document.getElementById('health-badge').className='badge '+(ok2?'badge-up':'badge-down');document.getElementById('leader-info').textContent=h.leader||'';document.getElementById('node-id').textContent=h.node_id||''}
+
+    // Stats
+    const na=n&&n.nodes?n.nodes:[];let tw=0;na.forEach(x=>tw+=x.total_workers||0);
+    document.getElementById('s-nodes').textContent=na.length;
+    document.getElementById('s-workers').textContent=tw;
+    const ta=t&&typeof t==='object'?Object.values(t):[];let inf=0,act=0;ta.forEach(x=>{const i=x.inflight||0;inf+=i;if(i>0)act++});
+    document.getElementById('s-tenants').textContent=ta.length;
+    document.getElementById('s-inflight').textContent=inf;
+    document.getElementById('s-active').textContent=act;
+
+    // Charts — store as plain arrays, labels as HH:MM:SS
+    const now=new Date(), ts=now.toLocaleTimeString();
+    push(history.labels,ts);if(history.labels.length>MAX)history.labels.shift();
+    push(history.inflight,inf);push(history.workers,tw);
+    if(charts['chart-inflight']){charts['chart-inflight'].data.datasets[0].data=downsample(history.inflight,300);charts['chart-inflight'].update('none')}
+
+    // Tenant allocations + per-tenant chart
+    const totals={};if(a&&a.nodes){a.nodes.forEach(na=>{Object.entries(na.tenants||{}).forEach(([tid,cnt])=>{totals[tid]=(totals[tid]||0)+cnt})})}
+    Object.entries(totals).forEach(([tid,cnt])=>{if(!history.tenants[tid])history.tenants[tid]=[];push(history.tenants[tid],cnt)});
+    const tc=charts['chart-tenants'];
+    if(tc){const tids=Object.keys(history.tenants).slice(0,6);
+      tc.data.datasets=tids.map((tid,i)=>({label:tid,borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data:downsample(history.tenants[tid]||[],200)}));
+      tc.update('none')}
+
+    // Tenant list
+    document.getElementById('tenant-list').innerHTML=Object.entries(totals).sort((a,b)=>b[1]-a[1]).map(([tid,cnt])=>{
+      const tinfo=ta.find(x=>x.id===tid)||{};
+      const max=tinfo.max_workers||cnt,pct=Math.round(cnt/Math.max(max,1)*100),idle=cnt<=1&&max>1;
+      const color=idle?'#9ca3af':C[Object.keys(totals).indexOf(tid)%C.length];
+      return `<div class="d-flex align-items-center gap-2 mb-2">
+        <b style="width:100px;font-size:13px">${tid}${idle?' <span class="badge badge-idle">idle</span>':''}</b>
+        <div class="flex-grow-1"><div class="tenant-bar"><div class="tenant-bar-fill${idle?' idle':''}" style="width:${pct}%;background:${color}"></div></div></div>
+        <span style="width:80px;text-align:right;font-size:12px;color:#6b7280">${cnt}/${max}</span>
+        <span style="width:40px;text-align:right;font-size:12px;color:${inf>0?'#f59e0b':'#6b7280'}">${tinfo.inflight||0} inf</span>
+      </div>`}).join('')||'<span class="text-muted">No tenants configured</span>';
+
+    // Timeline
+    if(!history.events.length)history.events.unshift({time:now.toLocaleTimeString(),msg:'Connected — '+ta.length+' tenant(s), '+na.length+' node(s)'});
+    document.getElementById('timeline').innerHTML=history.events.slice(0,25).map(e=>`<div class="timeline-item"><span class="timeline-time">${e.time}</span>${e.msg}</div>`).join('');
+
+    document.getElementById('refresh-time').textContent=now.toLocaleTimeString();
+  }catch(e){
+    stale++;if(ver===0)document.getElementById('err-banner').style.display='block';
+    console.error('refresh error:',e);
+  }
+  return ok;
+}
+
+async function act(verb){
+  const id=document.getElementById('new-tid').value.trim()||'default';
+  const name=document.getElementById('new-name').value.trim()||id;
+  const w=parseInt(document.getElementById('new-maxw').value)||50;
+  try{
+    if(verb==='upsert'){await fetch('/api/v1/admin/tenants/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,max_workers:w})});history.events.unshift({time:new Date().toLocaleTimeString(),msg:'Upsert tenant '+id})}
+    else if(verb==='delete'){if(!confirm('Delete '+id+'?'))return;await fetch('/api/v1/admin/tenants/'+id,{method:'DELETE'});history.events.unshift({time:new Date().toLocaleTimeString(),msg:'Delete tenant '+id})}
+    else if(verb==='task'){await fetch('/api/v1/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tenant_id:id,payload:'test-'+Date.now()})});history.events.unshift({time:new Date().toLocaleTimeString(),msg:'Submit task → '+id})}
+    refresh();
+  }catch(e){alert(e.message)}
+}
+
+function start(){
+  if(typeof Chart!=='undefined'){initChart('chart-inflight','Inflight','#f59e0b');initChart('chart-tenants','Tenants','#3b82f6')}
+  refresh();
+  setInterval(refresh,3000);
+}
+setTimeout(start, 100);
+</script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
