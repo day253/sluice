@@ -103,12 +103,17 @@ function updateUsageChart(totals){
   const c=charts['ch-usage'];if(!c)return;
   const tids=Object.keys(totals).sort((a,b)=>(totals[b]||0)-(totals[a]||0)).slice(0,6);
   if(!tids.length){c.data.datasets=[];c.update();document.getElementById('usage-debug').textContent='0 tenants';return}
-  const existing={};c.data.datasets.forEach(ds=>{existing[ds.label]=ds});
-  c.data.datasets=tids.map((tid,i)=>{
-    const label=tid;
-    const data=[...(H.usage[tid]||[])]; // clone array for change detection
-    if(existing[label]){existing[label].data=data;return existing[label]}
-    return{label,borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data};
+  // Remove datasets for tenants no longer present; update/add the rest.
+  const keep=new Set(tids);
+  c.data.datasets=c.data.datasets.filter(ds=>keep.has(ds.label));
+  const current=new Set(c.data.datasets.map(ds=>ds.label));
+  tids.forEach((tid,i)=>{
+    if(current.has(tid)){
+      const ds=c.data.datasets.find(d=>d.label===tid);
+      if(ds)ds.data=[...(H.usage[tid]||[])];
+    }else{
+      c.data.datasets.push({label:tid,borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data:[...(H.usage[tid]||[])]});
+    }
   });
   c.update();
   document.getElementById('usage-debug').textContent=tids.length+'t/'+(H.usage[tids[0]]||[]).length+'pts';
