@@ -92,25 +92,25 @@ function initChart(id,label,color){
 
 function updateInfChart(){
   const c=charts['ch-inf'];if(!c)return;
-  c.data.labels=H.labels.slice(-60);
-  c.data.datasets[0].data=H.inf.slice(-300);
-  c.update('none');
+  const newData=H.inf.slice(-300);
+  c.data.labels=H.labels.slice(-300);
+  c.data.datasets[0].data=newData;
+  c.update();
   document.getElementById('inf-debug').textContent=H.inf.length+'pts';
 }
 
 function updateUsageChart(totals){
   const c=charts['ch-usage'];if(!c)return;
   const tids=Object.keys(totals).sort((a,b)=>(totals[b]||0)-(totals[a]||0)).slice(0,6);
-  if(!tids.length){c.data.datasets=[];c.update('none');document.getElementById('usage-debug').textContent='0 tenants';return}
-  // Update or create datasets
+  if(!tids.length){c.data.datasets=[];c.update();document.getElementById('usage-debug').textContent='0 tenants';return}
   const existing={};c.data.datasets.forEach(ds=>{existing[ds.label]=ds});
   c.data.datasets=tids.map((tid,i)=>{
     const label=tid;
-    const data=H.usage[tid]||[];
+    const data=[...(H.usage[tid]||[])]; // clone array for change detection
     if(existing[label]){existing[label].data=data;return existing[label]}
     return{label,borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data};
   });
-  c.update('none');
+  c.update();
   document.getElementById('usage-debug').textContent=tids.length+'t/'+(H.usage[tids[0]]||[]).length+'pts';
 }
 
@@ -163,10 +163,9 @@ async function loadHistory(){
       if(d.name==='inflight:total'){H.inf=d.secs.filter(x=>x>=0).slice(-300);H.labels=d.secs.map((_,i)=>new Date(Date.now()-(d.secs.length-i)*1000).toLocaleTimeString()).slice(-300)}
       else if(d.name.startsWith('alloc:')){const tid=d.name.replace('alloc:','');H.usage[tid]=d.secs.filter(x=>x>=0).slice(-200)}
     });
-    updateInfChart();
-    // Build totals from usage data for the usage chart
+    if(H.inf.length){updateInfChart()}
     const totals={};Object.entries(H.usage).forEach(([tid,arr])=>{if(arr.length)totals[tid]=arr[arr.length-1]});
-    updateUsageChart(totals);
+    if(Object.keys(totals).length){updateUsageChart(totals)}
   }catch(e){console.error('loadHistory:',e)}
 }
 
