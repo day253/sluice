@@ -7,14 +7,12 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <style>
 body{background:#f8f9fb;color:#1a1a2e;font-size:14px}
-.navbar{box-shadow:0 1px 4px rgba(0,0,0,.06)}
-.navbar-brand{font-weight:700}
+.navbar{box-shadow:0 1px 4px rgba(0,0,0,.06)}.navbar-brand{font-weight:700}
 .badge-up{background:#d1fae5;color:#065f46}.badge-down{background:#fee2e2;color:#991b1b}
 .badge-idle{background:#f1f5f9;color:#64748b}
 .stat-val{font-size:24px;font-weight:700}.stat-lbl{font-size:11px;color:#6b7280;text-transform:uppercase}
-.chart-wrap{position:relative;height:200px}
+.chart-wrap{position:relative;height:220px}
 .tenant-row{cursor:pointer}.tenant-row:hover{background:#f0f4ff}
-.sort-asc::after{content:' ▲'}.sort-desc::after{content:' ▼'}
 .timeline{max-height:150px;overflow-y:auto;font-size:12px}
 </style>
 </head>
@@ -30,8 +28,7 @@ body{background:#f8f9fb;color:#1a1a2e;font-size:14px}
 <div id="err" class="alert alert-warning rounded-0 m-0 text-center" style="display:none">Connecting...</div>
 
 <div class="container-fluid px-4 py-3">
-  <!-- Stats -->
-  <div class="row g-2 mb-3" id="stats">
+  <div class="row g-2 mb-3">
     <div class="col-4 col-md-2"><div class="card p-2 text-center"><div class="stat-lbl">Nodes</div><div class="stat-val text-primary" id="s-nodes">-</div></div></div>
     <div class="col-4 col-md-2"><div class="card p-2 text-center"><div class="stat-lbl">Workers</div><div class="stat-val text-primary" id="s-workers">-</div></div></div>
     <div class="col-4 col-md-2"><div class="card p-2 text-center"><div class="stat-lbl">Tenants</div><div class="stat-val" id="s-tenants">0</div></div></div>
@@ -39,63 +36,58 @@ body{background:#f8f9fb;color:#1a1a2e;font-size:14px}
     <div class="col-4 col-md-2"><div class="card p-2 text-center"><div class="stat-lbl">Task Rate</div><div class="stat-val text-success" id="s-rate">-/s</div></div></div>
   </div>
 
-  <!-- Charts -->
   <div class="row g-3 mb-3">
     <div class="col-md-6"><div class="card"><div class="card-body">
-      <h6 class="text-muted text-uppercase small mb-2">Inflight Tasks</h6>
+      <h6 class="text-muted text-uppercase small mb-2">Inflight Tasks <small id="inf-debug" class="text-danger"></small></h6>
       <div class="chart-wrap"><canvas id="ch-inf"></canvas></div>
     </div></div></div>
     <div class="col-md-6"><div class="card"><div class="card-body">
-      <h6 class="text-muted text-uppercase small mb-2">Worker Usage % (allocated / max)</h6>
+      <h6 class="text-muted text-uppercase small mb-2">Worker Usage % <small id="usage-debug" class="text-danger"></small></h6>
       <div class="chart-wrap"><canvas id="ch-usage"></canvas></div>
     </div></div></div>
   </div>
 
-  <!-- Tenant list + Injector -->
   <div class="row g-3 mb-3">
     <div class="col-md-7"><div class="card"><div class="card-body">
       <div class="d-flex align-items-center gap-2 mb-2">
         <h6 class="text-muted text-uppercase small mb-0">Tenants</h6>
-        <span class="text-muted small" id="sort-info">click header to sort</span>
         <button class="btn btn-sm btn-outline-secondary ms-auto" onclick="inj('all')">Random All</button>
         <input class="form-control form-control-sm" id="inj-n" type="number" value="50" min="1" max="500" style="width:70px">
         <button class="btn btn-sm btn-primary" onclick="inj('sel')">Inject</button>
       </div>
       <table class="table table-sm mb-0"><thead>
-        <tr><th class="sort-asc" onclick="sortBy('name')">Name</th>
-          <th onclick="sortBy('max')">Max</th><th onclick="sortBy('used')">Used</th>
-          <th onclick="sortBy('rate')">Usage%</th><th>Inf</th><th></th></tr>
-      </thead><tbody id="tlist"><tr><td colspan="6" class="text-muted">No tenants yet — create one below</td></tr></tbody></table>
+        <tr><th onclick="sortBy('name')">Name</th><th onclick="sortBy('max')">Max</th><th onclick="sortBy('used')">Used</th><th onclick="sortBy('rate')">Usage%</th><th>Inf</th><th></th></tr></thead>
+        <tbody id="tlist"><tr><td colspan="6" class="text-muted">No tenants</td></tr></tbody></table>
       <div class="d-flex gap-2 mt-2">
         <input class="form-control form-control-sm" id="new-id" placeholder="tenant-id" style="max-width:120px">
         <input class="form-control form-control-sm" id="new-name" placeholder="name" style="max-width:120px">
         <input class="form-control form-control-sm" id="new-max" type="number" value="50" min="1" style="max-width:80px">
         <button class="btn btn-sm btn-primary" onclick="upsert()">Add/Update</button>
         <button class="btn btn-sm btn-outline-danger" onclick="del()">Delete</button>
+        <button class="btn btn-sm btn-outline-secondary" onclick="inj('one',document.getElementById('new-id').value)">+Tasks</button>
       </div>
     </div></div></div>
     <div class="col-md-5"><div class="card"><div class="card-body">
       <h6 class="text-muted text-uppercase small mb-2">Activity</h6>
-      <div class="timeline text-muted" id="tline">Waiting for data...</div>
+      <div class="timeline text-muted" id="tline">Waiting...</div>
     </div></div></div>
   </div>
 </div>
 
 <script>
 const MAX=300, C=['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899'];
-let H={inf:[],usage:{},tps:[],labels:[],events:[],tpsVals:[]},charts={},ver=0,sortKey='rate',sortDir=-1,lastDone=0;
-
-function push(a,v){a.push(v);if(a.length>MAX)a.shift()}
-function ds(a,n){if(a.length<=n)return a;const s=Math.ceil(a.length/n),o=[];for(let i=0;i<a.length;i+=s){let v=0;const e=Math.min(i+s,a.length);for(let j=i;j<e;j++)v+=a[j];o.push(v/(e-i))}return o}
+let H={inf:[],usage:{},tpsVals:[],labels:[],events:[]},charts={},ver=0,sortKey='rate',sortDir=-1;
 
 function initChart(id,label,color){
-  if(typeof Chart==='undefined')return;const c=document.getElementById(id);if(!c)return;
+  if(typeof Chart==='undefined'){document.getElementById(id+'-debug').textContent='Chart.js N/A';return}
+  const c=document.getElementById(id);if(!c)return;
   if(charts[id])charts[id].destroy();
-  charts[id]=new Chart(c,{type:'line',data:{datasets:[{label,borderColor:color,backgroundColor:color+'15',borderWidth:2,pointRadius:1,tension:.4,fill:true,data:[0,0]}]},
-    options:{responsive:true,maintainAspectRatio:false,animation:{duration:200},
-      scales:{x:{grid:{display:false},ticks:{maxTicksLimit:6,font:{size:10},callback:(v,i)=>H.labels[i]||''}},
-        y:{beginAtZero:true,grid:{color:'#f3f4f6'},ticks:{maxTicksLimit:4,font:{size:10}}}},
-      plugins:{legend:{display:false},tooltip:{callbacks:{title:ctx=>H.labels[ctx[0].dataIndex]||''}}}}});}
+  charts[id]=new Chart(c,{type:'line',data:{labels:[],datasets:[{label,borderColor:color,backgroundColor:color+'15',borderWidth:2,pointRadius:1,tension:.4,fill:true,data:[]}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:false,
+      scales:{y:{beginAtZero:true,grid:{color:'#f3f4f6'},ticks:{maxTicksLimit:5,font:{size:10}}},
+        x:{grid:{display:false},ticks:{maxTicksLimit:8,font:{size:10}}}},
+      plugins:{legend:{display:false}}}});
+}
 
 async function refresh(){
   try{
@@ -109,112 +101,65 @@ async function refresh(){
     if(!h&&!n&&!t&&!a){if(ver===0)document.getElementById('err').style.display='block';return}
     ver++;document.getElementById('err').style.display='none';
 
-    // Badge
-    const ok=h&&h.status==='ok';document.getElementById('badge').textContent=ok?'HEALTHY':'DOWN';
-    document.getElementById('badge').className='badge '+(ok?'badge-up':'badge-down');
-    if(h){document.getElementById('ldr').textContent=h.leader||'';document.getElementById('nid').textContent=h.node_id||''}
-
-    // Stats
+    if(h){const ok=h.status==='ok';document.getElementById('badge').textContent=ok?'HEALTHY':'DOWN';document.getElementById('badge').className='badge '+(ok?'badge-up':'badge-down');document.getElementById('ldr').textContent=h.leader||'';document.getElementById('nid').textContent=h.node_id||''}
     const na=n&&n.nodes?n.nodes:[];let tw=0;na.forEach(x=>tw+=x.total_workers||0);
-    document.getElementById('s-nodes').textContent=na.length;
-    document.getElementById('s-workers').textContent=tw;
-    const ta=t&&typeof t==='object'?Object.values(t):[];
-    let inf=0,act=0;ta.forEach(x=>{const i=x.inflight||0;inf+=i;if(i>0)act++});
-    document.getElementById('s-tenants').textContent=ta.length;
-    document.getElementById('s-inf').textContent=inf;
+    document.getElementById('s-nodes').textContent=na.length;document.getElementById('s-workers').textContent=tw;
+    const ta=t&&typeof t==='object'?Object.values(t):[];let inf=0;ta.forEach(x=>inf+=x.inflight||0);
+    document.getElementById('s-tenants').textContent=ta.length;document.getElementById('s-inf').textContent=inf;
 
-    // TPS: count completed tasks via inflight changes
-    const now=new Date();const ts=now.toLocaleTimeString();
-    push(H.labels,ts);push(H.inf,inf);
-    if(charts['ch-inf']){charts['ch-inf'].data.datasets[0].data=ds(H.inf,300);charts['ch-inf'].update('none')}
+    const now=new Date(),ts=now.toLocaleTimeString();
+    H.labels.push(ts);if(H.labels.length>MAX)H.labels.shift();
+    H.inf.push(inf);if(H.inf.length>MAX)H.inf.shift();
 
-    // Allocations → usage rate per tenant
+    // Update inflight chart
+    const c1=charts['ch-inf'];
+    if(c1){c1.data.labels=H.labels.slice(-50);c1.data.datasets[0].data=H.inf.slice(-300);c1.update('none');document.getElementById('inf-debug').textContent=H.inf.length+'pts'}
+    else document.getElementById('inf-debug').textContent='no-chart';
+
+    // Allocations
     const totals={};if(a&&a.nodes){a.nodes.forEach(na=>{Object.entries(na.tenants||{}).forEach(([tid,cnt])=>{totals[tid]=(totals[tid]||0)+cnt})})}
 
-    // TPS estimation: delta of (total tasks in FSM processed)
-    // Simple: use inflight changes as a proxy
-    if(H.inf.length>=2){
-      const rate=Math.abs(H.inf[H.inf.length-1]-(H.inf[H.inf.length-2]||0));
-      push(H.tpsVals,rate);
-      const avg=H.tpsVals.slice(-10).reduce((a,b)=>a+b,0)/Math.min(H.tpsVals.length,10);
-      document.getElementById('s-rate').textContent=Math.round(avg)+'/3s';
-    }
+    // TPS
+    if(H.inf.length>=2){const rate=Math.abs(H.inf[H.inf.length-1]-(H.inf[H.inf.length-2]||0));H.tpsVals.push(rate);if(H.tpsVals.length>20)H.tpsVals.shift();document.getElementById('s-rate').textContent=Math.round(H.tpsVals.reduce((a,b)=>a+b,0)/H.tpsVals.length)+'/3s'}
 
-    // Usage chart: per-tenant usage %
-    Object.entries(totals).forEach(([tid,cnt])=>{
-      if(!H.usage[tid])H.usage[tid]=[];
-      const tinfo=ta.find(x=>x.id===tid)||{};
-      const max=tinfo.max_workers||cnt;
-      push(H.usage[tid],max>0?Math.round(cnt/max*100):0);
-    });
-    const tc=charts['ch-usage'];
-    if(tc){const tids=Object.keys(H.usage).slice(0,6);
-      tc.data.datasets=tids.map((tid,i)=>({label:tid+' %',borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data:ds(H.usage[tid]||[],200)}));
-      tc.update('none')}
+    // Usage data
+    Object.entries(totals).forEach(([tid,cnt])=>{if(!H.usage[tid])H.usage[tid]=[];const ti=ta.find(x=>x.id===tid)||{};const max=ti.max_workers||cnt;H.usage[tid].push(max>0?Math.round(cnt/max*100):0);if(H.usage[tid].length>MAX)H.usage[tid].shift()});
 
-    // Tenant list sorted
-    const rows=ta.map(x=>{
-      const used=totals[x.id]||0;
-      return{id:x.id,name:x.name||x.id,max:x.max_workers||0,used,inf:x.inflight||0,rate:Math.round(used/Math.max(x.max_workers||1,1)*100)};
-    });
-    rows.sort((a,b)=>{const va=a[sortKey],vb=b[sortKey];if(typeof va==='string')return sortDir*va.localeCompare(vb);return sortDir*(va-vb)});
-    document.getElementById('tlist').innerHTML=rows.map(r=>`<tr class="tenant-row" onclick="document.getElementById('new-id').value='${r.id}';document.getElementById('new-max').value='${r.max}'">
-      <td><b>${r.id}</b>${r.rate<=1&&r.max>1?' <span class="badge badge-idle">idle</span>':''}</td>
+    // Update usage chart
+    const c2=charts['ch-usage'];
+    if(c2){const tids=Object.keys(H.usage).slice(0,6);c2.data.datasets=tids.map((tid,i)=>({label:tid+'%',borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data:H.usage[tid]?H.usage[tid].slice(-200):[]}));c2.update('none');document.getElementById('usage-debug').textContent=Object.keys(H.usage).length+' tenants'}
+    else document.getElementById('usage-debug').textContent='no-chart';
+
+    // Tenant list
+    const rows=ta.map(x=>{const used=totals[x.id]||0;return{id:x.id,name:x.name||x.id,max:x.max_workers||0,used,inf:x.inflight||0,rate:Math.round(used/Math.max(x.max_workers||1,1)*100)}});
+    rows.sort((a,b)=>{const va=a[sortKey],vb=b[sortKey];return typeof va==='string'?sortDir*va.localeCompare(vb):sortDir*(va-vb)});
+    document.getElementById('tlist').innerHTML=rows.map(r=>`<tr class="tenant-row" onclick="sel('${r.id}',${r.max})">
+      <td><b>${r.id}</b>${r.rate<=1&&r.max>1?' <span class="badge badge-idle">i</span>':''}</td>
       <td>${r.max}</td><td>${r.used}</td>
       <td><div class="progress" style="height:16px"><div class="progress-bar" style="width:${r.rate}%;background:${r.rate>80?'#ef4444':r.rate>40?'#f59e0b':'#3b82f6'}">${r.rate}%</div></div></td>
-      <td>${r.inf}</td>
-      <td><button class="btn btn-sm btn-outline-secondary" onclick="event.stopPropagation();inj('one','${r.id}')">+Tasks</button></td>
-    </tr>`).join('')||'<tr><td colspan="6" class="text-muted">No tenants</td></tr>';
+      <td>${r.inf}</td><td><button class="btn btn-sm btn-outline-secondary" onclick="event.stopPropagation();inj('one','${r.id}')">+</button></td></tr>`).join('')||'<tr><td colspan="6" class="text-muted">No tenants</td></tr>';
 
-    // Events
-    if(!H.events.length)H.events.unshift({time:ts,msg:'Connected — '+ta.length+' tenant(s), '+na.length+' node(s)'});
-    document.getElementById('tline').innerHTML=H.events.slice(0,25).map(e=>`<div style="padding:2px 0;border-bottom:1px solid #f3f4f6"><b style="color:#9ca3af">${e.time}</b> ${e.msg}</div>`).join('');
+    if(!H.events.length)H.events.unshift({time:ts,msg:'Connected'});while(H.events.length>30)H.events.pop();
+    document.getElementById('tline').innerHTML=H.events.map(e=>`<div style="padding:2px 0;border-bottom:1px solid #f3f4f6"><b style="color:#9ca3af">${e.time}</b> ${e.msg}</div>`).join('');
 
     document.getElementById('ts').textContent=ts;
-  }catch(e){if(ver===0)document.getElementById('err').style.display='block'}
+  }catch(e){if(ver===0)document.getElementById('err').style.display='block';console.error(e)}
 }
 
+function sel(id,max){document.getElementById('new-id').value=id;document.getElementById('new-max').value=max}
 function sortBy(k){if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=k==='name'?1:-1}refresh()}
+async function upsert(){const id=document.getElementById('new-id').value.trim();if(!id)return alert('id required');const name=document.getElementById('new-name').value.trim()||id;const max=parseInt(document.getElementById('new-max').value)||50;await fetch('/api/v1/admin/tenants/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,max_workers:max})});H.events.unshift({time:new Date().toLocaleTimeString(),msg:'Upsert '+id});refresh()}
+async function del(){const id=document.getElementById('new-id').value.trim();if(!id)return alert('id required');if(!confirm('Delete '+id+'?'))return;await fetch('/api/v1/admin/tenants/'+id,{method:'DELETE'});H.events.unshift({time:new Date().toLocaleTimeString(),msg:'Deleted '+id});refresh()}
+async function inj(mode,tid){const n=parseInt(document.getElementById('inj-n').value)||50;let tids=[];if(mode==='all'){const r=await fetch('/api/v1/admin/tenants').then(r=>r.json()).catch(()=>{});tids=r?Object.keys(r):[]}else if(tid)tids=[tid];else{const id=document.getElementById('new-id').value.trim();tids=id?[id]:[]}if(!tids.length)return alert('No tenants');for(let i=0;i<n;i++){const t=tids[Math.floor(Math.random()*tids.length)];fetch('/api/v1/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tenant_id:t,payload:'auto-'+Date.now()+'-'+i})}).catch(()=>{})}H.events.unshift({time:new Date().toLocaleTimeString(),msg:'Injected '+n+' tasks'});setTimeout(refresh,1500)}
 
-async function upsert(){
-  const id=document.getElementById('new-id').value.trim();if(!id)return alert('tenant-id required');
-  const name=document.getElementById('new-name').value.trim()||id;
-  const max=parseInt(document.getElementById('new-max').value)||50;
-  await fetch('/api/v1/admin/tenants/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,max_workers:max})});
-  H.events.unshift({time:new Date().toLocaleTimeString(),msg:'Upsert tenant '+id+' (max='+max+')'});
-  refresh();
-}
-async function del(){
-  const id=document.getElementById('new-id').value.trim();if(!id)return alert('tenant-id required');
-  if(!confirm('Delete '+id+'?'))return;
-  await fetch('/api/v1/admin/tenants/'+id,{method:'DELETE'});
-  H.events.unshift({time:new Date().toLocaleTimeString(),msg:'Deleted tenant '+id});
-  refresh();
-}
-
-async function inj(mode, tid){
-  const n=parseInt(document.getElementById('inj-n').value)||50;
-  const tenants=(mode==='all')?(await fetch('/api/v1/admin/tenants').then(r=>r.json()).catch(()=>{})):null;
-  const tids=(mode==='all'&&tenants)?Object.keys(tenants):(tid?[tid]:[]);
-  if(!tids.length)return alert('No tenants. Create one first.');
-  for(let i=0;i<n;i++){
-    const t=tids[Math.floor(Math.random()*tids.length)];
-    fetch('/api/v1/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tenant_id:t,payload:'auto-'+Date.now()+'-'+i})}).catch(()=>{});
-  }
-  H.events.unshift({time:new Date().toLocaleTimeString(),msg:'Injected '+n+' tasks ('+(mode==='all'?'random':tid)+')'});
-  setTimeout(refresh,2000);
-}
-
-// Save/load
 function save(){try{const d={inf:H.inf.slice(-200),usage:{},labels:H.labels.slice(-200),events:H.events.slice(-50)};Object.keys(H.usage).forEach(k=>{d.usage[k]=H.usage[k].slice(-200)});localStorage.setItem('sluice_v2',JSON.stringify(d))}catch(e){}}
 function load(){try{const s=localStorage.getItem('sluice_v2');if(!s)return;const d=JSON.parse(s);H.inf=d.inf||[];H.labels=d.labels||[];H.events=d.events||[];if(d.usage)Object.keys(d.usage).forEach(k=>{H.usage[k]=d.usage[k]||[]})}catch(e){}}
 
 (function start(){
   load();
-  // Pre-seed with 2 points so charts render immediately.
-  const ts=new Date().toLocaleTimeString();
-  if(!H.labels.length){H.labels.push(ts,ts);H.inf.push(0,0)}
-  initChart('ch-inf','Inflight','#f59e0b');initChart('ch-usage','Worker Usage %','#3b82f6');
+  if(!H.labels.length){const ts=new Date().toLocaleTimeString();H.labels.push(ts,ts);H.inf.push(0,0)}
+  initChart('ch-inf','Inflight','#f59e0b');
+  initChart('ch-usage','Usage %','#3b82f6');
   refresh();setInterval(refresh,3000);setInterval(save,10000);
 })();
 </script>
