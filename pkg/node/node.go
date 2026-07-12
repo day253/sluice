@@ -361,8 +361,7 @@ func (a metricsAdapter) Query(name string) ([]api.MetricsData, int) {
 	out := make([]api.MetricsData, len(data))
 	for i, d := range data {
 		out[i] = api.MetricsData{
-			Name: d.Name, Labels: d.Labels,
-			Secs: d.Secs, Mins: d.Mins, Hours: d.Hours, Days: d.Days,
+			Name: d.Name, Labels: d.Labels, Values: d.Values,
 		}
 	}
 	return out, n

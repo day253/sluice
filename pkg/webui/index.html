@@ -82,13 +82,14 @@ function initChart(id,label,color){
   if(typeof Chart==='undefined'){document.getElementById(id+'-debug').textContent=' CDN fail';return}
   const c=document.getElementById(id);if(!c)return;
   if(charts[id])charts[id].destroy();
-  const ds=id==='ch-inf'?[{label,borderColor:color,backgroundColor:color+'15',borderWidth:2,pointRadius:0,tension:.4,fill:true,data:[]}]:[];
+  const isUsage=id==='ch-usage';
+  const ds=isUsage?[]:[{label,borderColor:color,backgroundColor:color+'15',borderWidth:2,pointRadius:0,tension:.4,fill:true,data:[]}];
   charts[id]=new Chart(c,{type:'line',data:{labels:[],datasets:ds},
     options:{responsive:true,maintainAspectRatio:false,animation:false,
-      scales:{y:{beginAtZero:true,grid:{color:'#f3f4f6'},ticks:{maxTicksLimit:5,font:{size:10}}},
+      scales:{y:{beginAtZero:!isUsage,grid:{color:'#f3f4f6'},ticks:{maxTicksLimit:5,font:{size:10},callback:v=>isUsage?v+'%':v}},
         x:{grid:{display:false},ticks:{maxTicksLimit:8,font:{size:10}}}},
-      plugins:{legend:{display:id==='ch-usage'}}}});
-}
+      plugins:{legend:{display:isUsage},tooltip:{callbacks:{label:ctx=>isUsage?ctx.dataset.label+': '+ctx.parsed.y+'%':ctx.parsed.y}}}}});}
+
 
 function updateInfChart(){
   const c=charts['ch-inf'];if(!c)return;
@@ -165,8 +166,8 @@ async function refresh(){
 async function loadHistory(){
   try{const r=await fetch('/api/v1/metrics');if(!r.ok)return;const data=await r.json();
     data.forEach(d=>{
-      if(d.name==='inflight:total'){H.inf=d.secs.filter(x=>x>=0).slice(-300);H.labels=d.secs.map((_,i)=>new Date(Date.now()-(d.secs.length-i)*1000).toLocaleTimeString()).slice(-300)}
-      else if(d.name.startsWith('alloc:')){const tid=d.name.replace('alloc:','');H.usage[tid]=d.secs.filter(x=>x>=0).slice(-200)}
+      if(d.name==='inflight:total'){H.inf=d.values.filter(x=>x>=0).slice(-300);H.labels=d.values.map((_,i)=>new Date(Date.now()-(d.values.length-i)*1000).toLocaleTimeString()).slice(-300)}
+      else if(d.name.startsWith('alloc:')){const tid=d.name.replace('alloc:','');H.usage[tid]=d.values.filter(x=>x>=0).slice(-200)}
     });
     if(H.inf.length){updateInfChart()}
     const totals={};Object.entries(H.usage).forEach(([tid,arr])=>{if(arr.length)totals[tid]=arr[arr.length-1]});
