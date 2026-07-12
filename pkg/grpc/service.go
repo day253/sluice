@@ -64,17 +64,22 @@ func (s *Service) Submit(ctx context.Context, req *grpcv1.SubmitRequest) (*grpcv
 	}
 
 	taskID := uuid.New().String()
-	env := &queue.TaskEnvelope{
-		TaskID:         taskID,
-		TenantID:       req.TenantId,
-		Payload:        req.Payload,
-		IdempotencyKey: req.IdempotencyKey,
-		CreatedAt:      time.Now().UTC(),
+	payloadStr := string(req.Payload)
+
+	// Write directly to Raft FSM as "pending". Any node's workers can
+	// claim it — no local-queue routing problem.
+	cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: taskID, TenantID: req.TenantId, Payload: payloadStr,
+	})
+	if err := s.raft.Apply(cmd, 5000).Error(); err != nil {
+		s.logger.Error("submit raft apply failed", zap.Error(err))
+		return nil, status.Error(codes.Internal, "failed to create task")
 	}
-	if err := s.queue.Enqueue(req.TenantId, env); err != nil {
-		s.logger.Error("submit enqueue failed", zap.Error(err))
-		return nil, status.Error(codes.Internal, "failed to enqueue task")
-	}
+
+	// Also enqueue locally so local workers pick it up quickly (best-effort).
+	_ = s.queue.Enqueue(req.TenantId, &queue.TaskEnvelope{
+		TaskID: taskID, TenantID: req.TenantId, Payload: req.Payload, CreatedAt: time.Now().UTC(),
+	})
 
 	return &grpcv1.SubmitResponse{
 		TaskId: taskID, TenantId: req.TenantId, Status: types.TaskStatusPending,
@@ -164,11 +169,13 @@ func (s *Service) DeleteTenant(ctx context.Context, req *grpcv1.DeleteTenantRequ
 func (s *Service) ListTenants(ctx context.Context, req *grpcv1.ListTenantsRequest) (*grpcv1.ListTenantsResponse, error) {
 	tenants := s.fsm.GetAllTenants()
 	inflight := s.fsm.CountInflightPerTenant()
+	pending := s.fsm.CountPendingPerTenant()
 	resp := &grpcv1.ListTenantsResponse{}
 	for _, t := range tenants {
 		resp.Tenants = append(resp.Tenants, &grpcv1.TenantInfo{
 			TenantId: t.ID, Name: t.Name,
-			MaxWorkers: int32(t.MaxWorkers), Inflight: int32(inflight[t.ID]),
+			MaxWorkers: int32(t.MaxWorkers),
+			Inflight:   int32(inflight[t.ID] + pending[t.ID]),
 		})
 	}
 	return resp, nil

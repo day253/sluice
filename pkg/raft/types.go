@@ -8,6 +8,7 @@ const (
 	OpDeleteTenant     = "delete_tenant"
 	OpNodeUp           = "node_up"
 	OpNodeDown         = "node_down"
+	OpCreateTask       = "create_task"
 	OpClaimTask        = "claim_task"
 	OpCompleteTask     = "complete_task"
 	OpFailTask         = "fail_task"
@@ -29,6 +30,14 @@ type Command struct {
 // ---------------------------------------------------------------------------
 // Command payloads
 // ---------------------------------------------------------------------------
+
+// CreateTaskData is the payload for OpCreateTask — writes a task directly
+// into the FSM as "pending" so any node's workers can claim it.
+type CreateTaskData struct {
+	TaskID   string `json:"task_id"`
+	TenantID string `json:"tenant_id"`
+	Payload  string `json:"payload"`
+}
 
 // ClaimTaskData is the payload for OpClaimTask.
 type ClaimTaskData struct {

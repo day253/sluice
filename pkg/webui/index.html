@@ -181,10 +181,24 @@ async function act(verb){
   }catch(e){alert(e.message)}
 }
 
+function save(){
+  try{const d={inflight:history.inflight.slice(-200),workers:history.workers.slice(-200),tenants:{},labels:history.labels.slice(-200),events:history.events.slice(-50)};
+  Object.keys(history.tenants).forEach(k=>{d.tenants[k]=history.tenants[k].slice(-200)});
+  localStorage.setItem('sluice_hist',JSON.stringify(d))}catch(e){}}
+function load(){
+  try{const s=localStorage.getItem('sluice_hist');if(!s)return;const d=JSON.parse(s);
+  history.inflight=d.inflight||[];history.workers=d.workers||[];history.labels=d.labels||[];history.events=d.events||[];
+  if(d.tenants)Object.keys(d.tenants).forEach(k=>{history.tenants[k]=d.tenants[k]||[]});
+  // Restore chart data immediately
+  if(charts['chart-inflight']){charts['chart-inflight'].data.datasets[0].data=history.inflight;charts['chart-inflight'].update('none')}
+  if(charts['chart-tenants']){const tc=charts['chart-tenants'];const tids=Object.keys(history.tenants).slice(0,6);
+    tc.data.datasets=tids.map((tid,i)=>({label:tid,borderColor:C[i%C.length],backgroundColor:C[i%C.length]+'10',borderWidth:2,pointRadius:0,tension:.4,fill:false,data:history.tenants[tid]||[]}));tc.update('none')}
+  }catch(e){}}
 function start(){
+  load();
   if(typeof Chart!=='undefined'){initChart('chart-inflight','Inflight','#f59e0b');initChart('chart-tenants','Tenants','#3b82f6')}
   refresh();
-  setInterval(refresh,3000);
+  setInterval(refresh,3000);setInterval(save,10000);
 }
 setTimeout(start, 100);
 </script>

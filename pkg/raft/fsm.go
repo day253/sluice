@@ -59,6 +59,8 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		return f.applyNodeUp(cmd.Data)
 	case OpNodeDown:
 		return f.applyNodeDown(cmd.Data)
+	case OpCreateTask:
+		return f.applyCreateTask(cmd.Data)
 	case OpClaimTask:
 		return f.applyClaimTask(cmd.Data)
 	case OpClaimBatch:
@@ -205,6 +207,27 @@ func (f *FSM) applyNodeDown(data json.RawMessage) interface{} {
 		zap.String("node", req.ID),
 		zap.Int("re_queued", reQueued),
 	)
+	return nil
+}
+
+// applyCreateTask writes a new task as "pending" in the FSM so that any
+// node's workers can claim it via the recovery / pending-task path.
+func (f *FSM) applyCreateTask(data json.RawMessage) interface{} {
+	var req CreateTaskData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+	// If a task with this ID already exists (idempotency), skip.
+	if _, ok := f.state.Tasks[req.TaskID]; ok {
+		return nil
+	}
+	f.state.Tasks[req.TaskID] = &types.TaskRecord{
+		TaskID:    req.TaskID,
+		TenantID:  req.TenantID,
+		Status:    types.TaskStatusPending,
+		Payload:   req.Payload,
+		CreatedAt: time.Now().UTC(),
+	}
 	return nil
 }
 
@@ -499,8 +522,8 @@ func (f *FSM) FindPendingTasks(tenantID string) []*types.TaskRecord {
 	return out
 }
 
-// CountInflightPerTenant returns the number of inflight tasks per tenant.
-// This is used by the allocator as a load signal for idle detection.
+// CountInflightPerTenant returns the number of inflight + pending tasks per
+// tenant. Used by the allocator for idle detection and by the Web UI.
 func (f *FSM) CountInflightPerTenant() map[string]int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -511,7 +534,7 @@ func (f *FSM) CountInflightPerTenant() map[string]int {
 	return out
 }
 
-// CountPendingPerTenant returns the number of recovery-pending tasks per tenant.
+// CountPendingPerTenant returns pending (unclaimed) tasks per tenant.
 func (f *FSM) CountPendingPerTenant() map[string]int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
