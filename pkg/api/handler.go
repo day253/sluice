@@ -185,10 +185,15 @@ func (h *Handler) getAllocations(w http.ResponseWriter, r *http.Request) {
 		h.writeGRPCError(w, err)
 		return
 	}
-	h.writeJSON(w, http.StatusOK, types.AllocationResponse{
-		Tenants: h.tenantMap(),
-	})
-	_ = resp // resp already sent; tenants from FSM
+	nodes := make([]*types.NodeAllocation, 0, len(resp.Allocations))
+	for _, na := range resp.Allocations {
+		n := &types.NodeAllocation{NodeID: na.NodeId, Tenants: make(map[string]int)}
+		for _, t := range na.Tenants {
+			n.Tenants[t.TenantId] = int(t.Workers)
+		}
+		nodes = append(nodes, n)
+	}
+	h.writeJSON(w, http.StatusOK, types.AllocationResponse{Nodes: nodes})
 }
 
 // ---------------------------------------------------------------------------
