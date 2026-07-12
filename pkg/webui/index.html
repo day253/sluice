@@ -91,8 +91,8 @@ function ds(a,n){if(a.length<=n)return a;const s=Math.ceil(a.length/n),o=[];for(
 function initChart(id,label,color){
   if(typeof Chart==='undefined')return;const c=document.getElementById(id);if(!c)return;
   if(charts[id])charts[id].destroy();
-  charts[id]=new Chart(c,{type:'line',data:{datasets:[{label,borderColor:color,backgroundColor:color+'15',borderWidth:2,pointRadius:0,tension:.4,fill:true,data:[]}]},
-    options:{responsive:true,maintainAspectRatio:false,animation:false,
+  charts[id]=new Chart(c,{type:'line',data:{datasets:[{label,borderColor:color,backgroundColor:color+'15',borderWidth:2,pointRadius:1,tension:.4,fill:true,data:[0,0]}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:{duration:200},
       scales:{x:{grid:{display:false},ticks:{maxTicksLimit:6,font:{size:10},callback:(v,i)=>H.labels[i]||''}},
         y:{beginAtZero:true,grid:{color:'#f3f4f6'},ticks:{maxTicksLimit:4,font:{size:10}}}},
       plugins:{legend:{display:false},tooltip:{callbacks:{title:ctx=>H.labels[ctx[0].dataIndex]||''}}}}});}
@@ -211,6 +211,9 @@ function load(){try{const s=localStorage.getItem('sluice_v2');if(!s)return;const
 
 (function start(){
   load();
+  // Pre-seed with 2 points so charts render immediately.
+  const ts=new Date().toLocaleTimeString();
+  if(!H.labels.length){H.labels.push(ts,ts);H.inf.push(0,0)}
   initChart('ch-inf','Inflight','#f59e0b');initChart('ch-usage','Worker Usage %','#3b82f6');
   refresh();setInterval(refresh,3000);setInterval(save,10000);
 })();
