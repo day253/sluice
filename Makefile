@@ -1,4 +1,4 @@
-.PHONY: all build test bench clean deps proto run-dev run-node1 run-node2 run-node3
+.PHONY: all build test bench clean deps proto docker push-docker multipass multipass-clean run-dev run-node1 run-node2 run-node3
 
 APP     := sluice
 CMD_DIR := ./cmd/sluice
@@ -29,6 +29,20 @@ proto:
 # ---- Benchmarks ----
 bench:
 	go test -bench=. -benchtime=1s -benchmem ./pkg/...
+
+# ---- Docker ----
+docker: build
+	docker build -t ghcr.io/day253/sluice:latest .
+
+push-docker: docker
+	docker push ghcr.io/day253/sluice:latest
+
+# ---- Multipass ----
+multipass: build
+	./multipass/setup.sh
+
+multipass-clean:
+	./multipass/teardown.sh
 
 # ---- Run (development single-node) ----
 run-dev: build

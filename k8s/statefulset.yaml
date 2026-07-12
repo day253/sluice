@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sluice
+  labels:
+    app: sluice
+spec:
+  clusterIP: None  # headless — required for StatefulSet DNS
+  ports:
+    - name: api
+      port: 9090
+      targetPort: 9090
+    - name: raft
+      port: 7000
+      targetPort: 7000
+  selector:
+    app: sluice
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sluice-api
+  labels:
+    app: sluice
+spec:
+  type: ClusterIP
+  ports:
+    - name: api
+      port: 9090
+      targetPort: 9090
+  selector:
+    app: sluice
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sluice
+spec:
+  serviceName: sluice
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sluice
+  template:
+    metadata:
+      labels:
+        app: sluice
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: sluice
+          image: ghcr.io/day253/sluice:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: JOIN_HOST
+              value: sluice-0.sluice
+            - name: API
+              value: "0.0.0.0:9090"
+            - name: RAFT
+              value: "0.0.0.0:7000"
+            - name: DATA
+              value: /data
+            - name: WORKERS
+              value: "100"
+          ports:
+            - name: api
+              containerPort: 9090
+            - name: raft
+              containerPort: 7000
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            grpc:
+              port: 9090
+              service: sluice.v1.Sluice/Health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            grpc:
+              port: 9090
+              service: sluice.v1.Sluice/Health
+            initialDelaySeconds: 15
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
