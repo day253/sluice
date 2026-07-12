@@ -108,8 +108,9 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 	bridge := &raftApplierBridge{cluster: cluster}
 
-	// ---- Worker pool ----
+	// ---- Worker pool (only leader processes) ----
 	n.pool = worker.NewPool(cfg.NodeID, q, cluster.FSM(), bridge, processor, logger)
+	n.pool.SetWorkerGuard(func() bool { return cluster.IsLeader() })
 
 	// ---- Allocator engine ----
 	n.allocEngine = allocator.NewEngine(cfg.NodeID, cluster.FSM(), bridge, logger)
@@ -256,6 +257,7 @@ func (n *Node) watchLeadership() {
 		n.allocEngine.SetLeader(true)
 		_ = n.allocEngine.ReconcileNow()
 	}
+
 	ch := n.raftCluster.LeaderCh()
 	for {
 		select {

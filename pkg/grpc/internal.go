@@ -57,6 +57,9 @@ const (
 )
 
 func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamServer) error {
+	s.logger.Info("internal: ClaimStream opened")
+	defer s.logger.Info("internal: ClaimStream closed")
+
 	// Accumulation loop.
 	var (
 		batch   = make([]raftpkg.ClaimTaskData, 0, claimBatchMaxSize)
@@ -107,6 +110,7 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 		if len(batch) == 0 {
 			return
 		}
+		s.logger.Debug("internal: flushing claim batch", zap.Int("size", len(batch)))
 		stopTimer()
 
 		cmd := raftpkg.MustMarshalCommand(raftpkg.OpClaimBatch, raftpkg.ClaimBatchData{

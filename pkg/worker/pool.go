@@ -31,6 +31,12 @@ type Processor interface {
 // Pool
 // ---------------------------------------------------------------------------
 
+// Claimer abstracts task claiming.  A local raft.Apply works on the
+// leader; a gRPC streaming client works from any node.
+type Claimer interface {
+	Claim(taskID, tenantID, payload string) (bool, error)
+}
+
 // Pool manages worker goroutines organised by tenant.
 type Pool struct {
 	nodeID string
@@ -40,8 +46,10 @@ type Pool struct {
 
 	queue     queue.Queue
 	fsm       *raftpkg.FSM
-	raft      raftpkg.RaftApplier
-	processor Processor
+	raft        raftpkg.RaftApplier
+	claimer     Claimer     // nil = use raft.Apply directly
+	workerGuard func() bool // nil = always run
+	processor   Processor
 	logger    *zap.Logger
 
 	ctx    context.Context
@@ -84,6 +92,14 @@ func NewPool(
 		cancel:    cancel,
 	}
 }
+
+// SetClaimer sets a streaming claim client.  When set, workers use this
+// instead of raft.Apply so followers' workers can claim via the leader.
+func (p *Pool) SetClaimer(c Claimer) { p.claimer = c }
+
+// SetWorkerGuard gates worker processing.  Followers pass `IsLeader` so
+// only the leader processes tasks.
+func (p *Pool) SetWorkerGuard(fn func() bool) { p.workerGuard = fn }
 
 // ---------------------------------------------------------------------------
 // Reconcile
@@ -284,8 +300,17 @@ func (p *Pool) findRecoveryTask(tenantID string) *types.TaskRecord {
 	return tasks[0]
 }
 
-// claimTask applies OpClaimTask to the Raft log.
+// claimTask claims a task.  Uses streaming claim client if available
+// (works from any node); falls back to direct raft.Apply (leader only).
 func (p *Pool) claimTask(task *types.TaskRecord) error {
+	if p.claimer != nil {
+		ok, err := p.claimer.Claim(task.TaskID, task.TenantID, task.Payload)
+		if err != nil {
+			p.logger.Warn("claim stream failed, trying raft", zap.Error(err))
+		} else if ok {
+			return nil
+		}
+	}
 	data := raftpkg.ClaimTaskData{
 		TaskID:   task.TaskID,
 		TenantID: task.TenantID,
@@ -293,8 +318,7 @@ func (p *Pool) claimTask(task *types.TaskRecord) error {
 		Payload:  task.Payload,
 	}
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpClaimTask, data)
-	result := p.raft.Apply(cmd, 5000)
-	return result.Error()
+	return p.raft.Apply(cmd, 5000).Error()
 }
 
 // completeTask publishes the final result (done or failed) to Raft.
