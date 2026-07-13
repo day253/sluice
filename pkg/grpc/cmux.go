@@ -78,9 +78,12 @@ func (ms *MultiplexServer) Start() error {
 	return ms.mux.Serve()
 }
 
-// Stop gracefully shuts down all services.
+// Stop shuts down all services. Internal claim/result streams are long-lived,
+// so GracefulStop can wait forever for clients on other nodes during a rolling
+// restart. Tasks on an interrupted stream are protected by the claim lease and
+// will be recovered by the leader.
 func (ms *MultiplexServer) Stop() {
 	ms.logger.Info("cmux: stopping")
-	ms.grpcSrv.GracefulStop()
+	ms.grpcSrv.Stop()
 	_ = ms.httpSrv.Close()
 }

@@ -241,8 +241,13 @@ func (f *FSM) applyCreateTask(data json.RawMessage) interface{} {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return err
 	}
-	// If a task with this ID already exists (idempotency), skip.
+	// If a task with this ID already exists or has already completed
+	// (idempotency), skip. A delayed duplicate submission must not resurrect a
+	// completed task.
 	if _, ok := f.state.Tasks[req.TaskID]; ok {
+		return nil
+	}
+	if _, ok := f.state.Results[req.TaskID]; ok {
 		return nil
 	}
 	f.state.Tasks[req.TaskID] = &types.TaskRecord{
@@ -262,6 +267,9 @@ func (f *FSM) applyClaimTask(data json.RawMessage) interface{} {
 	}
 
 	now := time.Now().UTC()
+	if _, completed := f.state.Results[req.TaskID]; completed {
+		return fmt.Errorf("task %s already completed", req.TaskID)
+	}
 
 	// If the task was already claimed (by this node or another) reject.
 	if existing, ok := f.state.Tasks[req.TaskID]; ok {
@@ -327,6 +335,10 @@ func (f *FSM) applyClaimBatch(data json.RawMessage) interface{} {
 
 	now := time.Now().UTC()
 	for _, t := range req.Tasks {
+		if _, completed := f.state.Results[t.TaskID]; completed {
+			result.Failed = append(result.Failed, t.TaskID)
+			continue
+		}
 		if existing, ok := f.state.Tasks[t.TaskID]; ok {
 			if existing.Status == types.TaskStatusInflight {
 				result.Failed = append(result.Failed, t.TaskID)
@@ -362,7 +374,11 @@ func (f *FSM) applyCompleteBatch(data json.RawMessage) interface{} {
 	}
 	now := time.Now().UTC()
 	for _, t := range req.Tasks {
-		f.finishTask(t, types.TaskStatusDone, now)
+		status := types.TaskStatusDone
+		if t.Status == types.TaskStatusFailed || t.Error != "" {
+			status = types.TaskStatusFailed
+		}
+		f.finishTask(t, status, now)
 	}
 	return nil
 }
@@ -578,6 +594,12 @@ func (f *FSM) FindPendingTasks(tenantID string) []*types.TaskRecord {
 			out = append(out, &copyT)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].TaskID < out[j].TaskID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
 	return out
 }
 

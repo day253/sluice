@@ -159,6 +159,47 @@ func TestTaskClaimCompleteDone(t *testing.T) {
 	}
 }
 
+func TestCompletedTaskCannotBeResurrected(t *testing.T) {
+	fsm := newTestFSM(t)
+
+	applyCmd(t, fsm, OpCreateTask, CreateTaskData{
+		TaskID: "task-1", TenantID: "t1", Payload: `{}`,
+	})
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "task-1", TenantID: "t1", NodeID: "n1", Payload: `{}`,
+	})
+	applyCmd(t, fsm, OpCompleteTask, CompleteTaskData{
+		TaskID: "task-1", TenantID: "t1", Result: "OK",
+	})
+
+	// A worker on another node may already hold a stale local queue copy. Its
+	// late claim must be rejected instead of recreating the finished task.
+	claim := MustMarshalCommand(OpClaimTask, ClaimTaskData{
+		TaskID: "task-1", TenantID: "t1", NodeID: "n2", Payload: `{}`,
+	})
+	if resp := fsm.Apply(&raft.Log{Data: claim, Type: raft.LogCommand}); resp == nil {
+		t.Fatal("late claim unexpectedly succeeded")
+	}
+
+	batch := applyCmd(t, fsm, OpClaimBatch, ClaimBatchData{Tasks: []ClaimTaskData{{
+		TaskID: "task-1", TenantID: "t1", NodeID: "n2", Payload: `{}`,
+	}}}).(*ClaimBatchResult)
+	if len(batch.Claimed) != 0 || len(batch.Failed) != 1 || batch.Failed[0] != "task-1" {
+		t.Fatalf("late batch claim = %+v, want task-1 rejected", batch)
+	}
+
+	// Duplicate API delivery is idempotent too.
+	applyCmd(t, fsm, OpCreateTask, CreateTaskData{
+		TaskID: "task-1", TenantID: "t1", Payload: `{}`,
+	})
+	if task := fsm.GetTask("task-1"); task != nil {
+		t.Fatalf("completed task was resurrected: %+v", task)
+	}
+	if result := fsm.GetResult("task-1"); result == nil || result.Status != types.TaskStatusDone {
+		t.Fatalf("completed result was lost: %+v", result)
+	}
+}
+
 func TestTaskClaimCompleteFailed(t *testing.T) {
 	fsm := newTestFSM(t)
 
@@ -175,6 +216,21 @@ func TestTaskClaimCompleteFailed(t *testing.T) {
 	}
 	if result.Error != "timeout" {
 		t.Errorf("error = %s, want timeout", result.Error)
+	}
+}
+
+func TestCompleteBatchPreservesFailedStatus(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "failed-batch-task", TenantID: "t1", NodeID: "n1", Payload: `{}`,
+	})
+	applyCmd(t, fsm, OpCompleteBatch, CompleteBatchData{Tasks: []CompleteTaskData{{
+		TaskID: "failed-batch-task", TenantID: "t1", Status: types.TaskStatusFailed, Error: "boom",
+	}}})
+
+	result := fsm.GetResult("failed-batch-task")
+	if result == nil || result.Status != types.TaskStatusFailed || result.Error != "boom" {
+		t.Fatalf("failed batch result = %+v", result)
 	}
 }
 

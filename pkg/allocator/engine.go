@@ -30,8 +30,10 @@ const (
 	// interval this ≈ 9 s of inactivity).
 	idleThreshold = 3
 	// taskClaimLease bounds how long an inflight task may remain without a
-	// completion. Expired claims are returned to pending by the leader.
-	taskClaimLease = 5 * time.Minute
+	// completion. Expired claims are returned to pending by the leader within
+	// one reconciliation cycle. Demo tasks finish in milliseconds, so 30 s
+	// leaves ample headroom while keeping rollout recovery observable.
+	taskClaimLease = 30 * time.Second
 )
 
 // ---------------------------------------------------------------------------

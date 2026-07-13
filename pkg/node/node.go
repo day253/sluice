@@ -5,8 +5,10 @@ package node
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -59,6 +61,9 @@ type Node struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +122,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	n.pool = worker.NewPool(cfg.NodeID, q, cluster.FSM(), bridge, processor, logger)
 	n.claimClient = grpcpkg.NewClaimClient(cfg.NodeID, logger)
 	n.pool.SetClaimer(n.claimClient)
+	n.pool.SetCompleter(n.claimClient)
 
 	// ---- Allocator engine ----
 	n.allocEngine = allocator.NewEngine(cfg.NodeID, cluster.FSM(), bridge, logger)
@@ -224,17 +230,22 @@ func (n *Node) Start() error {
 // ---------------------------------------------------------------------------
 
 func (n *Node) Shutdown(timeout time.Duration) error {
+	n.shutdownOnce.Do(func() {
+		n.shutdownErr = n.shutdown(timeout)
+	})
+	return n.shutdownErr
+}
+
+func (n *Node) shutdown(timeout time.Duration) error {
 	n.logger.Info("shutting down node...")
 	n.cancel()
 
 	var errs []error
 
-	// 1. API server.
-	if n.muxServer != nil {
-		n.muxServer.Stop()
-	}
-	if n.apiServer != nil {
-		_ = n.apiServer.Shutdown(timeout)
+	// 1. Close outbound streams before waiting for workers. Cancellation leaves
+	// interrupted claims for the leader's lease scanner to recover.
+	if n.claimClient != nil {
+		n.claimClient.Close()
 	}
 
 	// 2. Worker pool.
@@ -242,14 +253,18 @@ func (n *Node) Shutdown(timeout time.Duration) error {
 		errs = append(errs, fmt.Errorf("pool shutdown: %w", err))
 	}
 
-	// 3. Queue.
-	if err := n.queue.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("queue close: %w", err))
+	// 3. API server. Internal streams are deliberately stopped after workers,
+	// so local completions get their final chance to flush.
+	if n.muxServer != nil {
+		n.muxServer.Stop()
+	}
+	if n.apiServer != nil {
+		_ = n.apiServer.Shutdown(timeout)
 	}
 
-	// 4. Claim client.
-	if n.claimClient != nil {
-		n.claimClient.Close()
+	// 4. Queue.
+	if err := n.queue.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("queue close: %w", err))
 	}
 	// 5. Raft.
 	if err := n.raftCluster.Shutdown(); err != nil {
@@ -270,11 +285,30 @@ func (n *Node) Shutdown(timeout time.Duration) error {
 func (n *Node) watchLeadership() {
 	updateClaim := func() {
 		if addr := n.raftCluster.LeaderAddr(); addr != "" {
-			apiAddr := addr[:len(addr)-5] + ":9090"
-			n.claimClient.SetLeader(apiAddr)
+			// Prefer the registered API address. Integration clusters use
+			// dynamic ports, while Kubernetes falls back to the stable Raft
+			// service host with the shared 9090 port.
+			for _, member := range n.raftCluster.FSM().GetState().Nodes {
+				if member.RaftAddress != addr || member.Address == "" {
+					continue
+				}
+				host, _, err := net.SplitHostPort(member.Address)
+				if err == nil && host != "0.0.0.0" && host != "::" && host != "" {
+					n.claimClient.SetLeader(member.Address)
+					return
+				}
+			}
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				n.logger.Warn("could not parse raft leader address", zap.String("addr", addr), zap.Error(err))
+				return
+			}
+			n.claimClient.SetLeader(net.JoinHostPort(host, "9090"))
 		}
 	}
 	updateClaim()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
 	if n.raftCluster.IsLeader() {
 		n.allocEngine.SetLeader(true)
@@ -286,6 +320,10 @@ func (n *Node) watchLeadership() {
 		select {
 		case <-n.ctx.Done():
 			return
+		case <-ticker.C:
+			// LeaderCh only reports this node's boolean leadership transitions.
+			// Polling the address also catches follower A -> follower B changes.
+			updateClaim()
 		case isLeader, ok := <-ch:
 			if !ok {
 				return

@@ -52,6 +52,7 @@ type ClaimTaskData struct {
 type CompleteTaskData struct {
 	TaskID   string `json:"task_id"`
 	TenantID string `json:"tenant_id"`
+	Status   string `json:"status,omitempty"`
 	Result   string `json:"result,omitempty"`
 	Error    string `json:"error,omitempty"`
 }

@@ -1,8 +1,11 @@
 package allocator
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"go.uber.org/zap"
@@ -267,12 +270,12 @@ func (f *fakeRaftApplier) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {
 	return &fakeApplyResult{}
 }
 
-func (f *fakeRaftApplier) IsLeader() bool    { return true }
+func (f *fakeRaftApplier) IsLeader() bool     { return true }
 func (f *fakeRaftApplier) LeaderAddr() string { return "test:7000" }
 
 type fakeApplyResult struct{}
 
-func (r *fakeApplyResult) Error() error        { return nil }
+func (r *fakeApplyResult) Error() error          { return nil }
 func (r *fakeApplyResult) Response() interface{} { return nil }
 
 func TestReconcile_ProducesValidPlan(t *testing.T) {
@@ -358,6 +361,45 @@ func TestReconcile_IdleTenantTriggersRedistribution(t *testing.T) {
 	}
 
 	t.Logf("post-reconcile n1: a=%d b=%d c=%d", alloc.Tenants["a"], alloc.Tenants["b"], alloc.Tenants["c"])
+}
+
+func TestRequeueStaleTasks_ExpiredClaimReturnsToPending(t *testing.T) {
+	fsm := newTestFSM()
+	applyOp(fsm, raftpkg.OpClaimTask, raftpkg.ClaimTaskData{
+		TaskID: "expired", TenantID: "a", NodeID: "n1", Payload: `{}`,
+	})
+
+	// Restore a snapshot with an expired ClaimedAt value. This exercises the
+	// same persisted state a leader sees after a full-cluster restart.
+	state := fsm.GetState()
+	state.Tasks["expired"].ClaimedAt = time.Now().UTC().Add(-taskClaimLease - time.Second)
+	snapshot, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(snapshot))); err != nil {
+		t.Fatal(err)
+	}
+
+	e := &Engine{
+		nodeID:              "test-node",
+		fsm:                 fsm,
+		raft:                &fakeRaftApplier{fsm: fsm},
+		logger:              zap.NewNop(),
+		idleCycles:          make(map[string]int),
+		minWorkersPerTenant: 1,
+	}
+	if err := e.requeueStaleTasks(); err != nil {
+		t.Fatalf("requeue stale tasks: %v", err)
+	}
+
+	task := fsm.GetTask("expired")
+	if task == nil || task.Status != types.TaskStatusPending {
+		t.Fatalf("expired task = %+v, want pending", task)
+	}
+	if task.NodeID != "" || !task.ClaimedAt.IsZero() {
+		t.Fatalf("expired claim metadata was not cleared: %+v", task)
+	}
 }
 
 // ---------------------------------------------------------------------------

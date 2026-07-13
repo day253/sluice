@@ -10,8 +10,8 @@ import (
 	hashicorpraft "github.com/hashicorp/raft"
 	"go.uber.org/zap"
 
-	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/queue"
+	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/types"
 )
 
@@ -20,7 +20,7 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockRaftApplier struct {
-	mu         sync.Mutex
+	mu          sync.Mutex
 	appliedCmds [][]byte
 }
 
@@ -31,8 +31,8 @@ func (m *mockRaftApplier) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {
 	return &mockApplyResult{}
 }
 
-func (m *mockRaftApplier) IsLeader() bool      { return true }
-func (m *mockRaftApplier) LeaderAddr() string   { return "mock:7000" }
+func (m *mockRaftApplier) IsLeader() bool     { return true }
+func (m *mockRaftApplier) LeaderAddr() string { return "mock:7000" }
 func (m *mockRaftApplier) appliedCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -45,8 +45,56 @@ func (r *mockApplyResult) Error() error          { return nil }
 func (r *mockApplyResult) Response() interface{} { return nil }
 
 type mockProcessor struct {
-	mu       sync.Mutex
+	mu        sync.Mutex
 	processed []string // task IDs
+}
+
+type fsmTaskClient struct {
+	fsm *raftpkg.FSM
+
+	mu            sync.Mutex
+	activeClaims  int
+	maxConcurrent int
+}
+
+func (c *fsmTaskClient) Claim(taskID, tenantID, payload string) (bool, error) {
+	c.mu.Lock()
+	c.activeClaims++
+	if c.activeClaims > c.maxConcurrent {
+		c.maxConcurrent = c.activeClaims
+	}
+	c.mu.Unlock()
+	time.Sleep(40 * time.Millisecond)
+	resp := c.fsm.Apply(&hashicorpraft.Log{Data: raftpkg.MustMarshalCommand(raftpkg.OpClaimTask, raftpkg.ClaimTaskData{
+		TaskID: taskID, TenantID: tenantID, NodeID: "n1", Payload: payload,
+	}), Type: hashicorpraft.LogCommand})
+	c.mu.Lock()
+	c.activeClaims--
+	c.mu.Unlock()
+	if err, ok := resp.(error); ok {
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *fsmTaskClient) Complete(taskID, tenantID, result, errStr string, failed bool) error {
+	op := raftpkg.OpCompleteTask
+	if failed {
+		op = raftpkg.OpFailTask
+	}
+	resp := c.fsm.Apply(&hashicorpraft.Log{Data: raftpkg.MustMarshalCommand(op, raftpkg.CompleteTaskData{
+		TaskID: taskID, TenantID: tenantID, Result: result, Error: errStr,
+	}), Type: hashicorpraft.LogCommand})
+	if err, ok := resp.(error); ok {
+		return err
+	}
+	return nil
+}
+
+func (c *fsmTaskClient) maxClaims() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.maxConcurrent
 }
 
 func (p *mockProcessor) Process(ctx context.Context, taskID, tenantID string, payload json.RawMessage) (string, error) {
@@ -255,6 +303,33 @@ func TestPoolWorker_RecoveryTasks(t *testing.T) {
 	}
 
 	pool.Shutdown(2 * time.Second)
+}
+
+func TestPoolWorker_ReservesPendingTaskBeforeClaim(t *testing.T) {
+	q := queue.NewMemoryQueue()
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "one-pending-task", TenantID: "a", Payload: `"payload"`,
+	})
+	client := &fsmTaskClient{fsm: fsm}
+	pool := NewPool("n1", q, fsm, &mockRaftApplier{}, &mockProcessor{}, zap.NewNop())
+	pool.SetClaimer(client)
+	pool.SetCompleter(client)
+	pool.Reconcile(map[string]int{"a": 20})
+
+	for i := 0; i < 30 && fsm.GetResult("one-pending-task") == nil; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if result := fsm.GetResult("one-pending-task"); result == nil {
+		t.Fatal("pending task was not completed")
+	}
+	if got := client.maxClaims(); got != 1 {
+		t.Fatalf("maximum concurrent claims for one task = %d, want 1", got)
+	}
+
+	if err := pool.Shutdown(2 * time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
 }
 
 // Helper to apply FSM operations directly.

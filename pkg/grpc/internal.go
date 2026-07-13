@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	grpcv1 "github.com/day253/sluice/pkg/grpc/v1"
 	raftpkg "github.com/day253/sluice/pkg/raft"
@@ -27,8 +29,8 @@ type InternalService struct {
 	logger *zap.Logger
 
 	// allocation subscribers
-	subMu   sync.RWMutex
-	subs    map[string]chan<- *grpcv1.AllocationPlan // nodeID → push channel
+	subMu sync.RWMutex
+	subs  map[string]chan<- *grpcv1.AllocationPlan // nodeID → push channel
 }
 
 // NewInternalService creates the internal gRPC service.
@@ -57,6 +59,9 @@ const (
 )
 
 func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamServer) error {
+	if !s.raft.IsLeader() {
+		return status.Error(codes.FailedPrecondition, "claim stream is only available on the leader")
+	}
 	s.logger.Info("internal: ClaimStream opened")
 	defer s.logger.Info("internal: ClaimStream closed")
 
@@ -66,6 +71,9 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 		timer   = time.NewTimer(claimBatchWindow)
 		timerOn = false
 	)
+	if !timer.Stop() {
+		<-timer.C
+	}
 
 	stopTimer := func() {
 		if timerOn && !timer.Stop() {
@@ -106,11 +114,14 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 	}()
 
 	// Process loop: accumulate and flush.
-	flush := func() {
+	flush := func() error {
 		if len(batch) == 0 {
-			return
+			return nil
 		}
 		stopTimer()
+		if !s.raft.IsLeader() {
+			return status.Error(codes.FailedPrecondition, "leadership changed")
+		}
 
 		// Filter: only grant claims for nodes that are allocated.
 		alloc := s.fsm.GetAllAllocations()
@@ -126,6 +137,7 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 			granted = append(granted, t)
 		}
 
+		claimedIDs := make([]string, 0, len(granted))
 		if len(granted) > 0 {
 			cmd := raftpkg.MustMarshalCommand(raftpkg.OpClaimBatch, raftpkg.ClaimBatchData{
 				Tasks: granted,
@@ -133,39 +145,36 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 			result := s.raft.Apply(cmd, 5000)
 			if err := result.Error(); err != nil {
 				s.logger.Error("claim batch raft apply failed", zap.Error(err))
-				// Fail all claims.
-				for _, t := range batch {
-					failedIDs = append(failedIDs, t.TaskID)
-				}
+				return status.Errorf(codes.Unavailable, "claim batch commit failed: %v", err)
 			} else if resp, ok := result.Response().(*raftpkg.ClaimBatchResult); ok {
+				claimedIDs = append(claimedIDs, resp.Claimed...)
 				failedIDs = append(failedIDs, resp.Failed...)
+			} else {
+				return status.Error(codes.Internal, "claim batch returned an invalid response")
 			}
 		}
 
-		claimedIDs := make([]string, 0, len(granted))
-		for _, t := range granted {
-			claimedIDs = append(claimedIDs, t.TaskID)
-		}
-
-		_ = stream.Send(&grpcv1.ClaimBatch{
+		if err := stream.Send(&grpcv1.ClaimBatch{
 			TaskIds:   claimedIDs,
 			FailedIds: failedIDs,
-		})
+		}); err != nil {
+			return err
+		}
 		batch = batch[:0]
+		return nil
 	}
 
 	for {
 		select {
 		case <-stream.Context().Done():
-			flush() // flush remaining before exit
+			_ = flush() // best effort; the client is already gone
 			return stream.Context().Err()
 		case err := <-readErr:
-			flush()
+			_ = flush()
 			return err
 		case c, ok := <-claimCh:
 			if !ok {
-				flush()
-				return nil
+				return flush()
 			}
 			batch = append(batch, c.req)
 			if len(batch) == 1 {
@@ -174,11 +183,15 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 				timerOn = true
 			}
 			if len(batch) >= claimBatchMaxSize {
-				flush()
+				if err := flush(); err != nil {
+					return err
+				}
 			}
 		case <-timer.C:
 			timerOn = false
-			flush()
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 	}
 }
@@ -188,14 +201,20 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 // ---------------------------------------------------------------------------
 
 func (s *InternalService) ResultStream(stream grpcv1.SluiceInternal_ResultStreamServer) error {
+	if !s.raft.IsLeader() {
+		return status.Error(codes.FailedPrecondition, "result stream is only available on the leader")
+	}
+	s.logger.Info("internal: ResultStream opened")
+	defer s.logger.Info("internal: ResultStream closed")
+
 	batch := make([]raftpkg.CompleteTaskData, 0, claimBatchMaxSize)
 	timer := time.NewTimer(claimBatchWindow)
-	timerOn := true
+	if !timer.Stop() {
+		<-timer.C
+	}
+	timerOn := false
 
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
+	stopTimer := func() {
 		if timerOn && !timer.Stop() {
 			select {
 			case <-timer.C:
@@ -203,6 +222,36 @@ func (s *InternalService) ResultStream(stream grpcv1.SluiceInternal_ResultStream
 			}
 		}
 		timerOn = false
+	}
+
+	resultCh := make(chan raftpkg.CompleteTaskData, 256)
+	readErr := make(chan error, 1)
+	go func() {
+		defer close(resultCh)
+		for {
+			req, err := stream.Recv()
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				readErr <- err
+				return
+			}
+			resultCh <- raftpkg.CompleteTaskData{
+				TaskID: req.TaskId, TenantID: req.TenantId,
+				Status: req.Status, Result: req.Result, Error: req.Error,
+			}
+		}
+	}()
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		stopTimer()
+		if !s.raft.IsLeader() {
+			return status.Error(codes.FailedPrecondition, "leadership changed")
+		}
 
 		cmd := raftpkg.MustMarshalCommand(raftpkg.OpCompleteBatch, raftpkg.CompleteBatchData{
 			Tasks: batch,
@@ -210,42 +259,46 @@ func (s *InternalService) ResultStream(stream grpcv1.SluiceInternal_ResultStream
 		result := s.raft.Apply(cmd, 5000)
 		if err := result.Error(); err != nil {
 			s.logger.Error("complete batch raft apply failed", zap.Error(err))
+			return status.Errorf(codes.Unavailable, "complete batch commit failed: %v", err)
 		}
 		committed := make([]string, len(batch))
 		for i, t := range batch {
 			committed[i] = t.TaskID
 		}
-		_ = stream.Send(&grpcv1.ResultBatch{CommittedIds: committed})
+		if err := stream.Send(&grpcv1.ResultBatch{CommittedIds: committed}); err != nil {
+			return err
+		}
 		batch = batch[:0]
-		timer = time.NewTimer(claimBatchWindow)
-		timerOn = true
+		return nil
 	}
 
 	for {
 		select {
 		case <-stream.Context().Done():
-			flush()
+			_ = flush()
 			return stream.Context().Err()
+		case err := <-readErr:
+			_ = flush()
+			return err
 		case <-timer.C:
-			flush()
-			timer = time.NewTimer(claimBatchWindow)
-			timerOn = true
-		default:
-			req, err := stream.Recv()
-			if err == io.EOF {
-				flush()
-				return nil
-			}
-			if err != nil {
-				flush()
+			timerOn = false
+			if err := flush(); err != nil {
 				return err
 			}
-			batch = append(batch, raftpkg.CompleteTaskData{
-				TaskID: req.TaskId, TenantID: req.TenantId,
-				Result: req.Result, Error: req.Error,
-			})
+		case result, ok := <-resultCh:
+			if !ok {
+				return flush()
+			}
+			batch = append(batch, result)
+			if len(batch) == 1 {
+				stopTimer()
+				timer = time.NewTimer(claimBatchWindow)
+				timerOn = true
+			}
 			if len(batch) >= claimBatchMaxSize {
-				flush()
+				if err := flush(); err != nil {
+					return err
+				}
 			}
 		}
 	}

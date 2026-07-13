@@ -37,6 +37,11 @@ type Claimer interface {
 	Claim(taskID, tenantID, payload string) (bool, error)
 }
 
+// Completer publishes task results through the current Raft leader.
+type Completer interface {
+	Complete(taskID, tenantID, result, errStr string, failed bool) error
+}
+
 // Pool manages worker goroutines organised by tenant.
 type Pool struct {
 	nodeID string
@@ -44,13 +49,17 @@ type Pool struct {
 	mu     sync.Mutex
 	groups map[string]*tenantGroup // tenantID → group
 
-	queue     queue.Queue
-	fsm       *raftpkg.FSM
+	queue       queue.Queue
+	fsm         *raftpkg.FSM
 	raft        raftpkg.RaftApplier
 	claimer     Claimer     // nil = use raft.Apply directly
+	completer   Completer   // nil = use raft.Apply directly
 	workerGuard func() bool // nil = always run
 	processor   Processor
-	logger    *zap.Logger
+	logger      *zap.Logger
+
+	activeMu sync.Mutex
+	active   map[string]struct{} // task IDs currently being claimed or processed locally
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -83,6 +92,7 @@ func NewPool(
 	return &Pool{
 		nodeID:    nodeID,
 		groups:    make(map[string]*tenantGroup),
+		active:    make(map[string]struct{}),
 		queue:     q,
 		fsm:       fsm,
 		raft:      raft,
@@ -96,6 +106,9 @@ func NewPool(
 // SetClaimer sets a streaming claim client.  When set, workers use this
 // instead of raft.Apply so followers' workers can claim via the leader.
 func (p *Pool) SetClaimer(c Claimer) { p.claimer = c }
+
+// SetCompleter configures leader-forwarded result commits.
+func (p *Pool) SetCompleter(c Completer) { p.completer = c }
 
 // SetWorkerGuard gates worker processing.  Followers pass `IsLeader` so
 // only the leader processes tasks.
@@ -247,26 +260,49 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 			}
 			continue
 		}
+		if !p.reserveTask(task.TaskID) {
+			continue
+		}
 
 		// 3. Claim the task via Raft.
 		if err := p.claimTask(task); err != nil {
+			p.releaseTask(task.TaskID)
 			logger.Warn("failed to claim task", zap.String("task_id", task.TaskID), zap.Error(err))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
 			continue
 		}
 
 		// 4. Process the task (context-aware).
 		result, err := p.processor.Process(ctx, task.TaskID, task.TenantID, json.RawMessage(task.Payload))
+		if err != nil && ctx.Err() != nil {
+			// A rollout interrupted execution. Leave the claim unfinished so the
+			// leader lease scanner can return it to pending for retry.
+			p.releaseTask(task.TaskID)
+			logger.Warn("task interrupted; waiting for lease recovery",
+				zap.String("task_id", task.TaskID), zap.Error(err))
+			return
+		}
 
 		// 5. Publish result via Raft.
+		var completeErr error
 		if err != nil {
-			p.completeTask(task.TaskID, task.TenantID, "", err.Error(), true)
+			completeErr = p.completeTask(task.TaskID, task.TenantID, "", err.Error(), true)
 			logger.Warn("task failed",
 				zap.String("task_id", task.TaskID),
 				zap.Error(err),
 			)
 		} else {
-			p.completeTask(task.TaskID, task.TenantID, result, "", false)
+			completeErr = p.completeTask(task.TaskID, task.TenantID, result, "", false)
 			logger.Debug("task completed", zap.String("task_id", task.TaskID))
+		}
+		p.releaseTask(task.TaskID)
+		if completeErr != nil {
+			logger.Error("task result was not committed; lease recovery will retry the task",
+				zap.String("task_id", task.TaskID), zap.Error(completeErr))
 		}
 	}
 }
@@ -309,6 +345,8 @@ func (p *Pool) claimTask(task *types.TaskRecord) error {
 			p.logger.Warn("claim stream failed, trying raft", zap.Error(err))
 		} else if ok {
 			return nil
+		} else {
+			return fmt.Errorf("claim rejected")
 		}
 	}
 	data := raftpkg.ClaimTaskData{
@@ -322,7 +360,23 @@ func (p *Pool) claimTask(task *types.TaskRecord) error {
 }
 
 // completeTask publishes the final result (done or failed) to Raft.
-func (p *Pool) completeTask(taskID, tenantID, result, errStr string, failed bool) {
+func (p *Pool) completeTask(taskID, tenantID, result, errStr string, failed bool) error {
+	if p.completer != nil {
+		var lastErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			if lastErr = p.completer.Complete(taskID, tenantID, result, errStr, failed); lastErr == nil {
+				return nil
+			}
+			if attempt < 2 {
+				select {
+				case <-p.ctx.Done():
+					attempt = 2
+				case <-time.After(time.Duration(attempt+1) * 300 * time.Millisecond):
+				}
+			}
+		}
+		p.logger.Warn("result stream failed, trying raft", zap.Error(lastErr))
+	}
 	op := raftpkg.OpCompleteTask
 	if failed {
 		op = raftpkg.OpFailTask
@@ -334,5 +388,21 @@ func (p *Pool) completeTask(taskID, tenantID, result, errStr string, failed bool
 		Error:    errStr,
 	}
 	cmd := raftpkg.MustMarshalCommand(op, data)
-	_ = p.raft.Apply(cmd, 5000) // best-effort; log errors if needed
+	return p.raft.Apply(cmd, 5000).Error()
+}
+
+func (p *Pool) reserveTask(taskID string) bool {
+	p.activeMu.Lock()
+	defer p.activeMu.Unlock()
+	if _, exists := p.active[taskID]; exists {
+		return false
+	}
+	p.active[taskID] = struct{}{}
+	return true
+}
+
+func (p *Pool) releaseTask(taskID string) {
+	p.activeMu.Lock()
+	delete(p.active, taskID)
+	p.activeMu.Unlock()
 }

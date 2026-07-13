@@ -31,12 +31,13 @@ import (
 
 // testCluster holds all the state needed for a multi-node integration test.
 type testCluster struct {
-	tb      testing.TB
-	nodes   []*node.Node
-	dirs    []string
+	tb        testing.TB
+	nodes     []*node.Node
+	dirs      []string
 	raftAddrs []string
 	httpAddrs []string
-	proc    *recordingProcessor
+	proc      *recordingProcessor
+	workers   int
 
 	mu      sync.Mutex
 	results map[string]*types.TaskResult // taskID → final result (polled from FSM)
@@ -54,16 +55,20 @@ func newTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster 
 	}
 
 	tc := &testCluster{
-		tb:      tb,
-		nodes:   make([]*node.Node, n),
-		dirs:    make([]string, n),
+		tb:        tb,
+		nodes:     make([]*node.Node, n),
+		dirs:      make([]string, n),
 		raftAddrs: make([]string, n),
 		httpAddrs: make([]string, n),
-		proc:    newRecordingProcessor(),
-		results: make(map[string]*types.TaskResult),
+		proc:      newRecordingProcessor(),
+		results:   make(map[string]*types.TaskResult),
+		workers:   totalWorkersPerNode,
 	}
 
 	logger := zap.NewNop()
+	if os.Getenv("SLUICE_TEST_LOGS") != "" {
+		logger, _ = zap.NewDevelopment()
+	}
 
 	// ---- Allocate random loopback ports ----
 	for i := 0; i < n; i++ {
@@ -91,7 +96,7 @@ func newTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster 
 	// ---- Create node 0 (bootstrap) ----
 	node0, err := node.New(node.Config{
 		NodeID:       "node-0",
-		APIAddress: tc.httpAddrs[0],
+		APIAddress:   tc.httpAddrs[0],
 		RaftAddress:  tc.raftAddrs[0],
 		DataDir:      tc.dirs[0],
 		Bootstrap:    true,
@@ -116,7 +121,7 @@ func newTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster 
 		nodeID := fmt.Sprintf("node-%d", i)
 		nd, err := node.New(node.Config{
 			NodeID:       nodeID,
-			APIAddress: tc.httpAddrs[i],
+			APIAddress:   tc.httpAddrs[i],
 			RaftAddress:  tc.raftAddrs[i],
 			DataDir:      tc.dirs[i],
 			Bootstrap:    false,
@@ -268,11 +273,21 @@ func (tc *testCluster) addTenant(id string, maxWorkers int) {
 	time.Sleep(500 * time.Millisecond)
 }
 
-// submitTask enqueues a task to a specific node's local queue and returns
-// the task ID.  It does NOT go through the HTTP API.
+// submitTask mirrors the production submit path: persist pending state through
+// Raft, then enqueue locally as a best-effort fast path.
 func (tc *testCluster) submitTask(nodeIdx int, tenantID string, payload string) string {
 	tc.tb.Helper()
 	taskID := fmt.Sprintf("task-%s-%d-%d", tenantID, nodeIdx, time.Now().UnixNano())
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		tc.tb.Fatal("submit task: no leader")
+	}
+	cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: taskID, TenantID: tenantID, Payload: payload,
+	})
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(cmd, 5*time.Second).Error(); err != nil {
+		tc.tb.Fatalf("persist task: %v", err)
+	}
 
 	env := &queue.TaskEnvelope{
 		TaskID:    taskID,
@@ -309,6 +324,44 @@ func (tc *testCluster) killNode(i int) {
 	tc.tb.Logf("killing node-%d", i)
 	_ = tc.nodes[i].Shutdown(2 * time.Second)
 	tc.nodes[i] = nil
+}
+
+// restartAll recreates every process over the existing Raft and queue data,
+// mirroring a StatefulSet rollout or a full Kubernetes cluster restart.
+func (tc *testCluster) restartAll() {
+	tc.tb.Helper()
+	for i, nd := range tc.nodes {
+		if nd == nil {
+			continue
+		}
+		if err := nd.Shutdown(5 * time.Second); err != nil {
+			tc.tb.Fatalf("stop node-%d for restart: %v", i, err)
+		}
+		tc.nodes[i] = nil
+	}
+
+	logger := zap.NewNop()
+	if os.Getenv("SLUICE_TEST_LOGS") != "" {
+		logger, _ = zap.NewDevelopment()
+	}
+	for i := range tc.nodes {
+		nd, err := node.New(node.Config{
+			NodeID:       fmt.Sprintf("node-%d", i),
+			APIAddress:   tc.httpAddrs[i],
+			RaftAddress:  tc.raftAddrs[i],
+			DataDir:      tc.dirs[i],
+			Bootstrap:    i == 0,
+			TotalWorkers: tc.workers,
+		}, tc.proc, logger)
+		if err != nil {
+			tc.tb.Fatalf("recreate node-%d: %v", i, err)
+		}
+		tc.nodes[i] = nd
+	}
+	for i := range tc.nodes {
+		go func(idx int) { _ = tc.nodes[idx].Start() }(i)
+	}
+	tc.waitAnyLeader(30 * time.Second)
 }
 
 // fsms returns the FSM of the first running node (for queries).
@@ -370,6 +423,18 @@ func (p *recordingProcessor) processedByTenant(tenantID string) int {
 	return n
 }
 
+func (p *recordingProcessor) processedTaskCount(taskID string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, record := range p.processed {
+		if record.TaskID == taskID {
+			n++
+		}
+	}
+	return n
+}
+
 // ===================================================================
 // MIT 6.824‑style integration tests
 // ===================================================================
@@ -385,13 +450,28 @@ func TestBasicAgreement(t *testing.T) {
 	tc.waitAllocation(10 * time.Second)
 	time.Sleep(2 * time.Second) // let workers spawn
 
-	// Submit all tasks to node 0.
+	// Submit all tasks through a follower's local worker queue. This verifies
+	// both claim and completion forwarding through the leader streams.
+	leader := tc.leaderIdx()
+	submitNode := 0
+	if submitNode == leader {
+		submitNode = 1
+	}
 	const nTasks = 15
+	taskIDs := make([]string, 0, nTasks)
 	for i := 0; i < nTasks; i++ {
-		tc.submitTask(0, "alice", fmt.Sprintf(`"payload-%d"`, i))
+		taskIDs = append(taskIDs, tc.submitTask(submitNode, "alice", fmt.Sprintf(`"payload-%d"`, i)))
 	}
 
 	tc.waitProcessed(nTasks, 30*time.Second)
+	tc.waitFor(func() bool {
+		for _, taskID := range taskIDs {
+			if result := tc.fsms().GetResult(taskID); result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, "follower task results committed through leader")
 
 	aliceCount := tc.proc.processedByTenant("alice")
 	if aliceCount != nTasks {
@@ -445,6 +525,24 @@ func TestFailover(t *testing.T) {
 		t.Error("after-fail tenant not found — new leader cannot commit")
 	}
 
+	// The remaining follower must notice that the leader address changed even
+	// though it stayed a follower, then forward claim and result streams to it.
+	follower := -1
+	for i, node := range tc.nodes {
+		if node != nil && i != newLeader {
+			follower = i
+			break
+		}
+	}
+	if follower < 0 {
+		t.Fatal("no surviving follower")
+	}
+	taskID := tc.submitTask(follower, "alice", `"after-leader-change"`)
+	tc.waitFor(func() bool {
+		result := tc.nodes[newLeader].RaftCluster().FSM().GetResult(taskID)
+		return result != nil && result.Status == types.TaskStatusDone
+	}, 30*time.Second, "task processed after follower-to-follower leader change")
+
 	t.Logf("failover: Raft log preserved and new entries committed after leader kill")
 }
 
@@ -472,9 +570,12 @@ func TestRecovery(t *testing.T) {
 
 	// Create inflight tasks directly via Raft (bypassing workers).
 	// These simulate tasks that were claimed by the victim.
+	taskIDs := make([]string, 0, 5)
 	for i := 0; i < 5; i++ {
+		taskID := fmt.Sprintf("rec-task-%d", i)
+		taskIDs = append(taskIDs, taskID)
 		cmd := raftpkg.MustMarshalCommand(raftpkg.OpClaimTask, raftpkg.ClaimTaskData{
-			TaskID:   fmt.Sprintf("rec-task-%d", i),
+			TaskID:   taskID,
 			TenantID: "alice",
 			NodeID:   fmt.Sprintf("node-%d", victim),
 			Payload:  `"recovery-test"`,
@@ -506,29 +607,87 @@ func TestRecovery(t *testing.T) {
 		t.Fatalf("mark node down: %v", err)
 	}
 
-	// All inflight tasks should now be re-queued as pending.
-	pending := tc.fsms().FindPendingTasks("alice")
-	t.Logf("pending after node-down: %d", len(pending))
-	if len(pending) != 5 {
-		t.Errorf("expected 5 pending tasks, got %d", len(pending))
-	}
-
-	// Survivor re-claims one pending task to prove the recovery pipeline works.
-	if len(pending) > 0 {
-		reclaim := raftpkg.MustMarshalCommand(raftpkg.OpClaimTask, raftpkg.ClaimTaskData{
-			TaskID:   pending[0].TaskID,
-			TenantID: "alice",
-			NodeID:   fmt.Sprintf("node-%d", leader),
-			Payload:  pending[0].Payload,
-		})
-		if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(reclaim, 5*time.Second).Error(); err != nil {
-			t.Errorf("re-claim recovery task: %v", err)
-		} else {
-			t.Logf("re-claimed recovery task %s on survivor", pending[0].TaskID)
+	// Survivors must claim, process, and commit every re-queued task. Checking
+	// only the intermediate pending state would miss broken result forwarding.
+	tc.waitFor(func() bool {
+		for _, taskID := range taskIDs {
+			result := tc.fsms().GetResult(taskID)
+			if result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, "all node-down tasks recovered and committed")
+	for _, taskID := range taskIDs {
+		if count := tc.proc.processedTaskCount(taskID); count != 1 {
+			t.Errorf("recovery task %s processed %d times, want once", taskID, count)
 		}
 	}
 
-	t.Logf("recovery: inflight→pending→re-claim pipeline verified")
+	t.Logf("recovery: inflight→pending→claim→complete pipeline verified")
+}
+
+// TestFullClusterRestartRecoversExpiredClaims preserves the production case
+// where all Kubernetes Pods restart while work is pending and inflight. Pending
+// work must resume immediately; abandoned inflight work must resume after its
+// claim lease expires, with no task executed twice.
+func TestFullClusterRestartRecoversExpiredClaims(t *testing.T) {
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	tc.addTenant("restart-tenant", 30)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader before restart")
+	}
+
+	taskIDs := make([]string, 0, 6)
+	for i := 0; i < 5; i++ {
+		taskID := fmt.Sprintf("restart-pending-%d", i)
+		taskIDs = append(taskIDs, taskID)
+		cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+			TaskID: taskID, TenantID: "restart-tenant", Payload: `"pending"`,
+		})
+		if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(cmd, 5*time.Second).Error(); err != nil {
+			t.Fatalf("create pending task: %v", err)
+		}
+	}
+	const expiredTaskID = "restart-expired-claim"
+	taskIDs = append(taskIDs, expiredTaskID)
+	claim := raftpkg.MustMarshalCommand(raftpkg.OpClaimTask, raftpkg.ClaimTaskData{
+		TaskID: expiredTaskID, TenantID: "restart-tenant", NodeID: "node-1", Payload: `"inflight"`,
+	})
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(claim, 5*time.Second).Error(); err != nil {
+		t.Fatalf("create inflight task: %v", err)
+	}
+
+	tc.restartAll()
+	tc.waitAllocation(15 * time.Second)
+	tc.waitFor(func() bool {
+		for _, taskID := range taskIDs {
+			result := tc.fsms().GetResult(taskID)
+			if result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, taskClaimRecoveryTimeout(), "all work completed after full cluster restart")
+
+	if unfinished := tc.fsms().CountUnfinishedPerTenant()["restart-tenant"]; unfinished != 0 {
+		t.Fatalf("unfinished tasks after recovery = %d, want 0", unfinished)
+	}
+	for _, taskID := range taskIDs {
+		if count := tc.proc.processedTaskCount(taskID); count != 1 {
+			t.Errorf("task %s processed %d times across restart, want once", taskID, count)
+		}
+	}
+	t.Log("full restart: pending and expired inflight work drained exactly once")
+}
+
+func taskClaimRecoveryTimeout() time.Duration {
+	// Production lease is 30s and allocator reconciliation runs every 3s.
+	// Keep enough election/CI headroom without hiding an unbounded wait.
+	return 50 * time.Second
 }
 
 // TestDynamicTenant verifies that adding and modifying tenants at runtime
