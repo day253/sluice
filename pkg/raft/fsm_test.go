@@ -2,6 +2,7 @@ package raft
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"testing"
@@ -197,6 +198,63 @@ func TestCompletedTaskCannotBeResurrected(t *testing.T) {
 	}
 	if result := fsm.GetResult("task-1"); result == nil || result.Status != types.TaskStatusDone {
 		t.Fatalf("completed result was lost: %+v", result)
+	}
+}
+
+func TestRestoreRepairsHistoricalCompletedAndUnfinishedOverlap(t *testing.T) {
+	state := types.NewFSMState()
+	state.Tasks["historical-duplicate"] = &types.TaskRecord{
+		TaskID: "historical-duplicate", TenantID: "globex", Status: types.TaskStatusPending,
+	}
+	state.Results["historical-duplicate"] = &types.TaskResult{
+		TaskID: "historical-duplicate", TenantID: "globex", Status: types.TaskStatusDone,
+		CompletedAt: time.Now().UTC().Add(-time.Hour),
+	}
+	state.ResultOrder = []string{"historical-duplicate"}
+	persisted, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fsm := newTestFSM(t)
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(persisted))); err != nil {
+		t.Fatal(err)
+	}
+	if task := fsm.GetTask("historical-duplicate"); task != nil {
+		t.Fatalf("historical unfinished copy survived restore: %+v", task)
+	}
+	if result := fsm.GetResult("historical-duplicate"); result == nil || result.Status != types.TaskStatusDone {
+		t.Fatalf("authoritative completed result was lost: %+v", result)
+	}
+	if unfinished := fsm.CountUnfinishedPerTenant()["globex"]; unfinished != 0 {
+		t.Fatalf("unfinished count after repair = %d, want 0", unfinished)
+	}
+}
+
+func TestClaimRepairsLiveHistoricalCompletedAndUnfinishedOverlap(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "historical-duplicate", TenantID: "globex", NodeID: "old-node", Payload: `{}`,
+	})
+	applyCmd(t, fsm, OpCompleteTask, CompleteTaskData{
+		TaskID: "historical-duplicate", TenantID: "globex", Result: "done",
+	})
+
+	// Reproduce the state emitted by the old stale-queue claim behavior.
+	fsm.state.Tasks["historical-duplicate"] = &types.TaskRecord{
+		TaskID: "historical-duplicate", TenantID: "globex", Status: types.TaskStatusPending,
+	}
+	batch := applyCmd(t, fsm, OpClaimBatch, ClaimBatchData{Tasks: []ClaimTaskData{{
+		TaskID: "historical-duplicate", TenantID: "globex", NodeID: "new-node", Payload: `{}`,
+	}}}).(*ClaimBatchResult)
+	if len(batch.Claimed) != 0 || len(batch.Failed) != 1 {
+		t.Fatalf("historical duplicate claim = %+v, want rejection", batch)
+	}
+	if task := fsm.GetTask("historical-duplicate"); task != nil {
+		t.Fatalf("live historical unfinished copy was not repaired: %+v", task)
+	}
+	if result := fsm.GetResult("historical-duplicate"); result == nil || result.Status != types.TaskStatusDone {
+		t.Fatalf("authoritative completed result was lost: %+v", result)
 	}
 }
 

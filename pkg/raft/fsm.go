@@ -143,12 +143,24 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 		delete(state.Results, state.ResultOrder[0])
 		state.ResultOrder = state.ResultOrder[1:]
 	}
+	// Older releases could resurrect a completed task from a stale local queue,
+	// leaving the same ID in both Tasks and Results. The completed result is
+	// authoritative; keeping the unfinished copy would make workers reject and
+	// retry it forever while starving newer pending work.
+	repairedTasks := 0
+	for taskID := range state.Results {
+		if _, exists := state.Tasks[taskID]; exists {
+			delete(state.Tasks, taskID)
+			repairedTasks++
+		}
+	}
 
 	f.state = &state
 	f.logger.Info("fsm: state restored from snapshot",
 		zap.Uint64("version", state.Version),
 		zap.Int("tenants", len(state.Tenants)),
 		zap.Int("nodes", len(state.Nodes)),
+		zap.Int("repaired_completed_tasks", repairedTasks),
 	)
 	return nil
 }
@@ -248,6 +260,7 @@ func (f *FSM) applyCreateTask(data json.RawMessage) interface{} {
 		return nil
 	}
 	if _, ok := f.state.Results[req.TaskID]; ok {
+		delete(f.state.Tasks, req.TaskID)
 		return nil
 	}
 	f.state.Tasks[req.TaskID] = &types.TaskRecord{
@@ -268,6 +281,7 @@ func (f *FSM) applyClaimTask(data json.RawMessage) interface{} {
 
 	now := time.Now().UTC()
 	if _, completed := f.state.Results[req.TaskID]; completed {
+		delete(f.state.Tasks, req.TaskID)
 		return fmt.Errorf("task %s already completed", req.TaskID)
 	}
 
@@ -336,6 +350,7 @@ func (f *FSM) applyClaimBatch(data json.RawMessage) interface{} {
 	now := time.Now().UTC()
 	for _, t := range req.Tasks {
 		if _, completed := f.state.Results[t.TaskID]; completed {
+			delete(f.state.Tasks, t.TaskID)
 			result.Failed = append(result.Failed, t.TaskID)
 			continue
 		}
