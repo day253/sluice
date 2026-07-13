@@ -38,6 +38,16 @@ data:
         --data="${DATA}" --bootstrap --workers={{ .Values.workersPerNode }} \
         --log-level={{ .Values.logLevel }}
     else
+      # Existing members must start immediately after a full-cluster restart.
+      # Waiting for pod 0's HTTP API here would deadlock Raft leader election.
+      if [ -f "${DATA}/raft/raft-stable.db" ]; then
+        echo "==> Restarting existing Raft member ${POD_NAME}"
+        exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
+          --raft-advertise="${RAFT_ADVERTISE}" \
+          --data="${DATA}" --workers={{ .Values.workersPerNode }} \
+          --log-level={{ .Values.logLevel }}
+      fi
+
       BOOTSTRAP_IP=$(resolve_service_ip "{{ include "sluice.fullname" . }}-0-raft")
       while [ -z "$BOOTSTRAP_IP" ]; do
         echo "   waiting for sluice-0 IP via K8s API..."

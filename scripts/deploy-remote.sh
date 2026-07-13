@@ -83,41 +83,50 @@ if [ -n "${existing_pods}" ]; then
       -p "{\"spec\":{\"selector\":{\"app\":null,\"app.kubernetes.io/name\":\"sluice\",\"app.kubernetes.io/instance\":\"${RELEASE}\",\"statefulset.kubernetes.io/pod-name\":\"${pod_name}\"}}}" >/dev/null
   done
 
-  probe_pod="${existing_pods%%$'\n'*}"
-  probe_name="${probe_pod#pod/}"
-  probe_ip="$(microk8s kubectl get service --namespace "${NAMESPACE}" "${probe_name}-raft" -o jsonpath='{.spec.clusterIP}')"
-  health="$(microk8s kubectl exec --namespace "${NAMESPACE}" "${probe_pod}" -- \
-    wget -qO- "http://${probe_ip}:9090/api/v1/health")"
-  leader_raft="$(printf '%s' "${health}" | sed -n 's/.*"leader":"\([^"]*\)".*/\1/p')"
-  leader_host="${leader_raft%:*}"
+  probe_name="$(microk8s kubectl get pods \
+    --namespace "${NAMESPACE}" \
+    -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE}" \
+    -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{"\n"}{end}' \
+    2>/dev/null | head -n 1 || true)"
 
-  if [ -z "${leader_host}" ]; then
-    printf 'Could not discover the current Raft leader from: %s\n' "${health}" >&2
-    exit 1
-  fi
-
-  if printf '%s' "${leader_host}" | grep -q '^sluice-'; then
-    leader_pod="${leader_host%%.*}"
-    leader_service_ip="$(microk8s kubectl get service --namespace "${NAMESPACE}" \
-      "${leader_pod}-raft" -o jsonpath='{.spec.clusterIP}')"
+  if [ -z "${probe_name}" ]; then
+    printf 'No Ready Sluice pod; skipping live Raft migration and continuing with Helm recovery.\n'
   else
-    # A leader reported as an IP is already directly reachable. It may be an
-    # old Pod IP during migration or the stable per-Pod ClusterIP afterwards.
-    leader_service_ip="${leader_host}"
-  fi
+    probe_pod="pod/${probe_name}"
+    probe_ip="$(microk8s kubectl get service --namespace "${NAMESPACE}" "${probe_name}-raft" -o jsonpath='{.spec.clusterIP}')"
+    health="$(microk8s kubectl exec --namespace "${NAMESPACE}" "${probe_pod}" -- \
+      wget -qO- "http://${probe_ip}:9090/api/v1/health")"
+    leader_raft="$(printf '%s' "${health}" | sed -n 's/.*"leader":"\([^"]*\)".*/\1/p')"
+    leader_host="${leader_raft%:*}"
 
-  for pod in ${existing_pods}; do
-    pod_name="${pod#pod/}"
-    pod_service_ip="$(microk8s kubectl get service --namespace "${NAMESPACE}" \
-      "${pod_name}-raft" -o jsonpath='{.spec.clusterIP}')"
-    payload="$(printf '{\"node_id\":\"%s\",\"raft_address\":\"%s:7000\",\"http_address\":\"%s:9090\",\"total_workers\":100}' \
-      "${pod_name}" "${pod_service_ip}" "${pod_service_ip}")"
-    printf '%s: ' "${pod_name}"
-    microk8s kubectl exec --namespace "${NAMESPACE}" "${probe_pod}" -- \
-      wget -qO- --header='Content-Type: application/json' --post-data="${payload}" \
-      "http://${leader_service_ip}:9090/api/v1/cluster/join"
-    printf '\n'
-  done
+    if [ -z "${leader_host}" ]; then
+      printf 'Could not discover the current Raft leader from: %s\n' "${health}" >&2
+      exit 1
+    fi
+
+    if printf '%s' "${leader_host}" | grep -q '^sluice-'; then
+      leader_pod="${leader_host%%.*}"
+      leader_service_ip="$(microk8s kubectl get service --namespace "${NAMESPACE}" \
+        "${leader_pod}-raft" -o jsonpath='{.spec.clusterIP}')"
+    else
+      # A leader reported as an IP is already directly reachable. It may be an
+      # old Pod IP during migration or the stable per-Pod ClusterIP afterwards.
+      leader_service_ip="${leader_host}"
+    fi
+
+    for pod in ${existing_pods}; do
+      pod_name="${pod#pod/}"
+      pod_service_ip="$(microk8s kubectl get service --namespace "${NAMESPACE}" \
+        "${pod_name}-raft" -o jsonpath='{.spec.clusterIP}')"
+      payload="$(printf '{\"node_id\":\"%s\",\"raft_address\":\"%s:7000\",\"http_address\":\"%s:9090\",\"total_workers\":100}' \
+        "${pod_name}" "${pod_service_ip}" "${pod_service_ip}")"
+      printf '%s: ' "${pod_name}"
+      microk8s kubectl exec --namespace "${NAMESPACE}" "${probe_pod}" -- \
+        wget -qO- --header='Content-Type: application/json' --post-data="${payload}" \
+        "http://${leader_service_ip}:9090/api/v1/cluster/join"
+      printf '\n'
+    done
+  fi
 else
   printf 'No existing release found; migration is not needed.\n'
 fi
