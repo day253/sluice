@@ -25,12 +25,13 @@ button,input,select{font:inherit}button{cursor:pointer}.hidden{display:none!impo
 .panel{background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);min-width:0}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:17px 19px;border-bottom:1px solid var(--line)}.panel-title{font-size:14px;font-weight:720;margin:0;letter-spacing:-.01em}.panel-kicker{font-size:11px;color:var(--muted);margin-top:3px}.panel-body{padding:18px 19px}
 .chart-summary{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}.chart-current{font-size:30px;font-weight:760;letter-spacing:-.05em}.chart-unit{color:var(--muted);font-size:12px}.chart-wrap{height:230px;position:relative}.chart-wrap canvas{display:block;width:100%;height:100%}
 .chart-legend{display:flex;flex-wrap:wrap;gap:8px 16px;padding:0 19px 16px}.legend-item{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:10px}.legend-item i{width:8px;height:8px;border-radius:50%;flex:0 0 auto}.legend-item strong{color:var(--ink);font-size:11px}.legend-empty{color:var(--muted);font-size:11px}
-.stack-panel{margin-bottom:16px}.meter{height:5px;background:#e9edf2;border-radius:999px;overflow:hidden;margin-top:12px}.meter>i{display:block;height:100%;border-radius:inherit;background:var(--blue);min-width:2px}
+.chart-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:16px;align-items:stretch}.meter{height:5px;background:#e9edf2;border-radius:999px;overflow:hidden;margin-top:12px}.meter>i{display:block;height:100%;border-radius:inherit;background:var(--blue);min-width:2px}
 .toolbar{display:flex;align-items:center;gap:8px}.quick-count{height:34px;display:flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:8px;padding:0 8px;background:#fff;color:var(--muted);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}.quick-count input{width:62px;border:0;border-left:1px solid var(--line);padding:4px 0 4px 8px;outline:0;color:var(--ink);font-size:12px;font-weight:720;background:transparent}.btn{border:1px solid transparent;border-radius:8px;padding:8px 11px;font-size:12px;font-weight:680;background:var(--surface);color:var(--ink);transition:.15s ease}.btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(26,39,57,.08)}.btn:disabled{cursor:wait;opacity:.55;transform:none;box-shadow:none}.btn-secondary{border-color:var(--line)}.btn-primary{background:var(--ink);color:#fff}.btn-danger{border-color:#f1cbd0;color:var(--red);background:#fff}.icon-btn{padding:6px 9px;border-color:var(--line);color:var(--blue);background:#fff;white-space:nowrap}
 .table-wrap{overflow:auto}.data-table{width:100%;border-collapse:collapse;min-width:820px}.data-table th{text-align:left;padding:10px 16px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;font-weight:750;background:#fbfcfd;border-bottom:1px solid var(--line)}.data-table td{padding:13px 16px;border-bottom:1px solid var(--line);vertical-align:middle;font-size:12px}.data-table tbody tr{transition:background .15s}.data-table tbody tr:hover{background:#f8fbff}.data-table tbody tr:last-child td{border-bottom:0}.tenant-name{font-weight:720}.tenant-id{color:var(--muted);font-size:10px;margin-top:3px}.state-badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:5px 8px;font-size:10px;font-weight:700;background:var(--green-soft);color:var(--green)}.state-badge.idle{background:#eef1f5;color:#6a7687}.state-badge.queued{background:var(--amber-soft);color:var(--amber)}.quota-cell{min-width:150px}.quota-line{display:flex;justify-content:space-between;gap:10px;margin-bottom:5px}.quota-line span:last-child{color:var(--muted);font-size:10px}.placement{display:flex;flex-wrap:wrap;gap:4px}.placement span{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#eef3f9;color:#53647a;padding:3px 6px;border-radius:5px;font-size:9px}.empty{padding:38px!important;text-align:center;color:var(--muted)}
 dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));box-shadow:0 24px 90px rgba(16,24,40,.25);color:var(--ink)}dialog::backdrop{background:rgba(23,32,46,.48);backdrop-filter:blur(3px)}.dialog-head{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid var(--line)}.dialog-head h2{font-size:16px;margin:0}.dialog-close{border:0;background:transparent;color:var(--muted);font-size:20px;padding:0 4px}.dialog-body{padding:20px}.form-grid{display:grid;gap:13px}.field label{display:block;font-size:11px;color:var(--muted);font-weight:680;margin-bottom:6px}.field input,.field select{width:100%;border:1px solid #d8dee7;border-radius:8px;padding:10px 11px;color:var(--ink);outline:none;background:#fff}.field input:focus,.field select:focus{border-color:#8bb8f4;box-shadow:0 0 0 3px #e9f2ff}.dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.dialog-actions .danger-left{margin-right:auto}
 .toast{position:fixed;right:22px;bottom:22px;background:var(--ink);color:#fff;padding:11px 14px;border-radius:9px;font-size:12px;box-shadow:0 12px 34px rgba(16,24,40,.25);z-index:30;max-width:330px}
 @media(max-width:1080px){.summary-grid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:800px){.chart-layout{grid-template-columns:1fr}}
 @media(max-width:700px){.topbar{height:auto;min-height:64px;padding:12px 16px;flex-wrap:wrap;gap:10px}.brand{min-width:0}.brand-sub,.top-meta .leader-meta{display:none}.top-meta{margin-left:auto}.shell{padding:20px 14px 36px}.page-heading{align-items:flex-start}.summary-grid{grid-template-columns:repeat(2,1fr)}.metric-card{padding:14px}.metric-value{font-size:24px}.summary-grid .metric-card:last-child{grid-column:span 2}.panel-head{align-items:flex-start;flex-direction:column}.toolbar{width:100%;flex-wrap:wrap}.quick-count{flex:1}.toolbar .btn{flex:1}.updated{display:none}}
 </style>
 </head>
@@ -62,17 +63,19 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
     <article class="metric-card"><div class="metric-top"><span>Tenants</span><span class="metric-icon">◇</span></div><div class="metric-value" id="metric-tenants">—</div><div class="metric-note" id="note-tenants">Configured limits</div></article>
   </section>
 
-  <section class="panel stack-panel">
-    <div class="panel-head"><div><h2 class="panel-title">Worker allocation by instance</h2><div class="panel-kicker">Solid lines show usage history · dashed lines show instance limits</div></div><div class="chart-summary"><span class="chart-current" id="workers-chart-current">0</span><span class="chart-unit">usage / <span id="workers-chart-limit">0</span> limit · 174 samples</span></div></div>
-    <div class="panel-body"><div class="chart-wrap"><canvas id="workers-chart" role="img" aria-label="Worker usage history and limit for each cluster instance"></canvas></div></div>
-    <div id="worker-chart-legend" class="chart-legend"></div>
-  </section>
+  <div class="chart-layout">
+    <section class="panel">
+      <div class="panel-head"><div><h2 class="panel-title">Worker allocation by instance</h2><div class="panel-kicker">Solid lines show usage history · dashed lines show instance limits</div></div><div class="chart-summary"><span class="chart-current" id="workers-chart-current">0</span><span class="chart-unit">usage / <span id="workers-chart-limit">0</span> limit · 174 samples</span></div></div>
+      <div class="panel-body"><div class="chart-wrap"><canvas id="workers-chart" role="img" aria-label="Worker usage history and limit for each cluster instance"></canvas></div></div>
+      <div id="worker-chart-legend" class="chart-legend"></div>
+    </section>
 
-  <section class="panel stack-panel">
-    <div class="panel-head"><div><h2 class="panel-title">Unfinished tasks by tenant</h2><div class="panel-kicker">One 174-point time series per tenant · legend ordered by current count</div></div></div>
-    <div class="panel-body"><div class="chart-wrap"><canvas id="tenant-unfinished-chart" role="img" aria-label="Unfinished task history for each tenant"></canvas></div></div>
-    <div id="tenant-chart-legend" class="chart-legend"></div>
-  </section>
+    <section class="panel">
+      <div class="panel-head"><div><h2 class="panel-title">Unfinished tasks by tenant</h2><div class="panel-kicker">One 174-point time series per tenant · legend ordered by current count</div></div></div>
+      <div class="panel-body"><div class="chart-wrap"><canvas id="tenant-unfinished-chart" role="img" aria-label="Unfinished task history for each tenant"></canvas></div></div>
+      <div id="tenant-chart-legend" class="chart-legend"></div>
+    </section>
+  </div>
 
   <section class="panel">
     <div class="panel-head">
