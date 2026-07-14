@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	grpcv1 "github.com/day253/sluice/pkg/grpc/v1"
+	"github.com/day253/sluice/pkg/types"
 )
 
 const workerStreamTimeout = 5 * time.Second
@@ -26,29 +30,95 @@ type ClaimClient struct {
 	leaderAddr   string
 	conn         *grpc.ClientConn
 	claimStream  grpcv1.SluiceInternal_ClaimStreamClient
+	assignStream grpcv1.SluiceInternal_AssignmentStreamClient
 	resultStream grpcv1.SluiceInternal_ResultStreamClient
 	streamCtx    context.Context
 	streamCancel context.CancelFunc
 	generation   uint64
 	closed       bool
+	assignLegacy bool // current leader does not implement AssignmentStream
 
 	claimSendMu  sync.Mutex
+	assignSendMu sync.Mutex
 	resultSendMu sync.Mutex
+	assignSeq    atomic.Uint64
 
 	pendingClaims    map[string]chan claimResult
 	pendingClaimsMu  sync.Mutex
+	pendingAssign    map[string]chan assignmentResult
+	pendingAssignMu  sync.Mutex
 	pendingResults   map[string]chan struct{}
 	pendingResultsMu sync.Mutex
 }
 
 type claimResult struct{ claimed bool }
 
+type assignmentResult struct {
+	task      *types.TaskRecord
+	supported bool
+}
+
 func NewClaimClient(nodeID string, logger *zap.Logger) *ClaimClient {
 	return &ClaimClient{
 		nodeID:         nodeID,
 		logger:         logger,
 		pendingClaims:  make(map[string]chan claimResult),
+		pendingAssign:  make(map[string]chan assignmentResult),
 		pendingResults: make(map[string]chan struct{}),
+	}
+}
+
+// Assign reports one idle execution slot to the leader. supported=false is
+// returned only while rolling against an older leader that does not implement
+// AssignmentStream; callers may use the legacy claim path in that case.
+func (c *ClaimClient) Assign(preferredTenantID string) (*types.TaskRecord, bool, error) {
+	c.mu.Lock()
+	stream, streamCtx, generation := c.assignStream, c.streamCtx, c.generation
+	legacy := c.assignLegacy
+	c.mu.Unlock()
+	if legacy {
+		return nil, false, nil
+	}
+	if stream == nil || streamCtx == nil {
+		return nil, true, fmt.Errorf("assignment client: not connected")
+	}
+
+	requestID := fmt.Sprintf("%s-%d", c.nodeID, c.assignSeq.Add(1))
+	ch := make(chan assignmentResult, 1)
+	c.pendingAssignMu.Lock()
+	c.pendingAssign[requestID] = ch
+	c.pendingAssignMu.Unlock()
+	defer func() {
+		c.pendingAssignMu.Lock()
+		delete(c.pendingAssign, requestID)
+		c.pendingAssignMu.Unlock()
+	}()
+
+	c.assignSendMu.Lock()
+	err := stream.Send(&grpcv1.AssignmentRequest{
+		RequestId: requestID, NodeId: c.nodeID, PreferredTenantId: preferredTenantID,
+	})
+	c.assignSendMu.Unlock()
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			c.disableAssignments(generation)
+			return nil, false, nil
+		}
+		c.invalidate(generation, err)
+		return nil, true, err
+	}
+
+	timer := time.NewTimer(workerStreamTimeout)
+	defer timer.Stop()
+	select {
+	case result := <-ch:
+		return result.task, result.supported, nil
+	case <-timer.C:
+		err := fmt.Errorf("assignment timeout")
+		c.invalidate(generation, err)
+		return nil, true, err
+	case <-streamCtx.Done():
+		return nil, true, streamCtx.Err()
 	}
 }
 
@@ -60,7 +130,8 @@ func (c *ClaimClient) SetLeader(addr string) {
 	if c.closed {
 		return
 	}
-	if addr == c.leaderAddr && c.claimStream != nil && c.resultStream != nil {
+	if addr == c.leaderAddr && c.claimStream != nil && c.resultStream != nil &&
+		(c.assignStream != nil || c.assignLegacy) {
 		return
 	}
 	if addr != c.leaderAddr {
@@ -192,6 +263,7 @@ func (c *ClaimClient) reconnectLocked() {
 	c.generation++
 	generation := c.generation
 	c.closeStreamsLocked()
+	c.assignLegacy = false
 	if c.leaderAddr == "" || c.closed {
 		return
 	}
@@ -219,14 +291,22 @@ func (c *ClaimClient) reconnectLocked() {
 		c.logger.Warn("result stream open failed", zap.Error(err))
 		return
 	}
+	assignStream, assignErr := client.AssignmentStream(streamCtx)
 
 	c.conn = conn
 	c.claimStream = claimStream
+	c.assignStream = assignStream
 	c.resultStream = resultStream
 	c.streamCtx = streamCtx
 	c.streamCancel = streamCancel
+	c.assignLegacy = status.Code(assignErr) == codes.Unimplemented
 	go c.recvClaimLoop(claimStream, generation)
 	go c.recvResultLoop(resultStream, generation)
+	if assignErr == nil {
+		go c.recvAssignmentLoop(assignStream, generation)
+	} else if !c.assignLegacy {
+		c.logger.Warn("assignment stream open failed", zap.Error(assignErr))
+	}
 	c.logger.Info("worker client connected", zap.String("addr", c.leaderAddr))
 }
 
@@ -239,9 +319,30 @@ func (c *ClaimClient) closeStreamsLocked() {
 	}
 	c.conn = nil
 	c.claimStream = nil
+	c.assignStream = nil
 	c.resultStream = nil
 	c.streamCtx = nil
 	c.streamCancel = nil
+}
+
+func (c *ClaimClient) disableAssignments(generation uint64) {
+	c.mu.Lock()
+	if c.closed || generation != c.generation {
+		c.mu.Unlock()
+		return
+	}
+	c.assignStream = nil
+	c.assignLegacy = true
+	c.mu.Unlock()
+
+	c.pendingAssignMu.Lock()
+	for _, ch := range c.pendingAssign {
+		select {
+		case ch <- assignmentResult{supported: false}:
+		default:
+		}
+	}
+	c.pendingAssignMu.Unlock()
 }
 
 func (c *ClaimClient) invalidate(generation uint64, err error) {
@@ -274,6 +375,36 @@ func (c *ClaimClient) recvClaimLoop(stream grpcv1.SluiceInternal_ClaimStreamClie
 	}
 }
 
+func (c *ClaimClient) recvAssignmentLoop(stream grpcv1.SluiceInternal_AssignmentStreamClient, generation uint64) {
+	for {
+		batch, err := stream.Recv()
+		if err != nil {
+			if status.Code(err) == codes.Unimplemented {
+				c.disableAssignments(generation)
+				return
+			}
+			if err != io.EOF {
+				c.logger.Debug("assignment recv done", zap.Error(err))
+			}
+			c.invalidate(generation, err)
+			return
+		}
+		for _, task := range batch.Tasks {
+			c.notifyAssignment(task.RequestId, assignmentResult{
+				supported: true,
+				task: &types.TaskRecord{
+					TaskID: task.TaskId, TenantID: task.TenantId,
+					Status: types.TaskStatusInflight, NodeID: c.nodeID,
+					QueueNodeID: task.QueueNodeId, Payload: string(task.Payload),
+				},
+			})
+		}
+		for _, requestID := range batch.EmptyRequestIds {
+			c.notifyAssignment(requestID, assignmentResult{supported: true})
+		}
+	}
+}
+
 func (c *ClaimClient) recvResultLoop(stream grpcv1.SluiceInternal_ResultStreamClient, generation uint64) {
 	for {
 		batch, err := stream.Recv()
@@ -297,6 +428,18 @@ func (c *ClaimClient) notifyClaim(taskID string, claimed bool) {
 	if ok {
 		select {
 		case ch <- claimResult{claimed: claimed}:
+		default:
+		}
+	}
+}
+
+func (c *ClaimClient) notifyAssignment(requestID string, result assignmentResult) {
+	c.pendingAssignMu.Lock()
+	ch, ok := c.pendingAssign[requestID]
+	c.pendingAssignMu.Unlock()
+	if ok {
+		select {
+		case ch <- result:
 		default:
 		}
 	}

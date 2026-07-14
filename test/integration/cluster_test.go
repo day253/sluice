@@ -60,6 +60,24 @@ func newTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster 
 	return newTestClusterWithLogger(tb, n, totalWorkersPerNode, logger)
 }
 
+func newClaimRejectCountingLogger(rejectedClaims *atomic.Int64) *zap.Logger {
+	var sink io.Writer = io.Discard
+	if os.Getenv("SLUICE_TEST_LOGS") != "" {
+		sink = os.Stderr
+	}
+	core := zapcore.NewCore(
+		zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
+		zapcore.AddSync(sink),
+		zap.WarnLevel,
+	)
+	return zap.New(core, zap.Hooks(func(entry zapcore.Entry) error {
+		if entry.Message == "failed to claim task" {
+			rejectedClaims.Add(1)
+		}
+		return nil
+	}))
+}
+
 func newTestClusterWithLogger(tb testing.TB, n int, totalWorkersPerNode int, logger *zap.Logger) *testCluster {
 	tb.Helper()
 
@@ -230,14 +248,19 @@ func (tc *testCluster) waitNodes(n int, timeout time.Duration) {
 	}, timeout, fmt.Sprintf("%d nodes active", n))
 }
 
-// waitAllocation blocks until every active node has a non-empty worker
-// allocation in the FSM.
+// waitAllocation blocks until every active follower has a non-empty worker
+// allocation and the leader has none.
 func (tc *testCluster) waitAllocation(timeout time.Duration) {
 	tc.waitFor(func() bool {
 		fsm := tc.nodes[0].RaftCluster().FSM()
 		allocs := fsm.GetAllAllocations()
 		active := fsm.GetActiveNodes()
-		if len(allocs) < len(active) {
+		leader := tc.leaderIdx()
+		if leader < 0 || len(allocs) != len(active)-1 {
+			return false
+		}
+		leaderID := fmt.Sprintf("node-%d", leader)
+		if _, ok := allocs[leaderID]; ok {
 			return false
 		}
 		for _, na := range allocs {
@@ -488,6 +511,38 @@ func TestBasicAgreement(t *testing.T) {
 	t.Logf("basic agreement: %d/%d tasks processed", aliceCount, nTasks)
 }
 
+// TestLeaderIsControlPlaneOnly locks the role boundary: the current leader
+// owns assignment and Raft commits but has no allocation or live business
+// workers. A follower still drains work end to end.
+func TestLeaderIsControlPlaneOnly(t *testing.T) {
+	tc := newTestCluster(t, 2, 20)
+	defer tc.shutdown()
+
+	tc.addTenant("control-plane-boundary", 20)
+	tc.waitAllocation(10 * time.Second)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader")
+	}
+	follower := 1 - leader
+	leaderID := fmt.Sprintf("node-%d", leader)
+	if allocation, ok := tc.fsms().GetAllocation(leaderID); ok {
+		t.Fatalf("leader allocation = %+v, want none", allocation)
+	}
+	tc.waitFor(func() bool {
+		return tc.nodes[leader].Pool().GetStatus()["control-plane-boundary"] == 0 &&
+			tc.nodes[follower].Pool().GetStatus()["control-plane-boundary"] > 0
+	}, 5*time.Second, "worker pools apply follower-only allocation")
+	taskID := tc.submitTask(leader, "control-plane-boundary", `"leader-submission"`)
+	tc.waitFor(func() bool {
+		result := tc.fsms().GetResult(taskID)
+		return result != nil && result.Status == types.TaskStatusDone
+	}, 30*time.Second, "follower executes leader-submitted task")
+	if count := tc.proc.processedTaskCount(taskID); count != 1 {
+		t.Fatalf("task processed %d times, want once", count)
+	}
+}
+
 // TestHTTPSubmitThroughFollower covers the production API path that was
 // previously missing from the integration suite. The request enters through
 // a real follower HTTP listener, is forwarded to the leader, and is then
@@ -594,22 +649,24 @@ func TestWorkStealUsesAgedPendingWork(t *testing.T) {
 	defer tc.shutdown()
 
 	tc.addTenant("steal-worker", 10)
-	tc.addTenant("steal-target", 1)
 	tc.waitAllocation(10 * time.Second)
 
 	// Stop target workers in the current mirror while preserving one source
-	// worker on every node. The allocator may restore the normal plan later,
+	// worker on every follower. The allocator may restore the normal plan later,
 	// but the aged task should be claimed before its next reconciliation tick.
 	allocs := make(map[string]*types.NodeAllocation)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
 	for _, nodeInfo := range tc.fsms().GetActiveNodes() {
+		if nodeInfo.ID == fmt.Sprintf("node-%d", leader) {
+			continue
+		}
 		allocs[nodeInfo.ID] = &types.NodeAllocation{
 			NodeID:  nodeInfo.ID,
 			Tenants: map[string]int{"steal-worker": 1},
 		}
-	}
-	leader := tc.leaderIdx()
-	if leader < 0 {
-		t.Fatal("no leader found")
 	}
 	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
 		raftpkg.MustMarshalCommand(raftpkg.OpUpdateAllocation, allocs), 5*time.Second,
@@ -626,21 +683,18 @@ func TestWorkStealUsesAgedPendingWork(t *testing.T) {
 	).Error(); err != nil {
 		t.Fatalf("create aged task: %v", err)
 	}
-	// Make the task old without sleeping through the five-second admission
-	// threshold. This mutation is test-only; production CreatedAt is immutable.
-	leaderFSM := tc.nodes[leader].RaftCluster().FSM()
-	state := leaderFSM.GetState()
-	if state.Tasks[taskID] == nil {
-		t.Fatalf("created task %s missing from leader FSM", taskID)
-	}
-	state.Tasks[taskID].CreatedAt = time.Now().UTC().Add(-time.Minute)
-	persisted, err := json.Marshal(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := leaderFSM.Restore(io.NopCloser(bytes.NewReader(persisted))); err != nil {
-		t.Fatalf("age task in test FSM: %v", err)
-	}
+	// No target allocation exists, so the task remains pending until it crosses
+	// the production five-second admission boundary.
+	var createdAt time.Time
+	tc.waitFor(func() bool {
+		record := tc.fsms().GetTask(taskID)
+		if record == nil {
+			return false
+		}
+		createdAt = record.CreatedAt
+		return !createdAt.IsZero()
+	}, 5*time.Second, "created task replicated")
+	tc.waitFor(func() bool { return time.Since(createdAt) > 5*time.Second }, 7*time.Second, "task reaches cross-node steal age")
 
 	tc.waitFor(func() bool {
 		result := tc.fsms().GetResult(taskID)
@@ -651,38 +705,94 @@ func TestWorkStealUsesAgedPendingWork(t *testing.T) {
 	}
 }
 
-// TestFreshRecoveryDoesNotCauseCrossNodeClaimStorm preserves the production
-// incident where every node scanned the same global pending set. The Raft FSM
-// protected correctness, but followers repeatedly submitted duplicate claims
-// and consumed most of the cluster on rejected work. Fresh recovery work has
-// one normal scanner (the leader); followers may only cross-node steal after
-// the age threshold.
-func TestFreshRecoveryDoesNotCauseCrossNodeClaimStorm(t *testing.T) {
+// TestLeaderAssignmentDrainsAgedBacklogWithoutClaimCompetition preserves
+// SCHED-002. Every worker reports only an idle slot; the leader chooses each
+// aged task once and commits the concrete node assignments in ClaimBatch.
+func TestLeaderAssignmentDrainsAgedBacklogWithoutClaimCompetition(t *testing.T) {
 	var rejectedClaims atomic.Int64
-	core := zapcore.NewCore(
-		zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
-		zapcore.AddSync(io.Discard),
-		zap.DebugLevel,
-	)
-	logger := zap.New(core, zap.Hooks(func(entry zapcore.Entry) error {
-		if entry.Message == "failed to claim task" {
-			rejectedClaims.Add(1)
-		}
-		return nil
-	}))
-	tc := newTestClusterWithLogger(t, 3, 40, logger)
+	tc := newTestClusterWithLogger(t, 3, 30, newClaimRejectCountingLogger(&rejectedClaims))
 	defer tc.shutdown()
 
-	tc.addTenant("recovery-owner", 120)
+	tc.addTenant("steal-source", 90)
 	tc.waitAllocation(10 * time.Second)
+
+	const taskCount = 90
+	tasks := make([]raftpkg.CreateTaskData, taskCount)
+	for i := range tasks {
+		tasks[i] = raftpkg.CreateTaskData{
+			TaskID:   fmt.Sprintf("aged-steal-%d", i),
+			TenantID: "unallocated-target",
+			Payload:  `"aged-work-steal"`,
+		}
+	}
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader while creating aged steal backlog")
+	}
+	cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: tasks})
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(cmd, 10*time.Second).Error(); err != nil {
+		t.Fatalf("create aged steal backlog: %v", err)
+	}
+	var createdAt time.Time
 	tc.waitFor(func() bool {
-		for _, nd := range tc.nodes {
-			if nd == nil || nd.Pool().GetStatus()["recovery-owner"] == 0 {
+		record := tc.fsms().GetTask(tasks[0].TaskID)
+		if record == nil {
+			return false
+		}
+		createdAt = record.CreatedAt
+		return !createdAt.IsZero()
+	}, 5*time.Second, "aged steal backlog replicated")
+	tc.waitFor(func() bool { return time.Since(createdAt) > 5*time.Second }, 7*time.Second, "backlog reaches cross-node steal age")
+
+	tc.waitFor(func() bool {
+		for _, task := range tasks {
+			result := tc.fsms().GetResult(task.TaskID)
+			if result == nil || result.Status != types.TaskStatusDone {
 				return false
 			}
 		}
 		return true
-	}, 10*time.Second, "recovery workers on every node")
+	}, 15*time.Second, "aged steal backlog drained")
+	for _, task := range tasks {
+		if count := tc.proc.processedTaskCount(task.TaskID); count != 1 {
+			t.Errorf("aged steal task %s processed %d times, want once", task.TaskID, count)
+		}
+	}
+	if got := rejectedClaims.Load(); got != 0 {
+		t.Fatalf("aged work stealing generated %d rejected claims, want 0", got)
+	}
+}
+
+// TestFreshRecoveryDoesNotCauseCrossNodeClaimStorm preserves the production
+// incident where every node scanned the same global pending set. Workers now
+// report idle slots only; the leader selects and commits every concrete task
+// assignment, so there is no worker-side claim race.
+func TestFreshRecoveryDoesNotCauseCrossNodeClaimStorm(t *testing.T) {
+	var rejectedClaims atomic.Int64
+	tc := newTestClusterWithLogger(t, 3, 40, newClaimRejectCountingLogger(&rejectedClaims))
+	defer tc.shutdown()
+
+	tc.addTenant("recovery-owner", 120)
+	tc.waitAllocation(10 * time.Second)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader while checking recovery workers")
+	}
+	tc.waitFor(func() bool {
+		for i, nd := range tc.nodes {
+			if nd == nil {
+				return false
+			}
+			workers := nd.Pool().GetStatus()["recovery-owner"]
+			if i == leader && workers != 0 {
+				return false
+			}
+			if i != leader && workers == 0 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "recovery workers only on followers")
 
 	const taskCount = 120
 	tasks := make([]raftpkg.CreateTaskData, taskCount)
@@ -692,10 +802,6 @@ func TestFreshRecoveryDoesNotCauseCrossNodeClaimStorm(t *testing.T) {
 			TenantID: "recovery-owner",
 			Payload:  `"raft-only-pending"`,
 		}
-	}
-	leader := tc.leaderIdx()
-	if leader < 0 {
-		t.Fatal("no leader while creating recovery backlog")
 	}
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: tasks})
 	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(cmd, 10*time.Second).Error(); err != nil {
@@ -749,6 +855,10 @@ func TestFailover(t *testing.T) {
 	// Wait for a new leader.
 	newLeader := tc.waitAnyLeader(30 * time.Second)
 	t.Logf("new leader: node-%d", newLeader)
+	tc.waitFor(func() bool {
+		_, allocated := tc.nodes[newLeader].RaftCluster().FSM().GetAllocation(fmt.Sprintf("node-%d", newLeader))
+		return !allocated && tc.nodes[newLeader].Pool().GetStatus()["alice"] == 0
+	}, 10*time.Second, "new leader leaves the execution plane")
 
 	// Verify the surviving cluster can commit NEW log entries.
 	cmd2 := raftpkg.MustMarshalCommand(raftpkg.OpUpsertTenant,
@@ -934,7 +1044,7 @@ func taskClaimRecoveryTimeout() time.Duration {
 // TestDynamicTenant verifies that adding and modifying tenants at runtime
 // causes the allocation to adapt.
 func TestDynamicTenant(t *testing.T) {
-	tc := newTestCluster(t, 2, 50) // 2 nodes, 100 total workers
+	tc := newTestCluster(t, 2, 50) // one 50-worker follower executes
 	defer tc.shutdown()
 
 	// Start with one tenant.
@@ -963,7 +1073,7 @@ func TestDynamicTenant(t *testing.T) {
 		aliceTotal2 += na.Tenants["alice"]
 		bobTotal += na.Tenants["bob"]
 	}
-	t.Logf("after bob added: alice=%d bob=%d (100 total)", aliceTotal2, bobTotal)
+	t.Logf("after bob added: alice=%d bob=%d (50 execution workers)", aliceTotal2, bobTotal)
 
 	if bobTotal < 1 {
 		t.Error("bob should get at least 1 worker")
@@ -978,7 +1088,7 @@ func TestDynamicTenant(t *testing.T) {
 // every aged backlog can probe above its configured limit, multiple tenants
 // share spare capacity, and total effective workers never exceed the cluster.
 func TestAdaptiveIdleBorrowing(t *testing.T) {
-	tc := newTestCluster(t, 2, 5) // 10 total workers
+	tc := newTestCluster(t, 2, 5) // one 5-worker follower executes
 	defer tc.shutdown()
 
 	tc.addTenant("borrower", 1)
@@ -989,7 +1099,7 @@ func TestAdaptiveIdleBorrowing(t *testing.T) {
 		for _, allocation := range allocations {
 			tenantEntries += len(allocation.Tenants)
 		}
-		return len(allocations) == 2 && tenantEntries >= 2
+		return len(allocations) == 1 && tenantEntries >= 2
 	}, 10*time.Second, "adaptive allocation mirror")
 
 	createBacklog := func(tenantID, prefix string, count int) {
@@ -1034,15 +1144,15 @@ func TestAdaptiveIdleBorrowing(t *testing.T) {
 				effectiveTotal += workers
 			}
 		}
-		return borrowed["borrower"] > 0 && borrowed["other"] > 0 && effectiveTotal <= 10
+		return borrowed["borrower"] > 0 && borrowed["other"] > 0 && effectiveTotal <= 5
 	}, 12*time.Second, "spare workers shared by two backlogged tenants")
 }
 
 // TestOversubscription verifies the max-min fairness allocation when the sum
 // of all tenant limits exceeds the total cluster capacity.
 func TestOversubscription(t *testing.T) {
-	// 2 nodes × 50 workers = 100 total
-	// Tenant limits: alice=100, bob=50, carol=30 → sum=180 > 100
+	// One follower × 50 workers = 50 execution workers; the leader only
+	// schedules. Tenant limits sum to 180, so the plan is oversubscribed.
 	tc := newTestCluster(t, 2, 50)
 	defer tc.shutdown()
 
@@ -1085,8 +1195,8 @@ func TestOversubscription(t *testing.T) {
 
 	// Total should not exceed cluster capacity.
 	grandTotal := totals["alice"] + totals["bob"] + totals["carol"]
-	if grandTotal > 100 {
-		t.Errorf("grand total %d exceeds cluster capacity 100", grandTotal)
+	if grandTotal > 50 {
+		t.Errorf("grand total %d exceeds execution capacity 50", grandTotal)
 	}
 
 	// Under oversubscription, no single tenant should get its full limit

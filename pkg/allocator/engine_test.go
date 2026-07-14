@@ -372,6 +372,30 @@ func TestActiveNodes_SortedByID(t *testing.T) {
 	}
 }
 
+func TestExecutionNodes_ExcludesLeaderAndPreservesStableOrder(t *testing.T) {
+	e := newTestEngine(nil)
+	e.nodeID = "node-2"
+	execution := e.executionNodes(map[string]*types.NodeInfo{
+		"node-10": {ID: "node-10", Status: types.NodeStatusUp},
+		"node-2":  {ID: "node-2", Status: types.NodeStatusUp},
+		"node-1":  {ID: "node-1", Status: types.NodeStatusUp},
+		"node-3":  {ID: "node-3", Status: types.NodeStatusDown},
+	})
+	got := make([]string, len(execution))
+	for i, node := range execution {
+		got[i] = node.ID
+	}
+	want := []string{"node-1", "node-10"}
+	if len(got) != len(want) {
+		t.Fatalf("execution nodes = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execution nodes = %v, want %v", got, want)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Integration: full reconcile pipeline
 // ---------------------------------------------------------------------------
@@ -442,6 +466,54 @@ func TestReconcile_ProducesValidPlan(t *testing.T) {
 	}
 
 	t.Logf("reconcile produced valid plan with %d nodes", len(allocMap))
+}
+
+func TestReconcile_LeaderHasNoAllocation(t *testing.T) {
+	fsm := newTestFSM()
+	raft := &fakeRaftApplier{fsm: fsm}
+	e := &Engine{
+		nodeID: "n1", fsm: fsm, raft: raft, logger: zap.NewNop(),
+		idleCycles: make(map[string]int), borrowedTargets: make(map[string]int),
+		minWorkersPerTenant: 1,
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	allocations := fsm.GetAllAllocations()
+	if _, ok := allocations["n1"]; ok {
+		t.Fatal("leader n1 received a worker allocation")
+	}
+	if allocation, ok := allocations["n2"]; !ok || len(allocation.Tenants) == 0 {
+		t.Fatalf("follower n2 allocation = %+v, want non-empty", allocation)
+	}
+	total := 0
+	for _, workers := range allocations["n2"].Tenants {
+		total += workers
+	}
+	if total > 50 {
+		t.Fatalf("allocated workers = %d, exceeds follower capacity 50", total)
+	}
+}
+
+func TestReconcile_OnlyLeaderClearsStaleAllocation(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyOp(fsm, raftpkg.OpNodeUp, types.NodeInfo{ID: "leader", Status: types.NodeStatusUp, TotalWorkers: 50})
+	applyOp(fsm, raftpkg.OpUpsertTenant, types.TenantConfig{ID: "a", MaxWorkers: 10})
+	applyOp(fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"leader": {NodeID: "leader", Tenants: map[string]int{"a": 10}},
+	})
+	raft := &fakeRaftApplier{fsm: fsm}
+	e := &Engine{
+		nodeID: "leader", fsm: fsm, raft: raft, logger: zap.NewNop(),
+		idleCycles: make(map[string]int), borrowedTargets: make(map[string]int),
+		minWorkersPerTenant: 1,
+	}
+	if err := e.Reconcile(); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if allocations := fsm.GetAllAllocations(); len(allocations) != 0 {
+		t.Fatalf("single-node control plane retained stale allocation: %+v", allocations)
+	}
 }
 
 func TestReconcile_IdleTenantTriggersRedistribution(t *testing.T) {

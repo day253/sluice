@@ -19,23 +19,27 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SluiceInternal_ClaimStream_FullMethodName    = "/sluice.internal.v1.SluiceInternal/ClaimStream"
-	SluiceInternal_ResultStream_FullMethodName   = "/sluice.internal.v1.SluiceInternal/ResultStream"
-	SluiceInternal_AllocationPush_FullMethodName = "/sluice.internal.v1.SluiceInternal/AllocationPush"
+	SluiceInternal_ClaimStream_FullMethodName      = "/sluice.internal.v1.SluiceInternal/ClaimStream"
+	SluiceInternal_AssignmentStream_FullMethodName = "/sluice.internal.v1.SluiceInternal/AssignmentStream"
+	SluiceInternal_ResultStream_FullMethodName     = "/sluice.internal.v1.SluiceInternal/ResultStream"
+	SluiceInternal_AllocationPush_FullMethodName   = "/sluice.internal.v1.SluiceInternal/AllocationPush"
 )
 
 // SluiceInternalClient is the client API for SluiceInternal service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type SluiceInternalClient interface {
-	// ClaimStream is the hot path for task processing.  Workers on ANY node
-	// open a bidirectional stream to the leader and send individual claim
-	// requests.  The leader accumulates for a configurable batch window
-	// (default 5 ms), then commits the entire batch as a single Raft log
-	// entry.  Claimed tasks are streamed back to the caller.
+	// ClaimStream is the legacy rolling-upgrade path. Older workers send
+	// concrete claim requests; the leader accumulates them for a configurable
+	// batch window (default 5 ms), then commits one Raft log entry.
 	//
 	// This reduces Raft Apply calls from O(tasks) to O(batches).
 	ClaimStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ClaimRequest, ClaimBatch], error)
+	// AssignmentStream is the leader-owned scheduling path. Each idle worker
+	// reports one free execution slot and its preferred tenant. The leader
+	// batches requests, selects distinct pending tasks, commits one ClaimBatch
+	// Raft entry, and only then returns executable task payloads.
+	AssignmentStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[AssignmentRequest, AssignmentBatch], error)
 	// ResultStream batches task completions.  Workers stream completion
 	// events to the leader, which commits them as a single Raft entry per
 	// batch window.
@@ -66,9 +70,22 @@ func (c *sluiceInternalClient) ClaimStream(ctx context.Context, opts ...grpc.Cal
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type SluiceInternal_ClaimStreamClient = grpc.BidiStreamingClient[ClaimRequest, ClaimBatch]
 
+func (c *sluiceInternalClient) AssignmentStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[AssignmentRequest, AssignmentBatch], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &SluiceInternal_ServiceDesc.Streams[1], SluiceInternal_AssignmentStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[AssignmentRequest, AssignmentBatch]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SluiceInternal_AssignmentStreamClient = grpc.BidiStreamingClient[AssignmentRequest, AssignmentBatch]
+
 func (c *sluiceInternalClient) ResultStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ResultRequest, ResultBatch], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SluiceInternal_ServiceDesc.Streams[1], SluiceInternal_ResultStream_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SluiceInternal_ServiceDesc.Streams[2], SluiceInternal_ResultStream_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +98,7 @@ type SluiceInternal_ResultStreamClient = grpc.BidiStreamingClient[ResultRequest,
 
 func (c *sluiceInternalClient) AllocationPush(ctx context.Context, in *AllocationSubscribe, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AllocationPlan], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &SluiceInternal_ServiceDesc.Streams[2], SluiceInternal_AllocationPush_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &SluiceInternal_ServiceDesc.Streams[3], SluiceInternal_AllocationPush_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -102,14 +119,17 @@ type SluiceInternal_AllocationPushClient = grpc.ServerStreamingClient[Allocation
 // All implementations must embed UnimplementedSluiceInternalServer
 // for forward compatibility.
 type SluiceInternalServer interface {
-	// ClaimStream is the hot path for task processing.  Workers on ANY node
-	// open a bidirectional stream to the leader and send individual claim
-	// requests.  The leader accumulates for a configurable batch window
-	// (default 5 ms), then commits the entire batch as a single Raft log
-	// entry.  Claimed tasks are streamed back to the caller.
+	// ClaimStream is the legacy rolling-upgrade path. Older workers send
+	// concrete claim requests; the leader accumulates them for a configurable
+	// batch window (default 5 ms), then commits one Raft log entry.
 	//
 	// This reduces Raft Apply calls from O(tasks) to O(batches).
 	ClaimStream(grpc.BidiStreamingServer[ClaimRequest, ClaimBatch]) error
+	// AssignmentStream is the leader-owned scheduling path. Each idle worker
+	// reports one free execution slot and its preferred tenant. The leader
+	// batches requests, selects distinct pending tasks, commits one ClaimBatch
+	// Raft entry, and only then returns executable task payloads.
+	AssignmentStream(grpc.BidiStreamingServer[AssignmentRequest, AssignmentBatch]) error
 	// ResultStream batches task completions.  Workers stream completion
 	// events to the leader, which commits them as a single Raft entry per
 	// batch window.
@@ -129,6 +149,9 @@ type UnimplementedSluiceInternalServer struct{}
 
 func (UnimplementedSluiceInternalServer) ClaimStream(grpc.BidiStreamingServer[ClaimRequest, ClaimBatch]) error {
 	return status.Error(codes.Unimplemented, "method ClaimStream not implemented")
+}
+func (UnimplementedSluiceInternalServer) AssignmentStream(grpc.BidiStreamingServer[AssignmentRequest, AssignmentBatch]) error {
+	return status.Error(codes.Unimplemented, "method AssignmentStream not implemented")
 }
 func (UnimplementedSluiceInternalServer) ResultStream(grpc.BidiStreamingServer[ResultRequest, ResultBatch]) error {
 	return status.Error(codes.Unimplemented, "method ResultStream not implemented")
@@ -164,6 +187,13 @@ func _SluiceInternal_ClaimStream_Handler(srv interface{}, stream grpc.ServerStre
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type SluiceInternal_ClaimStreamServer = grpc.BidiStreamingServer[ClaimRequest, ClaimBatch]
 
+func _SluiceInternal_AssignmentStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(SluiceInternalServer).AssignmentStream(&grpc.GenericServerStream[AssignmentRequest, AssignmentBatch]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type SluiceInternal_AssignmentStreamServer = grpc.BidiStreamingServer[AssignmentRequest, AssignmentBatch]
+
 func _SluiceInternal_ResultStream_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(SluiceInternalServer).ResultStream(&grpc.GenericServerStream[ResultRequest, ResultBatch]{ServerStream: stream})
 }
@@ -193,6 +223,12 @@ var SluiceInternal_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ClaimStream",
 			Handler:       _SluiceInternal_ClaimStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "AssignmentStream",
+			Handler:       _SluiceInternal_AssignmentStream_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
 		},

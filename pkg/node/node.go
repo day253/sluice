@@ -118,11 +118,12 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 	bridge := &raftApplierBridge{cluster: cluster}
 
-	// ---- Worker pool (only leader processes) ----
+	// ---- Worker pool (followers execute; leader is control-plane only) ----
 	n.pool = worker.NewPool(cfg.NodeID, q, cluster.FSM(), bridge, processor, logger)
 	n.claimClient = grpcpkg.NewClaimClient(cfg.NodeID, logger)
 	n.pool.SetClaimer(n.claimClient)
 	n.pool.SetCompleter(n.claimClient)
+	n.pool.SetWorkerGuard(func() bool { return !cluster.IsLeader() })
 
 	// ---- Allocator engine ----
 	n.allocEngine = allocator.NewEngine(cfg.NodeID, cluster.FSM(), bridge, logger)
@@ -133,6 +134,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	// ---- gRPC services (shared by HTTP adapter + gRPC server) ----
 	grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(), bridge, n.pool, logger)
 	internalSvc := grpcpkg.NewInternalService(cfg.NodeID, cluster.FSM(), bridge, logger)
+	internalSvc.SetQueue(q)
 
 	// ---- Metrics collector (server-side history) ----
 	n.collector = metrics.NewCollector(cluster.FSM(), logger)
@@ -311,6 +313,7 @@ func (n *Node) watchLeadership() {
 	defer ticker.Stop()
 
 	if n.raftCluster.IsLeader() {
+		n.pool.Reconcile(map[string]int{})
 		n.allocEngine.SetLeader(true)
 		_ = n.allocEngine.ReconcileNow()
 	}
@@ -330,6 +333,8 @@ func (n *Node) watchLeadership() {
 			}
 			n.allocEngine.SetLeader(isLeader)
 			if isLeader {
+				// Stop the data plane before publishing the follower-only plan.
+				n.pool.Reconcile(map[string]int{})
 				_ = n.allocEngine.ReconcileNow()
 			}
 			updateClaim()
@@ -346,15 +351,16 @@ func (n *Node) watchAllocations() {
 		case <-n.ctx.Done():
 			return
 		case <-ticker.C:
-			alloc, ok := n.raftCluster.FSM().GetAllocation(n.cfg.NodeID)
-			if !ok {
-				continue
-			}
 			state := n.raftCluster.FSM().GetState()
 			if state.Version == lastVersion {
 				continue
 			}
 			lastVersion = state.Version
+			alloc, ok := n.raftCluster.FSM().GetAllocation(n.cfg.NodeID)
+			if !ok || n.raftCluster.IsLeader() {
+				n.pool.Reconcile(map[string]int{})
+				continue
+			}
 			n.pool.Reconcile(alloc.Tenants)
 		}
 	}

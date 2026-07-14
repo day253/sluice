@@ -165,15 +165,16 @@ func (e *Engine) Reconcile() error {
 	}
 	state := e.fsm.GetState()
 
-	// 1. Determine active nodes and total cluster capacity.
-	activeNodes := e.activeNodes(state.Nodes)
-	if len(activeNodes) == 0 {
-		e.logger.Warn("allocator: no active nodes, skipping")
-		return nil
+	// 1. Determine execution nodes and total cluster capacity. The Raft leader
+	// is a control-plane scheduler only: it never receives worker allocation.
+	executionNodes := e.executionNodes(state.Nodes)
+	if len(executionNodes) == 0 {
+		e.logger.Warn("allocator: no follower execution nodes; clearing allocation")
+		return e.commitAllocations(map[string]*types.NodeAllocation{})
 	}
 
 	totalClusterWorkers := 0
-	for _, n := range activeNodes {
+	for _, n := range executionNodes {
 		totalClusterWorkers += n.TotalWorkers
 	}
 
@@ -183,7 +184,8 @@ func (e *Engine) Reconcile() error {
 		e.logger.Debug("allocator: no tenants configured")
 		// Reset idle tracking when there are no tenants.
 		e.idleCycles = make(map[string]int)
-		return nil
+		e.borrowedTargets = make(map[string]int)
+		return e.commitAllocations(map[string]*types.NodeAllocation{})
 	}
 
 	// 3. Build load snapshot: inflight tasks per tenant (FSM-level).
@@ -213,7 +215,7 @@ func (e *Engine) Reconcile() error {
 	)
 
 	// 8. Distribute each tenant's effective and borrowed workers across nodes.
-	nodeAllocs := e.distributeAcrossNodesWithBorrowed(finalAlloc, borrowed, activeNodes)
+	nodeAllocs := e.distributeAcrossNodesWithBorrowed(finalAlloc, borrowed, executionNodes)
 
 	// 9. Write to Raft.
 	allocMap := make(map[string]*types.NodeAllocation, len(nodeAllocs))
@@ -221,14 +223,7 @@ func (e *Engine) Reconcile() error {
 		allocMap[na.NodeID] = na
 	}
 
-	data, err := json.Marshal(allocMap)
-	if err != nil {
-		return err
-	}
-
-	cmd := raftpkg.MustMarshalCommand(raftpkg.OpUpdateAllocation, json.RawMessage(data))
-	result := e.raft.Apply(cmd, 5000)
-	if err := result.Error(); err != nil {
+	if err := e.commitAllocations(allocMap); err != nil {
 		return err
 	}
 
@@ -245,7 +240,7 @@ func (e *Engine) Reconcile() error {
 	}
 
 	e.logger.Info("allocator: plan committed",
-		zap.Int("nodes", len(activeNodes)),
+		zap.Int("execution_nodes", len(executionNodes)),
 		zap.Int("tenants", len(tenantList)),
 		zap.Int("idle_tenants", idleCount),
 		zap.Strings("idle_examples", idleNames),
@@ -253,6 +248,18 @@ func (e *Engine) Reconcile() error {
 		zap.Int("borrowed_workers", sumWorkers(borrowed)),
 	)
 	return nil
+}
+
+func (e *Engine) commitAllocations(allocations map[string]*types.NodeAllocation) error {
+	data, err := json.Marshal(allocations)
+	if err != nil {
+		return err
+	}
+	result := e.raft.Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpUpdateAllocation, json.RawMessage(data)),
+		5000,
+	)
+	return result.Error()
 }
 
 func (e *Engine) requeueStaleTasks() error {
@@ -610,6 +617,20 @@ func (e *Engine) activeNodes(nodes map[string]*types.NodeInfo) []*types.NodeInfo
 	}
 	sort.Slice(active, func(i, j int) bool { return nodeIDLess(active[i].ID, active[j].ID) })
 	return active
+}
+
+// executionNodes returns active followers in stable order. The current Raft
+// leader owns scheduling and Raft commits, so its worker capacity is
+// deliberately excluded from the data plane.
+func (e *Engine) executionNodes(nodes map[string]*types.NodeInfo) []*types.NodeInfo {
+	active := e.activeNodes(nodes)
+	execution := make([]*types.NodeInfo, 0, len(active))
+	for _, node := range active {
+		if node.ID != e.nodeID {
+			execution = append(execution, node)
+		}
+	}
+	return execution
 }
 
 // nodeIDLess keeps allocation placement stable while treating the usual

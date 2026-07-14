@@ -46,6 +46,13 @@ type StealableClaimer interface {
 
 const workStealThreshold = 5 * time.Second
 
+// TaskAssigner is the production scheduling boundary. Workers report an idle
+// slot; the leader chooses and durably claims the concrete task. supported is
+// false only during a rolling upgrade against a legacy leader.
+type TaskAssigner interface {
+	Assign(preferredTenantID string) (task *types.TaskRecord, supported bool, err error)
+}
+
 // Completer publishes task results through the current Raft leader.
 type Completer interface {
 	Complete(taskID, tenantID, result, errStr string, failed bool) error
@@ -119,8 +126,8 @@ func (p *Pool) SetClaimer(c Claimer) { p.claimer = c }
 // SetCompleter configures leader-forwarded result commits.
 func (p *Pool) SetCompleter(c Completer) { p.completer = c }
 
-// SetWorkerGuard gates worker processing.  Followers pass `IsLeader` so
-// only the leader processes tasks.
+// SetWorkerGuard gates worker processing. Nodes use it to ensure the Raft
+// leader remains control-plane only and never requests or executes work.
 func (p *Pool) SetWorkerGuard(fn func() bool) { p.workerGuard = fn }
 
 // ---------------------------------------------------------------------------
@@ -251,30 +258,64 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 			return
 		default:
 		}
+		if p.workerGuard != nil && !p.workerGuard() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
 
-		// 1. Try local queue first.
-		task := p.dequeueLocal(tenantID)
+		var task *types.TaskRecord
 		steal := false
+		reserved := false
+		leaderAssigned := false
+		legacyScheduling := true
 
-		// 2. Prefer another tenant's queue on this same node before looking
-		// across the cluster. This is the cheapest steal and preserves locality.
-		if task == nil {
-			task = p.dequeueLocalOtherTenant(tenantID)
-			steal = task != nil
+		// Production path: the worker reports one idle slot, and only the Raft
+		// leader chooses and claims the concrete task.
+		if assigner, ok := p.claimer.(TaskAssigner); ok {
+			assigned, supported, err := assigner.Assign(tenantID)
+			if supported {
+				legacyScheduling = false
+				if err != nil {
+					logger.Debug("leader assignment unavailable", zap.Error(err))
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(100 * time.Millisecond):
+					}
+					continue
+				}
+				task = assigned
+				leaderAssigned = task != nil
+			}
 		}
 
-		// 3. Only the leader performs the normal global recovery scan. All
-		// submissions are durably queued on the leader, and restricting this
-		// path prevents every node from racing on the same pending task.
-		if task == nil {
-			task = p.findRecoveryTask(tenantID)
-		}
+		if legacyScheduling {
+			// Compatibility path used only while rolling against an older leader.
+			// 1. Try local queue first.
+			task = p.dequeueLocal(tenantID)
 
-		// 4. An idle worker may steal an aged task from another tenant. This
-		// reuses existing capacity; it does not change the replicated allocation.
-		if task == nil {
-			task = p.findStealTask(tenantID)
-			steal = task != nil
+			// 2. Prefer another tenant's queue on this same node.
+			if task == nil {
+				task = p.dequeueLocalOtherTenant(tenantID)
+				steal = task != nil
+			}
+
+			// 3. Only the leader performs the normal global recovery scan.
+			if task == nil {
+				task = p.findRecoveryTask(tenantID)
+				reserved = task != nil
+			}
+
+			// 4. Legacy cross-node work steal.
+			if task == nil {
+				task = p.findStealTask(tenantID)
+				steal = task != nil
+				reserved = task != nil
+			}
 		}
 
 		if task == nil {
@@ -286,20 +327,34 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 			}
 			continue
 		}
-		if !p.reserveTask(task.TaskID) {
+		// Leadership/allocation may have changed while Assign was blocked. Never
+		// begin business execution after this worker has been cancelled or gated.
+		if ctx.Err() != nil || (p.workerGuard != nil && !p.workerGuard()) {
+			return
+		}
+		if !reserved && !p.reserveTask(task.TaskID) {
 			continue
 		}
-
-		// 4. Claim the task via Raft.
-		if err := p.claimTask(task, steal); err != nil {
-			p.releaseTask(task.TaskID)
-			logger.Warn("failed to claim task", zap.String("task_id", task.TaskID), zap.Error(err))
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(50 * time.Millisecond):
+		if leaderAssigned {
+			// The leader has already committed pending→inflight. Remove a stale
+			// local queue hint if this task originated on this node.
+			if task.QueueNodeID == p.nodeID {
+				if err := p.queue.Remove(task.TenantID, task.TaskID); err != nil {
+					logger.Warn("remove assigned local queue hint failed", zap.Error(err))
+				}
 			}
-			continue
+		} else {
+			// Legacy clients still claim a worker-selected task during rollout.
+			if err := p.claimTask(task, steal); err != nil {
+				p.releaseTask(task.TaskID)
+				logger.Warn("failed to claim task", zap.String("task_id", task.TaskID), zap.Error(err))
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+				continue
+			}
 		}
 
 		// 5. Process the task (context-aware).
@@ -378,19 +433,22 @@ func (p *Pool) findRecoveryTask(tenantID string) *types.TaskRecord {
 		return nil
 	}
 	tasks := p.fsm.FindPendingTasks(tenantID)
-	if len(tasks) == 0 {
-		return nil
+	for _, task := range tasks {
+		if p.reserveTask(task.TaskID) {
+			return task
+		}
 	}
-	// Try the first one (oldest).
-	return tasks[0]
+	return nil
 }
 
 func (p *Pool) findStealTask(tenantID string) *types.TaskRecord {
 	tasks := p.fsm.FindStealablePendingTasks(tenantID, time.Now().UTC().Add(-workStealThreshold))
-	if len(tasks) == 0 {
-		return nil
+	for _, task := range tasks {
+		if p.reserveTask(task.TaskID) {
+			return task
+		}
 	}
-	return tasks[0]
+	return nil
 }
 
 // claimTask claims a task.  Uses streaming claim client if available

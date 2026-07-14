@@ -647,9 +647,33 @@ func (f *FSM) FindPendingTasks(tenantID string) []*types.TaskRecord {
 	return out
 }
 
-// FindStealablePendingTasks returns aged pending tasks belonging to tenants
-// other than excludeTenantID. Results are FIFO by the original enqueue time,
-// making stealing deterministic and independent of client estimates.
+// FindAllPendingTasks returns the global pending queue in FIFO order. Only
+// the Raft leader's assignment service uses this method to choose concrete
+// tasks for idle execution slots; workers never schedule from this snapshot.
+func (f *FSM) FindAllPendingTasks() []*types.TaskRecord {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make([]*types.TaskRecord, 0)
+	for _, task := range f.state.Tasks {
+		if task.Status != types.TaskStatusPending {
+			continue
+		}
+		copyTask := *task
+		out = append(out, &copyTask)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].TaskID < out[j].TaskID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+// FindStealablePendingTasks supports the legacy rolling-upgrade claim path.
+// It returns aged pending tasks belonging to tenants other than
+// excludeTenantID, ordered by original enqueue time. New workers receive
+// concrete assignments from the leader and do not call this method.
 func (f *FSM) FindStealablePendingTasks(excludeTenantID string, before time.Time) []*types.TaskRecord {
 	f.mu.RLock()
 	defer f.mu.RUnlock()

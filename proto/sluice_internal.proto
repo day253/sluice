@@ -7,19 +7,23 @@ option go_package = "github.com/day253/sluice/pkg/grpc/v1;grpcv1";
 // ---------------------------------------------------------------------------
 // SluiceInternal — node-to-node streaming for high throughput
 //
-// Only the leader exposes this service.  Worker nodes connect to the
-// leader to batch-claim tasks and receive allocation push updates.
+// Worker nodes connect to the leader. AssignmentStream is the primary
+// scheduling path; ClaimStream remains for rolling-upgrade compatibility.
 // ---------------------------------------------------------------------------
 
 service SluiceInternal {
-  // ClaimStream is the hot path for task processing.  Workers on ANY node
-  // open a bidirectional stream to the leader and send individual claim
-  // requests.  The leader accumulates for a configurable batch window
-  // (default 5 ms), then commits the entire batch as a single Raft log
-  // entry.  Claimed tasks are streamed back to the caller.
+  // ClaimStream is the legacy rolling-upgrade path. Older workers send
+  // concrete claim requests; the leader accumulates them for a configurable
+  // batch window (default 5 ms), then commits one Raft log entry.
   //
   // This reduces Raft Apply calls from O(tasks) to O(batches).
   rpc ClaimStream(stream ClaimRequest) returns (stream ClaimBatch);
+
+  // AssignmentStream is the leader-owned scheduling path. Each idle worker
+  // reports one free execution slot and its preferred tenant. The leader
+  // batches requests, selects distinct pending tasks, commits one ClaimBatch
+  // Raft entry, and only then returns executable task payloads.
+  rpc AssignmentStream(stream AssignmentRequest) returns (stream AssignmentBatch);
 
   // ResultStream batches task completions.  Workers stream completion
   // events to the leader, which commits them as a single Raft entry per
@@ -46,6 +50,29 @@ message ClaimRequest {
 message ClaimBatch {
   repeated string task_ids    = 1;  // successfully claimed
   repeated string failed_ids  = 2;  // already claimed by another node
+}
+
+// ---------------------------------------------------------------------------
+// AssignmentStream
+// ---------------------------------------------------------------------------
+
+message AssignmentRequest {
+  string request_id          = 1;
+  string node_id             = 2;
+  string preferred_tenant_id = 3;
+}
+
+message AssignedTask {
+  string request_id   = 1;
+  string task_id      = 2;
+  string tenant_id    = 3;
+  bytes  payload      = 4;
+  string queue_node_id = 5;
+}
+
+message AssignmentBatch {
+  repeated AssignedTask tasks          = 1;
+  repeated string empty_request_ids    = 2;
 }
 
 // ---------------------------------------------------------------------------

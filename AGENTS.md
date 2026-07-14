@@ -13,6 +13,11 @@ These rules apply to the entire repository.
   explicit non-goals. Do not silently expand the protocol's responsibilities.
 - Current-state mirrors and historical series are different data classes.
   Document which one is stored before adding a field or metric.
+- Preserve the control/data-plane boundary: within one Raft shard, only the
+  leader selects concrete task-to-node assignments and commits them; the
+  leader runs no business workers, and followers never self-claim from a
+  replicated global pending snapshot. Scale assignment with additional Raft
+  shards, not decentralized claim races.
 
 ## Mandatory regression coverage
 
@@ -28,6 +33,10 @@ These rules apply to the entire repository.
   bugs behind unbounded waits or long unconditional sleeps.
 - Run `make test` with the race detector before merging a correctness or
   scheduling change.
+- A scheduling or protocol design change is itself a regression risk even
+  without a newly observed defect. Add focused unit coverage, a real
+  multi-node integration case, and the requirement/non-goal boundary in the
+  design and case matrix in the same change.
 
 ## Design and case history
 

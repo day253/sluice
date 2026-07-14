@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -67,6 +68,49 @@ type stealTrackingClient struct {
 	*fsmTaskClient
 	mu     sync.Mutex
 	stolen bool
+}
+
+type leaderAssignmentClient struct {
+	fsm *raftpkg.FSM
+
+	mu         sync.Mutex
+	task       *types.TaskRecord
+	claimCalls int
+}
+
+func (c *leaderAssignmentClient) Assign(string) (*types.TaskRecord, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	task := c.task
+	c.task = nil
+	return task, true, nil
+}
+
+func (c *leaderAssignmentClient) Claim(string, string, string) (bool, error) {
+	c.mu.Lock()
+	c.claimCalls++
+	c.mu.Unlock()
+	return false, fmt.Errorf("worker-side claim must not be used after leader assignment")
+}
+
+func (c *leaderAssignmentClient) Complete(taskID, tenantID, result, errStr string, failed bool) error {
+	op := raftpkg.OpCompleteTask
+	if failed {
+		op = raftpkg.OpFailTask
+	}
+	response := c.fsm.Apply(&hashicorpraft.Log{Data: raftpkg.MustMarshalCommand(op, raftpkg.CompleteTaskData{
+		TaskID: taskID, TenantID: tenantID, Result: result, Error: errStr,
+	}), Type: hashicorpraft.LogCommand})
+	if err, ok := response.(error); ok {
+		return err
+	}
+	return nil
+}
+
+func (c *leaderAssignmentClient) claims() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.claimCalls
 }
 
 func (c *stealTrackingClient) ClaimSteal(taskID, tenantID, payload string) (bool, error) {
@@ -296,6 +340,70 @@ func TestPoolWorker_ClaimsAndCompletesTask(t *testing.T) {
 	pool.Shutdown(2 * time.Second)
 }
 
+func TestPoolWorker_ExecutesLeaderAssignmentWithoutWorkerClaim(t *testing.T) {
+	q := queue.NewMemoryQueue()
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "leader-assigned", TenantID: "a", Payload: `"payload"`,
+	})
+	applyOp(fsm, raftpkg.OpClaimTask, raftpkg.ClaimTaskData{
+		TaskID: "leader-assigned", TenantID: "a", NodeID: "worker-node", Payload: `"payload"`,
+	})
+	client := &leaderAssignmentClient{
+		fsm: fsm,
+		task: &types.TaskRecord{
+			TaskID: "leader-assigned", TenantID: "a", Status: types.TaskStatusInflight,
+			NodeID: "worker-node", Payload: `"payload"`,
+		},
+	}
+	proc := &mockProcessor{}
+	pool := NewPool("worker-node", q, fsm, &mockRaftApplier{}, proc, zap.NewNop())
+	pool.SetClaimer(client)
+	pool.SetCompleter(client)
+	pool.Reconcile(map[string]int{"a": 1})
+
+	for i := 0; i < 50 && fsm.GetResult("leader-assigned") == nil; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if result := fsm.GetResult("leader-assigned"); result == nil || result.Status != types.TaskStatusDone {
+		t.Fatalf("leader-assigned result = %+v, want done", result)
+	}
+	if got := client.claims(); got != 0 {
+		t.Fatalf("worker issued %d claims after durable leader assignment, want 0", got)
+	}
+	if got := proc.processedCount(); got != 1 {
+		t.Fatalf("processed count = %d, want 1", got)
+	}
+	if err := pool.Shutdown(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPoolWorker_GuardPreventsLeaderExecution(t *testing.T) {
+	q := queue.NewMemoryQueue()
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	proc := &mockProcessor{}
+	raft := &mockRaftApplier{}
+	pool := NewPool("leader", q, fsm, raft, proc, zap.NewNop())
+	pool.SetWorkerGuard(func() bool { return false })
+	if err := q.Enqueue("a", &queue.TaskEnvelope{
+		TaskID: "must-not-run", TenantID: "a", Payload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pool.Reconcile(map[string]int{"a": 1})
+	time.Sleep(250 * time.Millisecond)
+	if got := proc.processedCount(); got != 0 {
+		t.Fatalf("leader processed %d tasks while guarded, want 0", got)
+	}
+	if got := raft.appliedCount(); got != 0 {
+		t.Fatalf("unexpected direct Raft applies: %d", got)
+	}
+	if err := pool.Shutdown(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPoolWorker_RecoveryTasks(t *testing.T) {
 	q := queue.NewMemoryQueue()
 	fsm := raftpkg.NewFSM(zap.NewNop())
@@ -330,6 +438,41 @@ func TestPoolWorker_RecoveryTasks(t *testing.T) {
 	pool.Shutdown(2 * time.Second)
 }
 
+func TestPoolWorker_RecoveryWorkersReserveDistinctTasks(t *testing.T) {
+	q := queue.NewMemoryQueue()
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	for i := 0; i < 4; i++ {
+		applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+			TaskID: fmt.Sprintf("parallel-recovery-%d", i), TenantID: "a", Payload: `"payload"`,
+		})
+	}
+	client := &fsmTaskClient{fsm: fsm}
+	pool := NewPool("n1", q, fsm, &mockRaftApplier{}, &mockProcessor{}, zap.NewNop())
+	pool.SetClaimer(client)
+	pool.SetCompleter(client)
+	pool.Reconcile(map[string]int{"a": 4})
+
+	for i := 0; i < 50; i++ {
+		complete := true
+		for task := 0; task < 4; task++ {
+			if fsm.GetResult(fmt.Sprintf("parallel-recovery-%d", task)) == nil {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := client.maxClaims(); got < 2 {
+		t.Fatalf("maximum concurrent recovery claims = %d, want at least 2 distinct tasks", got)
+	}
+	if err := pool.Shutdown(2 * time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+}
+
 func TestPoolWorker_FollowerDoesNotRaceFreshGlobalPendingTask(t *testing.T) {
 	q := queue.NewMemoryQueue()
 	fsm := raftpkg.NewFSM(zap.NewNop())
@@ -359,6 +502,10 @@ func TestPoolWorker_FollowerDoesNotRaceFreshGlobalPendingTask(t *testing.T) {
 func TestPoolWorker_StealsAgedTaskFromAnotherTenant(t *testing.T) {
 	q := queue.NewMemoryQueue()
 	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyOp(fsm, raftpkg.OpNodeUp, types.NodeInfo{ID: "worker-node", TotalWorkers: 1})
+	applyOp(fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"worker-node": {NodeID: "worker-node", Tenants: map[string]int{"worker": 1}},
+	})
 	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
 		TaskID: "steal-task", TenantID: "other", Payload: `"payload"`,
 	})
