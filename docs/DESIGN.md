@@ -23,6 +23,11 @@
 7. 完成: Worker → ResultStream → Leader → raft.Apply(OpCompleteBatch)
 ```
 
+提交请求可以携带 `estimated_duration_ms`（预估处理耗时，0 表示未知）。
+Leader 在同一节点的 claim stream 内按短作业优先（SPT）排序，节点的并发
+worker 负责并行执行；ClaimBatch 和 ResultBatch 分别用一条 Raft 日志提交。
+没有预估值的旧客户端在未知任务之间继续使用 FIFO，保持向后兼容。
+
 ## 限流模型
 
 - **维度**: 并发数（同时 inflight 的任务数）

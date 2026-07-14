@@ -543,8 +543,9 @@ func TestHTTPBatchSubmitThroughFollower(t *testing.T) {
 	request := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, taskCount)}
 	for i := range request.Tasks {
 		request.Tasks[i] = types.TaskSubmitRequest{
-			TenantID: "batch-http-tenant",
-			Payload:  json.RawMessage(fmt.Sprintf(`{"index":%d}`, i)),
+			TenantID:            "batch-http-tenant",
+			Payload:             json.RawMessage(fmt.Sprintf(`{"index":%d}`, i)),
+			EstimatedDurationMs: int64((taskCount - i) * 10),
 		}
 	}
 	body, err := json.Marshal(request)

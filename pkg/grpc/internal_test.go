@@ -41,6 +41,22 @@ func applyInternalTestCommand(fsm *raftpkg.FSM, op string, data interface{}) {
 	})
 }
 
+func TestClaimBatchOrdersShortestEstimatedTasksFirst(t *testing.T) {
+	batch := []raftpkg.ClaimTaskData{
+		{TaskID: "unknown", EstimatedDurationMs: 0},
+		{TaskID: "long", EstimatedDurationMs: 500},
+		{TaskID: "short", EstimatedDurationMs: 10},
+	}
+	sortClaimBatch(batch)
+	got := []string{batch[0].TaskID, batch[1].TaskID, batch[2].TaskID}
+	want := []string{"short", "long", "unknown"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("claim order = %v, want %v", got, want)
+		}
+	}
+}
+
 func waitForWorkerClientDisconnected(t *testing.T, client *ClaimClient) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

@@ -14,11 +14,12 @@ import (
 // TaskEnvelope wraps a submitted task that sits in the local queue until a
 // worker picks it up.
 type TaskEnvelope struct {
-	TaskID         string          `json:"task_id"`
-	TenantID       string          `json:"tenant_id"`
-	Payload        json.RawMessage `json:"payload"`
-	IdempotencyKey string          `json:"idempotency_key,omitempty"`
-	CreatedAt      time.Time       `json:"created_at"`
+	TaskID              string          `json:"task_id"`
+	TenantID            string          `json:"tenant_id"`
+	Payload             json.RawMessage `json:"payload"`
+	IdempotencyKey      string          `json:"idempotency_key,omitempty"`
+	EstimatedDurationMs int64           `json:"estimated_duration_ms,omitempty"`
+	CreatedAt           time.Time       `json:"created_at"`
 }
 
 // ---------------------------------------------------------------------------

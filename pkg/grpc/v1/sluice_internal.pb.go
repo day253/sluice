@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        v3.21.12
-// source: proto/sluice_internal.proto
+// source: sluice_internal.proto
 
 package grpcv1
 
@@ -22,18 +22,19 @@ const (
 )
 
 type ClaimRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
-	TenantId      string                 `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
-	NodeId        string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	Payload       []byte                 `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	TaskId              string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	TenantId            string                 `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	NodeId              string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Payload             []byte                 `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
+	EstimatedDurationMs int64                  `protobuf:"varint,5,opt,name=estimated_duration_ms,json=estimatedDurationMs,proto3" json:"estimated_duration_ms,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *ClaimRequest) Reset() {
 	*x = ClaimRequest{}
-	mi := &file_proto_sluice_internal_proto_msgTypes[0]
+	mi := &file_sluice_internal_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -45,7 +46,7 @@ func (x *ClaimRequest) String() string {
 func (*ClaimRequest) ProtoMessage() {}
 
 func (x *ClaimRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sluice_internal_proto_msgTypes[0]
+	mi := &file_sluice_internal_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -58,7 +59,7 @@ func (x *ClaimRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClaimRequest.ProtoReflect.Descriptor instead.
 func (*ClaimRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sluice_internal_proto_rawDescGZIP(), []int{0}
+	return file_sluice_internal_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *ClaimRequest) GetTaskId() string {
@@ -89,6 +90,13 @@ func (x *ClaimRequest) GetPayload() []byte {
 	return nil
 }
 
+func (x *ClaimRequest) GetEstimatedDurationMs() int64 {
+	if x != nil {
+		return x.EstimatedDurationMs
+	}
+	return 0
+}
+
 type ClaimBatch struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TaskIds       []string               `protobuf:"bytes,1,rep,name=task_ids,json=taskIds,proto3" json:"task_ids,omitempty"`       // successfully claimed
@@ -99,7 +107,7 @@ type ClaimBatch struct {
 
 func (x *ClaimBatch) Reset() {
 	*x = ClaimBatch{}
-	mi := &file_proto_sluice_internal_proto_msgTypes[1]
+	mi := &file_sluice_internal_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -111,7 +119,7 @@ func (x *ClaimBatch) String() string {
 func (*ClaimBatch) ProtoMessage() {}
 
 func (x *ClaimBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sluice_internal_proto_msgTypes[1]
+	mi := &file_sluice_internal_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -124,7 +132,7 @@ func (x *ClaimBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClaimBatch.ProtoReflect.Descriptor instead.
 func (*ClaimBatch) Descriptor() ([]byte, []int) {
-	return file_proto_sluice_internal_proto_rawDescGZIP(), []int{1}
+	return file_sluice_internal_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *ClaimBatch) GetTaskIds() []string {
@@ -154,7 +162,7 @@ type ResultRequest struct {
 
 func (x *ResultRequest) Reset() {
 	*x = ResultRequest{}
-	mi := &file_proto_sluice_internal_proto_msgTypes[2]
+	mi := &file_sluice_internal_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -166,7 +174,7 @@ func (x *ResultRequest) String() string {
 func (*ResultRequest) ProtoMessage() {}
 
 func (x *ResultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sluice_internal_proto_msgTypes[2]
+	mi := &file_sluice_internal_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -179,7 +187,7 @@ func (x *ResultRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResultRequest.ProtoReflect.Descriptor instead.
 func (*ResultRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sluice_internal_proto_rawDescGZIP(), []int{2}
+	return file_sluice_internal_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *ResultRequest) GetTaskId() string {
@@ -226,7 +234,7 @@ type ResultBatch struct {
 
 func (x *ResultBatch) Reset() {
 	*x = ResultBatch{}
-	mi := &file_proto_sluice_internal_proto_msgTypes[3]
+	mi := &file_sluice_internal_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -238,7 +246,7 @@ func (x *ResultBatch) String() string {
 func (*ResultBatch) ProtoMessage() {}
 
 func (x *ResultBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sluice_internal_proto_msgTypes[3]
+	mi := &file_sluice_internal_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -251,7 +259,7 @@ func (x *ResultBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResultBatch.ProtoReflect.Descriptor instead.
 func (*ResultBatch) Descriptor() ([]byte, []int) {
-	return file_proto_sluice_internal_proto_rawDescGZIP(), []int{3}
+	return file_sluice_internal_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *ResultBatch) GetCommittedIds() []string {
@@ -270,7 +278,7 @@ type AllocationSubscribe struct {
 
 func (x *AllocationSubscribe) Reset() {
 	*x = AllocationSubscribe{}
-	mi := &file_proto_sluice_internal_proto_msgTypes[4]
+	mi := &file_sluice_internal_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -282,7 +290,7 @@ func (x *AllocationSubscribe) String() string {
 func (*AllocationSubscribe) ProtoMessage() {}
 
 func (x *AllocationSubscribe) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sluice_internal_proto_msgTypes[4]
+	mi := &file_sluice_internal_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -295,7 +303,7 @@ func (x *AllocationSubscribe) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AllocationSubscribe.ProtoReflect.Descriptor instead.
 func (*AllocationSubscribe) Descriptor() ([]byte, []int) {
-	return file_proto_sluice_internal_proto_rawDescGZIP(), []int{4}
+	return file_sluice_internal_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *AllocationSubscribe) GetNodeId() string {
@@ -315,7 +323,7 @@ type TenantWorkerCount struct {
 
 func (x *TenantWorkerCount) Reset() {
 	*x = TenantWorkerCount{}
-	mi := &file_proto_sluice_internal_proto_msgTypes[5]
+	mi := &file_sluice_internal_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -327,7 +335,7 @@ func (x *TenantWorkerCount) String() string {
 func (*TenantWorkerCount) ProtoMessage() {}
 
 func (x *TenantWorkerCount) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sluice_internal_proto_msgTypes[5]
+	mi := &file_sluice_internal_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -340,7 +348,7 @@ func (x *TenantWorkerCount) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TenantWorkerCount.ProtoReflect.Descriptor instead.
 func (*TenantWorkerCount) Descriptor() ([]byte, []int) {
-	return file_proto_sluice_internal_proto_rawDescGZIP(), []int{5}
+	return file_sluice_internal_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *TenantWorkerCount) GetTenantId() string {
@@ -367,7 +375,7 @@ type AllocationPlan struct {
 
 func (x *AllocationPlan) Reset() {
 	*x = AllocationPlan{}
-	mi := &file_proto_sluice_internal_proto_msgTypes[6]
+	mi := &file_sluice_internal_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -379,7 +387,7 @@ func (x *AllocationPlan) String() string {
 func (*AllocationPlan) ProtoMessage() {}
 
 func (x *AllocationPlan) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sluice_internal_proto_msgTypes[6]
+	mi := &file_sluice_internal_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -392,7 +400,7 @@ func (x *AllocationPlan) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AllocationPlan.ProtoReflect.Descriptor instead.
 func (*AllocationPlan) Descriptor() ([]byte, []int) {
-	return file_proto_sluice_internal_proto_rawDescGZIP(), []int{6}
+	return file_sluice_internal_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *AllocationPlan) GetNodeId() string {
@@ -409,16 +417,17 @@ func (x *AllocationPlan) GetTenants() []*TenantWorkerCount {
 	return nil
 }
 
-var File_proto_sluice_internal_proto protoreflect.FileDescriptor
+var File_sluice_internal_proto protoreflect.FileDescriptor
 
-const file_proto_sluice_internal_proto_rawDesc = "" +
+const file_sluice_internal_proto_rawDesc = "" +
 	"\n" +
-	"\x1bproto/sluice_internal.proto\x12\x12sluice.internal.v1\"w\n" +
+	"\x15sluice_internal.proto\x12\x12sluice.internal.v1\"\xab\x01\n" +
 	"\fClaimRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1b\n" +
 	"\ttenant_id\x18\x02 \x01(\tR\btenantId\x12\x17\n" +
 	"\anode_id\x18\x03 \x01(\tR\x06nodeId\x12\x18\n" +
-	"\apayload\x18\x04 \x01(\fR\apayload\"F\n" +
+	"\apayload\x18\x04 \x01(\fR\apayload\x122\n" +
+	"\x15estimated_duration_ms\x18\x05 \x01(\x03R\x13estimatedDurationMs\"F\n" +
 	"\n" +
 	"ClaimBatch\x12\x19\n" +
 	"\btask_ids\x18\x01 \x03(\tR\ataskIds\x12\x1d\n" +
@@ -446,19 +455,19 @@ const file_proto_sluice_internal_proto_rawDesc = "" +
 	"\x0eAllocationPush\x12'.sluice.internal.v1.AllocationSubscribe\x1a\".sluice.internal.v1.AllocationPlan0\x01B-Z+github.com/day253/sluice/pkg/grpc/v1;grpcv1b\x06proto3"
 
 var (
-	file_proto_sluice_internal_proto_rawDescOnce sync.Once
-	file_proto_sluice_internal_proto_rawDescData []byte
+	file_sluice_internal_proto_rawDescOnce sync.Once
+	file_sluice_internal_proto_rawDescData []byte
 )
 
-func file_proto_sluice_internal_proto_rawDescGZIP() []byte {
-	file_proto_sluice_internal_proto_rawDescOnce.Do(func() {
-		file_proto_sluice_internal_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_proto_sluice_internal_proto_rawDesc), len(file_proto_sluice_internal_proto_rawDesc)))
+func file_sluice_internal_proto_rawDescGZIP() []byte {
+	file_sluice_internal_proto_rawDescOnce.Do(func() {
+		file_sluice_internal_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_sluice_internal_proto_rawDesc), len(file_sluice_internal_proto_rawDesc)))
 	})
-	return file_proto_sluice_internal_proto_rawDescData
+	return file_sluice_internal_proto_rawDescData
 }
 
-var file_proto_sluice_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
-var file_proto_sluice_internal_proto_goTypes = []any{
+var file_sluice_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_sluice_internal_proto_goTypes = []any{
 	(*ClaimRequest)(nil),        // 0: sluice.internal.v1.ClaimRequest
 	(*ClaimBatch)(nil),          // 1: sluice.internal.v1.ClaimBatch
 	(*ResultRequest)(nil),       // 2: sluice.internal.v1.ResultRequest
@@ -467,7 +476,7 @@ var file_proto_sluice_internal_proto_goTypes = []any{
 	(*TenantWorkerCount)(nil),   // 5: sluice.internal.v1.TenantWorkerCount
 	(*AllocationPlan)(nil),      // 6: sluice.internal.v1.AllocationPlan
 }
-var file_proto_sluice_internal_proto_depIdxs = []int32{
+var file_sluice_internal_proto_depIdxs = []int32{
 	5, // 0: sluice.internal.v1.AllocationPlan.tenants:type_name -> sluice.internal.v1.TenantWorkerCount
 	0, // 1: sluice.internal.v1.SluiceInternal.ClaimStream:input_type -> sluice.internal.v1.ClaimRequest
 	2, // 2: sluice.internal.v1.SluiceInternal.ResultStream:input_type -> sluice.internal.v1.ResultRequest
@@ -482,26 +491,26 @@ var file_proto_sluice_internal_proto_depIdxs = []int32{
 	0, // [0:1] is the sub-list for field type_name
 }
 
-func init() { file_proto_sluice_internal_proto_init() }
-func file_proto_sluice_internal_proto_init() {
-	if File_proto_sluice_internal_proto != nil {
+func init() { file_sluice_internal_proto_init() }
+func file_sluice_internal_proto_init() {
+	if File_sluice_internal_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_sluice_internal_proto_rawDesc), len(file_proto_sluice_internal_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_sluice_internal_proto_rawDesc), len(file_sluice_internal_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_proto_sluice_internal_proto_goTypes,
-		DependencyIndexes: file_proto_sluice_internal_proto_depIdxs,
-		MessageInfos:      file_proto_sluice_internal_proto_msgTypes,
+		GoTypes:           file_sluice_internal_proto_goTypes,
+		DependencyIndexes: file_sluice_internal_proto_depIdxs,
+		MessageInfos:      file_sluice_internal_proto_msgTypes,
 	}.Build()
-	File_proto_sluice_internal_proto = out.File
-	file_proto_sluice_internal_proto_goTypes = nil
-	file_proto_sluice_internal_proto_depIdxs = nil
+	File_sluice_internal_proto = out.File
+	file_sluice_internal_proto_goTypes = nil
+	file_sluice_internal_proto_depIdxs = nil
 }

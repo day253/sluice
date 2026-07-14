@@ -99,9 +99,9 @@ func TestSubmitBatchUsesOneRaftApply(t *testing.T) {
 	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
 
 	resp, err := svc.SubmitBatch(context.Background(), &grpcv1.SubmitBatchRequest{Tasks: []*grpcv1.SubmitRequest{
-		{TenantId: "tenant-a", Payload: []byte(`{"n":1}`)},
-		{TenantId: "tenant-a", Payload: []byte(`{"n":2}`)},
-		{TenantId: "tenant-a", Payload: []byte(`{"n":3}`)},
+		{TenantId: "tenant-a", Payload: []byte(`{"n":1}`), EstimatedDurationMs: 100},
+		{TenantId: "tenant-a", Payload: []byte(`{"n":2}`), EstimatedDurationMs: 10},
+		{TenantId: "tenant-a", Payload: []byte(`{"n":3}`), EstimatedDurationMs: 50},
 	}})
 	if err != nil {
 		t.Fatalf("submit batch: %v", err)
@@ -112,9 +112,13 @@ func TestSubmitBatchUsesOneRaftApply(t *testing.T) {
 	if got := testRaft.applyCount.Load(); got != 1 {
 		t.Fatalf("Raft Apply calls = %d, want one batch entry", got)
 	}
-	for _, task := range resp.GetTasks() {
+	for i, task := range resp.GetTasks() {
 		if task.GetTaskId() == "" || fsm.GetTask(task.GetTaskId()) == nil {
 			t.Fatalf("batch task was not persisted: %+v", task)
+		}
+		wantEstimate := []int64{100, 10, 50}[i]
+		if got := fsm.GetTask(task.GetTaskId()).EstimatedDurationMs; got != wantEstimate {
+			t.Fatalf("task %s estimate = %d, want %d", task.GetTaskId(), got, wantEstimate)
 		}
 	}
 }

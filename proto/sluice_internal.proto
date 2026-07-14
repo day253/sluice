@@ -40,6 +40,7 @@ message ClaimRequest {
   string tenant_id = 2;
   string node_id   = 3;
   bytes  payload   = 4;
+  int64  estimated_duration_ms = 5;
 }
 
 message ClaimBatch {

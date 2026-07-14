@@ -138,3 +138,10 @@ task/s = 1 / (2 × RaftCommitLatency + ProcessTime)
 | 空闲租户 worker | 已实现 idle detection | 已生效 |
 | leader 单点写 | multi-raft (每租户一个 raft group) | N× 写入能力 |
 | FSM snapshot | 增量快照 | 减少 I/O 抖动 |
+
+### 5.1 任务批量调度
+
+提交方可提供 `estimated_duration_ms`。同一节点的 ClaimStream 会把任务按
+短作业优先排序，再以最多 128 条为一批提交 `OpClaimBatch`；节点上的多个
+worker 并发执行，ResultStream 以同样的批量窗口提交 `OpCompleteBatch`。
+未提供估时的任务在未知任务之间保持 FIFO，避免旧客户端行为改变。

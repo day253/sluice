@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"io"
+	"sort"
 	"sync"
 	"time"
 
@@ -108,6 +109,7 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 				req: raftpkg.ClaimTaskData{
 					TaskID: req.TaskId, TenantID: req.TenantId,
 					NodeID: req.NodeId, Payload: string(req.Payload),
+					EstimatedDurationMs: req.EstimatedDurationMs,
 				},
 			}
 		}
@@ -125,6 +127,10 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 
 		// Filter: only grant claims for nodes that are allocated.
 		alloc := s.fsm.GetAllAllocations()
+		// Claims on one node stream form one node-local execution batch. Apply
+		// shortest-predicted tasks first so small jobs clear quickly while the
+		// batch is committed atomically.
+		sortClaimBatch(batch)
 		granted := make([]raftpkg.ClaimTaskData, 0, len(batch))
 		var failedIDs []string
 
@@ -194,6 +200,21 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 			}
 		}
 	}
+}
+
+// sortClaimBatch applies shortest-predicted-task-first ordering. Unknown
+// estimates remain behind known estimates but retain deterministic ID order.
+func sortClaimBatch(batch []raftpkg.ClaimTaskData) {
+	sort.SliceStable(batch, func(i, j int) bool {
+		left, right := batch[i].EstimatedDurationMs, batch[j].EstimatedDurationMs
+		if left > 0 && right > 0 && left != right {
+			return left < right
+		}
+		if (left > 0) != (right > 0) {
+			return left > 0
+		}
+		return batch[i].TaskID < batch[j].TaskID
+	})
 }
 
 // ---------------------------------------------------------------------------

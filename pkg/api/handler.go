@@ -89,7 +89,7 @@ func (h *Handler) submitTask(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.svc.Submit(r.Context(), &grpcv1.SubmitRequest{
 		TenantId: req.TenantID, Payload: req.Payload,
-		IdempotencyKey: req.IdempotencyKey,
+		IdempotencyKey: req.IdempotencyKey, EstimatedDurationMs: req.EstimatedDurationMs,
 	})
 	if err != nil {
 		h.writeGRPCError(w, err)
@@ -110,7 +110,8 @@ func (h *Handler) submitBatch(w http.ResponseWriter, r *http.Request) {
 	req := &grpcv1.SubmitBatchRequest{Tasks: make([]*grpcv1.SubmitRequest, len(body.Tasks))}
 	for i, task := range body.Tasks {
 		req.Tasks[i] = &grpcv1.SubmitRequest{
-			TenantId: task.TenantID, Payload: task.Payload, IdempotencyKey: task.IdempotencyKey,
+			TenantId: task.TenantID, Payload: task.Payload,
+			IdempotencyKey: task.IdempotencyKey, EstimatedDurationMs: task.EstimatedDurationMs,
 		}
 	}
 	resp, err := h.svc.SubmitBatch(r.Context(), req)

@@ -37,6 +37,13 @@ type Claimer interface {
 	Claim(taskID, tenantID, payload string) (bool, error)
 }
 
+// EstimatedClaimer is an optional extension implemented by the production
+// streaming client. It lets the leader order claims by expected completion
+// time without breaking simple test/fallback claimers.
+type EstimatedClaimer interface {
+	ClaimWithEstimate(taskID, tenantID, payload string, estimatedDurationMs int64) (bool, error)
+}
+
 // Completer publishes task results through the current Raft leader.
 type Completer interface {
 	Complete(taskID, tenantID, result, errStr string, failed bool) error
@@ -319,9 +326,10 @@ func (p *Pool) dequeueLocal(tenantID string) *types.TaskRecord {
 	}
 	raw, _ := json.Marshal(env.Payload)
 	return &types.TaskRecord{
-		TaskID:   env.TaskID,
-		TenantID: env.TenantID,
-		Payload:  string(raw),
+		TaskID:              env.TaskID,
+		TenantID:            env.TenantID,
+		Payload:             string(raw),
+		EstimatedDurationMs: env.EstimatedDurationMs,
 	}
 }
 
@@ -340,7 +348,15 @@ func (p *Pool) findRecoveryTask(tenantID string) *types.TaskRecord {
 // (works from any node); falls back to direct raft.Apply (leader only).
 func (p *Pool) claimTask(task *types.TaskRecord) error {
 	if p.claimer != nil {
-		ok, err := p.claimer.Claim(task.TaskID, task.TenantID, task.Payload)
+		var (
+			ok  bool
+			err error
+		)
+		if estimated, supportsEstimate := p.claimer.(EstimatedClaimer); supportsEstimate {
+			ok, err = estimated.ClaimWithEstimate(task.TaskID, task.TenantID, task.Payload, task.EstimatedDurationMs)
+		} else {
+			ok, err = p.claimer.Claim(task.TaskID, task.TenantID, task.Payload)
+		}
 		if err != nil {
 			p.logger.Warn("claim stream failed, trying raft", zap.Error(err))
 		} else if ok {
@@ -350,10 +366,11 @@ func (p *Pool) claimTask(task *types.TaskRecord) error {
 		}
 	}
 	data := raftpkg.ClaimTaskData{
-		TaskID:   task.TaskID,
-		TenantID: task.TenantID,
-		NodeID:   p.nodeID,
-		Payload:  task.Payload,
+		TaskID:              task.TaskID,
+		TenantID:            task.TenantID,
+		NodeID:              p.nodeID,
+		Payload:             task.Payload,
+		EstimatedDurationMs: task.EstimatedDurationMs,
 	}
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpClaimTask, data)
 	return p.raft.Apply(cmd, 5000).Error()

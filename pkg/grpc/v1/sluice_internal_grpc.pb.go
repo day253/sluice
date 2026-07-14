@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             v3.21.12
-// source: proto/sluice_internal.proto
+// source: sluice_internal.proto
 
 package grpcv1
 
@@ -208,5 +208,5 @@ var SluiceInternal_ServiceDesc = grpc.ServiceDesc{
 			ServerStreams: true,
 		},
 	},
-	Metadata: "proto/sluice_internal.proto",
+	Metadata: "sluice_internal.proto",
 }

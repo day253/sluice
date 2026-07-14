@@ -284,11 +284,12 @@ func (f *FSM) insertPendingTask(req CreateTaskData) {
 		return
 	}
 	f.state.Tasks[req.TaskID] = &types.TaskRecord{
-		TaskID:    req.TaskID,
-		TenantID:  req.TenantID,
-		Status:    types.TaskStatusPending,
-		Payload:   req.Payload,
-		CreatedAt: time.Now().UTC(),
+		TaskID:              req.TaskID,
+		TenantID:            req.TenantID,
+		Status:              types.TaskStatusPending,
+		Payload:             req.Payload,
+		EstimatedDurationMs: req.EstimatedDurationMs,
+		CreatedAt:           time.Now().UTC(),
 	}
 }
 
@@ -314,19 +315,21 @@ func (f *FSM) applyClaimTask(data json.RawMessage) interface{} {
 		existing.NodeID = req.NodeID
 		existing.ClaimedAt = now
 		existing.Payload = req.Payload
+		existing.EstimatedDurationMs = req.EstimatedDurationMs
 		return nil
 	}
 
 	// Fresh claim — the payload is being promoted from the local queue into
 	// the Raft log, giving it cluster-wide durability.
 	f.state.Tasks[req.TaskID] = &types.TaskRecord{
-		TaskID:    req.TaskID,
-		TenantID:  req.TenantID,
-		Status:    types.TaskStatusInflight,
-		NodeID:    req.NodeID,
-		Payload:   req.Payload,
-		CreatedAt: now,
-		ClaimedAt: now,
+		TaskID:              req.TaskID,
+		TenantID:            req.TenantID,
+		Status:              types.TaskStatusInflight,
+		NodeID:              req.NodeID,
+		Payload:             req.Payload,
+		EstimatedDurationMs: req.EstimatedDurationMs,
+		CreatedAt:           now,
+		ClaimedAt:           now,
 	}
 	return nil
 }
@@ -629,6 +632,15 @@ func (f *FSM) FindPendingTasks(tenantID string) []*types.TaskRecord {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
+		// Shortest predicted job first improves completion time for small
+		// tasks while preserving FIFO for tasks without an estimate.
+		left, right := out[i].EstimatedDurationMs, out[j].EstimatedDurationMs
+		if left > 0 && right > 0 && left != right {
+			return left < right
+		}
+		if (left > 0) != (right > 0) {
+			return left > 0
+		}
 		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
 			return out[i].TaskID < out[j].TaskID
 		}
