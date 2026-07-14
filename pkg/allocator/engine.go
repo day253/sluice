@@ -41,6 +41,10 @@ const (
 	// tenant using otherwise spare cluster capacity. Later probes double the
 	// previous target (1, 3, 7, ...), bounded by the actual spare capacity.
 	borrowProbeStep = 1
+	// pendingBorrowThreshold avoids scaling out on a transient queue blip.
+	// The allocator runs every 3 seconds, so a second cycle is enough to
+	// identify work that is genuinely waiting for capacity.
+	pendingBorrowThreshold = 5 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -196,14 +200,16 @@ func (e *Engine) Reconcile() error {
 
 	// 7. If exactly one tenant still has pending work, let it probe spare
 	// capacity above its configured limit. The moment another tenant has
-	// pending work, borrowed workers are released so normal quotas are
+	// work, borrowed workers are released so normal quotas are
 	// restored in this same reconciliation cycle.
+	pendingCount := e.fsm.CountPendingPerTenant()
 	finalAlloc, borrowed := e.applyBorrowing(
 		tenantList,
 		finalAlloc,
 		totalClusterWorkers,
 		inflightCount,
-		e.fsm.CountPendingPerTenant(),
+		pendingCount,
+		e.fsm.OldestPendingCreatedAtByTenant(),
 		idleSet,
 	)
 
@@ -377,6 +383,7 @@ func (e *Engine) applyBorrowing(
 	totalWorkers int,
 	unfinished map[string]int,
 	pending map[string]int,
+	oldestPending map[string]time.Time,
 	idleSet map[string]bool,
 ) (map[string]int, map[string]int) {
 	effective := make(map[string]int, len(allocation))
@@ -418,6 +425,11 @@ func (e *Engine) applyBorrowing(
 		delete(e.borrowedTargets, tenantID)
 		return effective, borrowed
 	}
+	oldest := oldestPending[tenantID]
+	if oldest.IsZero() || time.Since(oldest) < pendingBorrowThreshold {
+		delete(e.borrowedTargets, tenantID)
+		return effective, borrowed
+	}
 	spare := totalWorkers - sumWorkers(effective)
 	if spare <= 0 {
 		delete(e.borrowedTargets, tenantID)
@@ -431,6 +443,9 @@ func (e *Engine) applyBorrowing(
 	}
 	if target > spare {
 		target = spare
+	}
+	if target > pending[tenantID] {
+		target = pending[tenantID]
 	}
 	if target <= 0 {
 		delete(e.borrowedTargets, tenantID)

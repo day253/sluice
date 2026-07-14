@@ -1,8 +1,10 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -55,6 +57,25 @@ type fsmTaskClient struct {
 	mu            sync.Mutex
 	activeClaims  int
 	maxConcurrent int
+}
+
+type stealTrackingClient struct {
+	*fsmTaskClient
+	mu     sync.Mutex
+	stolen bool
+}
+
+func (c *stealTrackingClient) ClaimSteal(taskID, tenantID, payload string) (bool, error) {
+	c.mu.Lock()
+	c.stolen = true
+	c.mu.Unlock()
+	return c.Claim(taskID, tenantID, payload)
+}
+
+func (c *stealTrackingClient) didSteal() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stolen
 }
 
 func (c *fsmTaskClient) Claim(taskID, tenantID, payload string) (bool, error) {
@@ -303,6 +324,43 @@ func TestPoolWorker_RecoveryTasks(t *testing.T) {
 	}
 
 	pool.Shutdown(2 * time.Second)
+}
+
+func TestPoolWorker_StealsAgedTaskFromAnotherTenant(t *testing.T) {
+	q := queue.NewMemoryQueue()
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "steal-task", TenantID: "other", Payload: `"payload"`,
+	})
+	state := fsm.GetState()
+	state.Tasks["steal-task"].CreatedAt = time.Now().UTC().Add(-time.Minute)
+	persisted, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(persisted))); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &stealTrackingClient{fsmTaskClient: &fsmTaskClient{fsm: fsm}}
+	proc := &mockProcessor{}
+	pool := NewPool("worker-node", q, fsm, &mockRaftApplier{}, proc, zap.NewNop())
+	pool.SetClaimer(client)
+	pool.SetCompleter(client)
+	pool.Reconcile(map[string]int{"worker": 1})
+
+	for i := 0; i < 40 && fsm.GetResult("steal-task") == nil; i++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if result := fsm.GetResult("steal-task"); result == nil || result.Status != types.TaskStatusDone {
+		t.Fatalf("stolen task result = %+v", result)
+	}
+	if !client.didSteal() {
+		t.Fatal("worker completed another tenant's task without the steal claim path")
+	}
+	if err := pool.Shutdown(2 * time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
 }
 
 func TestPoolWorker_ReservesPendingTaskBeforeClaim(t *testing.T) {

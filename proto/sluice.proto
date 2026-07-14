@@ -47,8 +47,7 @@ message SubmitRequest {
   string tenant_id       = 1;
   bytes  payload         = 2;
   string idempotency_key = 3;
-  // Optional expected processing time. Zero means unknown.
-  int64  estimated_duration_ms = 4;
+  reserved 4;
 }
 
 message SubmitResponse {

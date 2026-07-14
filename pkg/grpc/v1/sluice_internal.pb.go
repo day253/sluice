@@ -22,14 +22,14 @@ const (
 )
 
 type ClaimRequest struct {
-	state               protoimpl.MessageState `protogen:"open.v1"`
-	TaskId              string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
-	TenantId            string                 `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
-	NodeId              string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	Payload             []byte                 `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
-	EstimatedDurationMs int64                  `protobuf:"varint,5,opt,name=estimated_duration_ms,json=estimatedDurationMs,proto3" json:"estimated_duration_ms,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
+	TenantId      string                 `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	NodeId        string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Payload       []byte                 `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
+	Steal         bool                   `protobuf:"varint,5,opt,name=steal,proto3" json:"steal,omitempty"` // true when an idle worker claims an aged task for another tenant
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ClaimRequest) Reset() {
@@ -90,11 +90,11 @@ func (x *ClaimRequest) GetPayload() []byte {
 	return nil
 }
 
-func (x *ClaimRequest) GetEstimatedDurationMs() int64 {
+func (x *ClaimRequest) GetSteal() bool {
 	if x != nil {
-		return x.EstimatedDurationMs
+		return x.Steal
 	}
-	return 0
+	return false
 }
 
 type ClaimBatch struct {
@@ -421,13 +421,13 @@ var File_sluice_internal_proto protoreflect.FileDescriptor
 
 const file_sluice_internal_proto_rawDesc = "" +
 	"\n" +
-	"\x15sluice_internal.proto\x12\x12sluice.internal.v1\"\xab\x01\n" +
+	"\x15sluice_internal.proto\x12\x12sluice.internal.v1\"\x8d\x01\n" +
 	"\fClaimRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1b\n" +
 	"\ttenant_id\x18\x02 \x01(\tR\btenantId\x12\x17\n" +
 	"\anode_id\x18\x03 \x01(\tR\x06nodeId\x12\x18\n" +
-	"\apayload\x18\x04 \x01(\fR\apayload\x122\n" +
-	"\x15estimated_duration_ms\x18\x05 \x01(\x03R\x13estimatedDurationMs\"F\n" +
+	"\apayload\x18\x04 \x01(\fR\apayload\x12\x14\n" +
+	"\x05steal\x18\x05 \x01(\bR\x05steal\"F\n" +
 	"\n" +
 	"ClaimBatch\x12\x19\n" +
 	"\btask_ids\x18\x01 \x03(\tR\ataskIds\x12\x1d\n" +

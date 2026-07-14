@@ -26,10 +26,8 @@ type SubmitRequest struct {
 	TenantId       string                 `protobuf:"bytes,1,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
 	Payload        []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
 	IdempotencyKey string                 `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
-	// Optional expected processing time. Zero means unknown.
-	EstimatedDurationMs int64 `protobuf:"varint,4,opt,name=estimated_duration_ms,json=estimatedDurationMs,proto3" json:"estimated_duration_ms,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *SubmitRequest) Reset() {
@@ -81,13 +79,6 @@ func (x *SubmitRequest) GetIdempotencyKey() string {
 		return x.IdempotencyKey
 	}
 	return ""
-}
-
-func (x *SubmitRequest) GetEstimatedDurationMs() int64 {
-	if x != nil {
-		return x.EstimatedDurationMs
-	}
-	return 0
 }
 
 type SubmitResponse struct {
@@ -1126,12 +1117,11 @@ var File_sluice_proto protoreflect.FileDescriptor
 
 const file_sluice_proto_rawDesc = "" +
 	"\n" +
-	"\fsluice.proto\x12\tsluice.v1\"\xa3\x01\n" +
+	"\fsluice.proto\x12\tsluice.v1\"u\n" +
 	"\rSubmitRequest\x12\x1b\n" +
 	"\ttenant_id\x18\x01 \x01(\tR\btenantId\x12\x18\n" +
 	"\apayload\x18\x02 \x01(\fR\apayload\x12'\n" +
-	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\x122\n" +
-	"\x15estimated_duration_ms\x18\x04 \x01(\x03R\x13estimatedDurationMs\"^\n" +
+	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKeyJ\x04\b\x04\x10\x05\"^\n" +
 	"\x0eSubmitResponse\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1b\n" +
 	"\ttenant_id\x18\x02 \x01(\tR\btenantId\x12\x16\n" +

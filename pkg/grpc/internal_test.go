@@ -1,6 +1,9 @@
 package grpc
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -41,19 +44,52 @@ func applyInternalTestCommand(fsm *raftpkg.FSM, op string, data interface{}) {
 	})
 }
 
-func TestClaimBatchOrdersShortestEstimatedTasksFirst(t *testing.T) {
+func TestClaimBatchPreservesArrivalOrder(t *testing.T) {
 	batch := []raftpkg.ClaimTaskData{
-		{TaskID: "unknown", EstimatedDurationMs: 0},
-		{TaskID: "long", EstimatedDurationMs: 500},
-		{TaskID: "short", EstimatedDurationMs: 10},
+		{TaskID: "first"},
+		{TaskID: "second"},
+		{TaskID: "third"},
 	}
-	sortClaimBatch(batch)
 	got := []string{batch[0].TaskID, batch[1].TaskID, batch[2].TaskID}
-	want := []string{"short", "long", "unknown"}
+	want := []string{"first", "second", "third"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("claim order = %v, want %v", got, want)
 		}
+	}
+}
+
+func TestCanStealRequiresAgedPendingTask(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "old-task", TenantID: "target", Payload: `{}`,
+	})
+	state := fsm.GetState()
+	state.Tasks["old-task"].CreatedAt = time.Now().UTC().Add(-time.Minute)
+	persisted, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(persisted))); err != nil {
+		t.Fatal(err)
+	}
+
+	service := NewInternalService("leader", fsm, &internalTestRaft{}, zap.NewNop())
+	if !service.canSteal(raftpkg.ClaimTaskData{TaskID: "old-task", TenantID: "target", Steal: true}) {
+		t.Fatal("aged pending task was not admitted for stealing")
+	}
+	if service.canSteal(raftpkg.ClaimTaskData{TaskID: "old-task", TenantID: "target"}) {
+		t.Fatal("claim without steal flag was admitted")
+	}
+	if service.canSteal(raftpkg.ClaimTaskData{TaskID: "old-task", TenantID: "wrong", Steal: true}) {
+		t.Fatal("wrong tenant was admitted for stealing")
+	}
+
+	applyInternalTestCommand(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "fresh-task", TenantID: "target", Payload: `{}`,
+	})
+	if service.canSteal(raftpkg.ClaimTaskData{TaskID: "fresh-task", TenantID: "target", Steal: true}) {
+		t.Fatal("fresh pending task was admitted for stealing")
 	}
 }
 

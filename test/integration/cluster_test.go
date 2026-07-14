@@ -543,9 +543,8 @@ func TestHTTPBatchSubmitThroughFollower(t *testing.T) {
 	request := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, taskCount)}
 	for i := range request.Tasks {
 		request.Tasks[i] = types.TaskSubmitRequest{
-			TenantID:            "batch-http-tenant",
-			Payload:             json.RawMessage(fmt.Sprintf(`{"index":%d}`, i)),
-			EstimatedDurationMs: int64((taskCount - i) * 10),
+			TenantID: "batch-http-tenant",
+			Payload:  json.RawMessage(fmt.Sprintf(`{"index":%d}`, i)),
 		}
 	}
 	body, err := json.Marshal(request)
@@ -579,6 +578,71 @@ func TestHTTPBatchSubmitThroughFollower(t *testing.T) {
 			completed := tc.fsms().GetResult(task.TaskID)
 			return completed != nil && completed.Status == types.TaskStatusDone
 		}, 30*time.Second, "batch task completion")
+	}
+}
+
+// TestWorkStealUsesAgedPendingWork verifies the cross-tenant fallback path.
+// The target tenant is deliberately removed from the current allocation
+// mirror, so only an already allocated idle worker can finish its aged task.
+func TestWorkStealUsesAgedPendingWork(t *testing.T) {
+	tc := newTestCluster(t, 2, 10)
+	defer tc.shutdown()
+
+	tc.addTenant("steal-worker", 10)
+	tc.addTenant("steal-target", 1)
+	tc.waitAllocation(10 * time.Second)
+
+	// Stop target workers in the current mirror while preserving one source
+	// worker on every node. The allocator may restore the normal plan later,
+	// but the aged task should be claimed before its next reconciliation tick.
+	allocs := make(map[string]*types.NodeAllocation)
+	for _, nodeInfo := range tc.fsms().GetActiveNodes() {
+		allocs[nodeInfo.ID] = &types.NodeAllocation{
+			NodeID:  nodeInfo.ID,
+			Tenants: map[string]int{"steal-worker": 1},
+		}
+	}
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpUpdateAllocation, allocs), 5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("remove target allocation: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	taskID := "aged-steal-task"
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+			TaskID: taskID, TenantID: "steal-target", Payload: `{"from":"steal"}`,
+		}), 5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("create aged task: %v", err)
+	}
+	// Make the task old without sleeping through the five-second admission
+	// threshold. This mutation is test-only; production CreatedAt is immutable.
+	leaderFSM := tc.nodes[leader].RaftCluster().FSM()
+	state := leaderFSM.GetState()
+	if state.Tasks[taskID] == nil {
+		t.Fatalf("created task %s missing from leader FSM", taskID)
+	}
+	state.Tasks[taskID].CreatedAt = time.Now().UTC().Add(-time.Minute)
+	persisted, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := leaderFSM.Restore(io.NopCloser(bytes.NewReader(persisted))); err != nil {
+		t.Fatalf("age task in test FSM: %v", err)
+	}
+
+	tc.waitFor(func() bool {
+		result := tc.fsms().GetResult(taskID)
+		return result != nil && result.Status == types.TaskStatusDone
+	}, 10*time.Second, "aged task stolen by idle worker")
+	if got := tc.proc.processedByTenant("steal-target"); got != 1 {
+		t.Fatalf("steal-target processed count = %d, want 1", got)
 	}
 }
 

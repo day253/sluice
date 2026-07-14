@@ -37,12 +37,13 @@ type Claimer interface {
 	Claim(taskID, tenantID, payload string) (bool, error)
 }
 
-// EstimatedClaimer is an optional extension implemented by the production
-// streaming client. It lets the leader order claims by expected completion
-// time without breaking simple test/fallback claimers.
-type EstimatedClaimer interface {
-	ClaimWithEstimate(taskID, tenantID, payload string, estimatedDurationMs int64) (bool, error)
+// StealableClaimer is implemented by the streaming claimer. It lets an idle
+// worker explicitly ask the leader to admit an aged task from another tenant.
+type StealableClaimer interface {
+	ClaimSteal(taskID, tenantID, payload string) (bool, error)
 }
+
+const workStealThreshold = 5 * time.Second
 
 // Completer publishes task results through the current Raft leader.
 type Completer interface {
@@ -258,6 +259,14 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 			task = p.findRecoveryTask(tenantID)
 		}
 
+		// 3. An idle worker may steal an aged task from another tenant. This
+		// reuses existing capacity; it does not change the replicated allocation.
+		steal := false
+		if task == nil {
+			task = p.findStealTask(tenantID)
+			steal = task != nil
+		}
+
 		if task == nil {
 			// Nothing to do — sleep and retry.
 			select {
@@ -271,8 +280,8 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 			continue
 		}
 
-		// 3. Claim the task via Raft.
-		if err := p.claimTask(task); err != nil {
+		// 4. Claim the task via Raft.
+		if err := p.claimTask(task, steal); err != nil {
 			p.releaseTask(task.TaskID)
 			logger.Warn("failed to claim task", zap.String("task_id", task.TaskID), zap.Error(err))
 			select {
@@ -283,7 +292,7 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 			continue
 		}
 
-		// 4. Process the task (context-aware).
+		// 5. Process the task (context-aware).
 		result, err := p.processor.Process(ctx, task.TaskID, task.TenantID, json.RawMessage(task.Payload))
 		if err != nil && ctx.Err() != nil {
 			// A rollout interrupted execution. Leave the claim unfinished so the
@@ -294,7 +303,7 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 			return
 		}
 
-		// 5. Publish result via Raft.
+		// 6. Publish result via Raft.
 		var completeErr error
 		if err != nil {
 			completeErr = p.completeTask(task.TaskID, task.TenantID, "", err.Error(), true)
@@ -326,10 +335,9 @@ func (p *Pool) dequeueLocal(tenantID string) *types.TaskRecord {
 	}
 	raw, _ := json.Marshal(env.Payload)
 	return &types.TaskRecord{
-		TaskID:              env.TaskID,
-		TenantID:            env.TenantID,
-		Payload:             string(raw),
-		EstimatedDurationMs: env.EstimatedDurationMs,
+		TaskID:   env.TaskID,
+		TenantID: env.TenantID,
+		Payload:  string(raw),
 	}
 }
 
@@ -344,16 +352,26 @@ func (p *Pool) findRecoveryTask(tenantID string) *types.TaskRecord {
 	return tasks[0]
 }
 
+func (p *Pool) findStealTask(tenantID string) *types.TaskRecord {
+	tasks := p.fsm.FindStealablePendingTasks(tenantID, time.Now().UTC().Add(-workStealThreshold))
+	if len(tasks) == 0 {
+		return nil
+	}
+	return tasks[0]
+}
+
 // claimTask claims a task.  Uses streaming claim client if available
 // (works from any node); falls back to direct raft.Apply (leader only).
-func (p *Pool) claimTask(task *types.TaskRecord) error {
+func (p *Pool) claimTask(task *types.TaskRecord, steal bool) error {
 	if p.claimer != nil {
-		var (
-			ok  bool
-			err error
-		)
-		if estimated, supportsEstimate := p.claimer.(EstimatedClaimer); supportsEstimate {
-			ok, err = estimated.ClaimWithEstimate(task.TaskID, task.TenantID, task.Payload, task.EstimatedDurationMs)
+		var ok bool
+		var err error
+		if steal {
+			if sc, supported := p.claimer.(StealableClaimer); supported {
+				ok, err = sc.ClaimSteal(task.TaskID, task.TenantID, task.Payload)
+			} else {
+				ok, err = p.claimer.Claim(task.TaskID, task.TenantID, task.Payload)
+			}
 		} else {
 			ok, err = p.claimer.Claim(task.TaskID, task.TenantID, task.Payload)
 		}
@@ -366,11 +384,11 @@ func (p *Pool) claimTask(task *types.TaskRecord) error {
 		}
 	}
 	data := raftpkg.ClaimTaskData{
-		TaskID:              task.TaskID,
-		TenantID:            task.TenantID,
-		NodeID:              p.nodeID,
-		Payload:             task.Payload,
-		EstimatedDurationMs: task.EstimatedDurationMs,
+		TaskID:   task.TaskID,
+		TenantID: task.TenantID,
+		NodeID:   p.nodeID,
+		Payload:  task.Payload,
+		Steal:    steal,
 	}
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpClaimTask, data)
 	return p.raft.Apply(cmd, 5000).Error()

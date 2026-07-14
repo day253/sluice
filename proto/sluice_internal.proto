@@ -40,7 +40,7 @@ message ClaimRequest {
   string tenant_id = 2;
   string node_id   = 3;
   bytes  payload   = 4;
-  int64  estimated_duration_ms = 5;
+  bool   steal     = 5;  // true when an idle worker claims an aged task for another tenant
 }
 
 message ClaimBatch {

@@ -284,12 +284,11 @@ func (f *FSM) insertPendingTask(req CreateTaskData) {
 		return
 	}
 	f.state.Tasks[req.TaskID] = &types.TaskRecord{
-		TaskID:              req.TaskID,
-		TenantID:            req.TenantID,
-		Status:              types.TaskStatusPending,
-		Payload:             req.Payload,
-		EstimatedDurationMs: req.EstimatedDurationMs,
-		CreatedAt:           time.Now().UTC(),
+		TaskID:    req.TaskID,
+		TenantID:  req.TenantID,
+		Status:    types.TaskStatusPending,
+		Payload:   req.Payload,
+		CreatedAt: time.Now().UTC(),
 	}
 }
 
@@ -315,21 +314,19 @@ func (f *FSM) applyClaimTask(data json.RawMessage) interface{} {
 		existing.NodeID = req.NodeID
 		existing.ClaimedAt = now
 		existing.Payload = req.Payload
-		existing.EstimatedDurationMs = req.EstimatedDurationMs
 		return nil
 	}
 
 	// Fresh claim — the payload is being promoted from the local queue into
 	// the Raft log, giving it cluster-wide durability.
 	f.state.Tasks[req.TaskID] = &types.TaskRecord{
-		TaskID:              req.TaskID,
-		TenantID:            req.TenantID,
-		Status:              types.TaskStatusInflight,
-		NodeID:              req.NodeID,
-		Payload:             req.Payload,
-		EstimatedDurationMs: req.EstimatedDurationMs,
-		CreatedAt:           now,
-		ClaimedAt:           now,
+		TaskID:    req.TaskID,
+		TenantID:  req.TenantID,
+		Status:    types.TaskStatusInflight,
+		NodeID:    req.NodeID,
+		Payload:   req.Payload,
+		CreatedAt: now,
+		ClaimedAt: now,
 	}
 	return nil
 }
@@ -628,7 +625,8 @@ func (f *FSM) TaskStatus(taskID string) (string, bool) {
 }
 
 // FindPendingTasks returns all tasks with status "pending" for the given
-// tenant.  These are tasks that were re-queued after a node failure.
+// tenant, ordered by their original enqueue time. Pending tasks may be newly
+// submitted or re-queued after a node failure.
 func (f *FSM) FindPendingTasks(tenantID string) []*types.TaskRecord {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -640,15 +638,29 @@ func (f *FSM) FindPendingTasks(tenantID string) []*types.TaskRecord {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
-		// Shortest predicted job first improves completion time for small
-		// tasks while preserving FIFO for tasks without an estimate.
-		left, right := out[i].EstimatedDurationMs, out[j].EstimatedDurationMs
-		if left > 0 && right > 0 && left != right {
-			return left < right
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].TaskID < out[j].TaskID
 		}
-		if (left > 0) != (right > 0) {
-			return left > 0
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+// FindStealablePendingTasks returns aged pending tasks belonging to tenants
+// other than excludeTenantID. Results are FIFO by the original enqueue time,
+// making stealing deterministic and independent of client estimates.
+func (f *FSM) FindStealablePendingTasks(excludeTenantID string, before time.Time) []*types.TaskRecord {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var out []*types.TaskRecord
+	for _, task := range f.state.Tasks {
+		if task.Status != types.TaskStatusPending || task.TenantID == excludeTenantID || task.CreatedAt.IsZero() || !task.CreatedAt.Before(before) {
+			continue
 		}
+		copyTask := *task
+		out = append(out, &copyTask)
+	}
+	sort.Slice(out, func(i, j int) bool {
 		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
 			return out[i].TaskID < out[j].TaskID
 		}
@@ -691,6 +703,25 @@ func (f *FSM) CountPendingPerTenant() map[string]int {
 	for _, t := range f.state.Tasks {
 		if t.Status == types.TaskStatusPending {
 			out[t.TenantID]++
+		}
+	}
+	return out
+}
+
+// OldestPendingCreatedAtByTenant returns the creation time of the oldest
+// pending task for each tenant. It is a current scheduling signal only; the
+// task history remains in the bounded task/result stores.
+func (f *FSM) OldestPendingCreatedAtByTenant() map[string]time.Time {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	out := make(map[string]time.Time)
+	for _, task := range f.state.Tasks {
+		if task.Status != types.TaskStatusPending {
+			continue
+		}
+		oldest, ok := out[task.TenantID]
+		if !ok || task.CreatedAt.Before(oldest) {
+			out[task.TenantID] = task.CreatedAt
 		}
 	}
 	return out

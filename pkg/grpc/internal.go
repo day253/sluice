@@ -2,7 +2,6 @@ package grpc
 
 import (
 	"io"
-	"sort"
 	"sync"
 	"time"
 
@@ -108,8 +107,7 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 			claimCh <- claimWithIndex{
 				req: raftpkg.ClaimTaskData{
 					TaskID: req.TaskId, TenantID: req.TenantId,
-					NodeID: req.NodeId, Payload: string(req.Payload),
-					EstimatedDurationMs: req.EstimatedDurationMs,
+					NodeID: req.NodeId, Payload: string(req.Payload), Steal: req.Steal,
 				},
 			}
 		}
@@ -127,18 +125,18 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 
 		// Filter: only grant claims for nodes that are allocated.
 		alloc := s.fsm.GetAllAllocations()
-		// Claims on one node stream form one node-local execution batch. Apply
-		// shortest-predicted tasks first so small jobs clear quickly while the
-		// batch is committed atomically.
-		sortClaimBatch(batch)
+		// Preserve the worker arrival order. Scheduling is based on actual
+		// pending age and observed completion, not client-provided estimates.
 		granted := make([]raftpkg.ClaimTaskData, 0, len(batch))
 		var failedIDs []string
 
 		for _, t := range batch {
 			na, ok := alloc[t.NodeID]
 			if !ok || na.Tenants[t.TenantID] <= 0 {
-				failedIDs = append(failedIDs, t.TaskID)
-				continue
+				if !s.canSteal(t) {
+					failedIDs = append(failedIDs, t.TaskID)
+					continue
+				}
 			}
 			granted = append(granted, t)
 		}
@@ -202,19 +200,20 @@ func (s *InternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamSe
 	}
 }
 
-// sortClaimBatch applies shortest-predicted-task-first ordering. Unknown
-// estimates remain behind known estimates but retain deterministic ID order.
-func sortClaimBatch(batch []raftpkg.ClaimTaskData) {
-	sort.SliceStable(batch, func(i, j int) bool {
-		left, right := batch[i].EstimatedDurationMs, batch[j].EstimatedDurationMs
-		if left > 0 && right > 0 && left != right {
-			return left < right
-		}
-		if (left > 0) != (right > 0) {
-			return left > 0
-		}
-		return batch[i].TaskID < batch[j].TaskID
-	})
+// workStealThreshold is intentionally shared with the worker-side age check.
+// The leader remains authoritative so a stale or malicious client cannot
+// bypass tenant allocation by setting the steal bit on a fresh task.
+const workStealThreshold = 5 * time.Second
+
+func (s *InternalService) canSteal(task raftpkg.ClaimTaskData) bool {
+	if !task.Steal {
+		return false
+	}
+	record := s.fsm.GetTask(task.TaskID)
+	if record == nil || record.Status != "pending" || record.TenantID != task.TenantID {
+		return false
+	}
+	return !record.CreatedAt.IsZero() && record.CreatedAt.Before(time.Now().UTC().Add(-workStealThreshold))
 }
 
 // ---------------------------------------------------------------------------

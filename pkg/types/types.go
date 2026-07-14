@@ -66,14 +66,13 @@ type NodeAllocation struct {
 // inflight (currently being processed).  Once finished the task is moved into
 // TaskResult.
 type TaskRecord struct {
-	TaskID              string    `json:"task_id"`
-	TenantID            string    `json:"tenant_id"`
-	Status              string    `json:"status"` // "pending" | "inflight"
-	NodeID              string    `json:"node_id,omitempty"`
-	Payload             string    `json:"payload,omitempty"`
-	EstimatedDurationMs int64     `json:"estimated_duration_ms,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-	ClaimedAt           time.Time `json:"claimed_at,omitempty"`
+	TaskID    string    `json:"task_id"`
+	TenantID  string    `json:"tenant_id"`
+	Status    string    `json:"status"` // "pending" | "inflight"
+	NodeID    string    `json:"node_id,omitempty"`
+	Payload   string    `json:"payload,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	ClaimedAt time.Time `json:"claimed_at,omitempty"`
 }
 
 // TaskResult is the final outcome of a task.
@@ -119,10 +118,9 @@ func NewFSMState() *FSMState {
 
 // TaskSubmitRequest is the JSON body for POST /api/v1/tasks.
 type TaskSubmitRequest struct {
-	TenantID            string          `json:"tenant_id"`
-	Payload             json.RawMessage `json:"payload"`
-	IdempotencyKey      string          `json:"idempotency_key,omitempty"`
-	EstimatedDurationMs int64           `json:"estimated_duration_ms,omitempty"`
+	TenantID       string          `json:"tenant_id"`
+	Payload        json.RawMessage `json:"payload"`
+	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 }
 
 // BatchTaskSubmitRequest is the JSON body for POST /api/v1/tasks/batch.

@@ -111,10 +111,9 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 		}
 		taskID := uuid.New().String()
 		create[i] = raftpkg.CreateTaskData{
-			TaskID:              taskID,
-			TenantID:            item.TenantId,
-			Payload:             string(item.Payload),
-			EstimatedDurationMs: item.EstimatedDurationMs,
+			TaskID:   taskID,
+			TenantID: item.TenantId,
+			Payload:  string(item.Payload),
 		}
 		resp.Tasks[i] = &grpcv1.SubmitResponse{TaskId: taskID, TenantId: item.TenantId, Status: types.TaskStatusPending}
 	}
@@ -128,11 +127,10 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 		// Also enqueue locally so local workers pick tasks up quickly
 		// (best-effort); the batch Raft entry remains the durable source.
 		_ = s.queue.Enqueue(item.TenantId, &queue.TaskEnvelope{
-			TaskID:              create[i].TaskID,
-			TenantID:            item.TenantId,
-			Payload:             item.Payload,
-			EstimatedDurationMs: item.EstimatedDurationMs,
-			CreatedAt:           time.Now().UTC(),
+			TaskID:    create[i].TaskID,
+			TenantID:  item.TenantId,
+			Payload:   item.Payload,
+			CreatedAt: time.Now().UTC(),
 		})
 	}
 	return resp, nil

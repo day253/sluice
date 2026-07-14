@@ -71,16 +71,16 @@ func (c *ClaimClient) SetLeader(addr string) {
 }
 
 func (c *ClaimClient) Claim(taskID, tenantID, payload string) (bool, error) {
-	return c.claim(taskID, tenantID, payload, 0)
+	return c.claim(taskID, tenantID, payload, false)
 }
 
-// ClaimWithEstimate sends the optional expected duration to the leader so it
-// can schedule short jobs ahead of long jobs in the next claim batch.
-func (c *ClaimClient) ClaimWithEstimate(taskID, tenantID, payload string, estimatedDurationMs int64) (bool, error) {
-	return c.claim(taskID, tenantID, payload, estimatedDurationMs)
+// ClaimSteal claims an aged pending task for another tenant using an existing
+// idle worker. The leader validates the age before admitting the claim.
+func (c *ClaimClient) ClaimSteal(taskID, tenantID, payload string) (bool, error) {
+	return c.claim(taskID, tenantID, payload, true)
 }
 
-func (c *ClaimClient) claim(taskID, tenantID, payload string, estimatedDurationMs int64) (bool, error) {
+func (c *ClaimClient) claim(taskID, tenantID, payload string, steal bool) (bool, error) {
 	ch := make(chan claimResult, 1)
 	c.pendingClaimsMu.Lock()
 	if _, exists := c.pendingClaims[taskID]; exists {
@@ -105,7 +105,7 @@ func (c *ClaimClient) claim(taskID, tenantID, payload string, estimatedDurationM
 	c.claimSendMu.Lock()
 	err := stream.Send(&grpcv1.ClaimRequest{
 		TaskId: taskID, TenantId: tenantID,
-		NodeId: c.nodeID, Payload: []byte(payload), EstimatedDurationMs: estimatedDurationMs,
+		NodeId: c.nodeID, Payload: []byte(payload), Steal: steal,
 	})
 	c.claimSendMu.Unlock()
 	if err != nil {

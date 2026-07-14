@@ -227,8 +227,8 @@ func TestCompletedTaskCannotBeResurrected(t *testing.T) {
 func TestCreateTaskBatchPersistsAllTasksAndIsIdempotent(t *testing.T) {
 	fsm := newTestFSM(t)
 	batch := CreateTaskBatchData{Tasks: []CreateTaskData{
-		{TaskID: "batch-1", TenantID: "tenant-a", Payload: `{"n":1}`, EstimatedDurationMs: 100},
-		{TaskID: "batch-2", TenantID: "tenant-b", Payload: `{"n":2}`, EstimatedDurationMs: 10},
+		{TaskID: "batch-1", TenantID: "tenant-a", Payload: `{"n":1}`},
+		{TaskID: "batch-2", TenantID: "tenant-b", Payload: `{"n":2}`},
 	}}
 	applyCmd(t, fsm, OpCreateTaskBatch, batch)
 	applyCmd(t, fsm, OpCreateTaskBatch, batch)
@@ -241,28 +241,48 @@ func TestCreateTaskBatchPersistsAllTasksAndIsIdempotent(t *testing.T) {
 		if task.TenantID != want.TenantID || task.Payload != want.Payload || task.Status != types.TaskStatusPending {
 			t.Fatalf("batch task %s = %+v", want.TaskID, task)
 		}
-		if task.EstimatedDurationMs != want.EstimatedDurationMs {
-			t.Fatalf("batch task %s estimate = %d, want %d", want.TaskID, task.EstimatedDurationMs, want.EstimatedDurationMs)
-		}
 	}
 	if got := fsm.CountUnfinishedPerTenant(); got["tenant-a"] != 1 || got["tenant-b"] != 1 {
 		t.Fatalf("unfinished counts after duplicate batch = %+v", got)
 	}
 }
 
-func TestFindPendingTasksUsesShortestEstimatedDurationFirst(t *testing.T) {
+func TestFindPendingTasksUsesCreatedAtFIFO(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpCreateTask, CreateTaskData{TaskID: "first", TenantID: "tenant-a"})
+	time.Sleep(time.Millisecond)
+	applyCmd(t, fsm, OpCreateTask, CreateTaskData{TaskID: "second", TenantID: "tenant-a"})
+	pending := fsm.FindPendingTasks("tenant-a")
+	if len(pending) != 2 {
+		t.Fatalf("pending tasks = %d, want 2", len(pending))
+	}
+	if pending[0].TaskID != "first" || pending[1].TaskID != "second" {
+		t.Fatalf("pending order = [%s %s], want [first second]", pending[0].TaskID, pending[1].TaskID)
+	}
+}
+
+func TestFindStealablePendingTasksFiltersTenantAndAge(t *testing.T) {
 	fsm := newTestFSM(t)
 	applyCmd(t, fsm, OpCreateTaskBatch, CreateTaskBatchData{Tasks: []CreateTaskData{
-		{TaskID: "long", TenantID: "tenant-a", EstimatedDurationMs: 500},
-		{TaskID: "unknown", TenantID: "tenant-a"},
-		{TaskID: "short", TenantID: "tenant-a", EstimatedDurationMs: 10},
+		{TaskID: "old-other", TenantID: "other"},
+		{TaskID: "old-same", TenantID: "worker"},
+		{TaskID: "fresh-other", TenantID: "other"},
 	}})
-	pending := fsm.FindPendingTasks("tenant-a")
-	if len(pending) != 3 {
-		t.Fatalf("pending tasks = %d, want 3", len(pending))
+	state := fsm.GetState()
+	state.Tasks["old-other"].CreatedAt = time.Now().UTC().Add(-time.Minute)
+	state.Tasks["old-same"].CreatedAt = time.Now().UTC().Add(-time.Minute)
+	state.Tasks["fresh-other"].CreatedAt = time.Now().UTC()
+	persisted, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if pending[0].TaskID != "short" || pending[1].TaskID != "long" || pending[2].TaskID != "unknown" {
-		t.Fatalf("pending order = [%s %s %s], want [short long unknown]", pending[0].TaskID, pending[1].TaskID, pending[2].TaskID)
+	if err := fsm.Restore(io.NopCloser(bytes.NewReader(persisted))); err != nil {
+		t.Fatal(err)
+	}
+
+	got := fsm.FindStealablePendingTasks("worker", time.Now().UTC().Add(-5*time.Second))
+	if len(got) != 1 || got[0].TaskID != "old-other" {
+		t.Fatalf("stealable tasks = %+v, want only old-other", got)
 	}
 }
 

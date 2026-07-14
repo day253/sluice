@@ -16,17 +16,20 @@
 2. 发现: Worker → fsm.FindPendingTasks(tenantID) → 发现 pending 任务
 3. 认领: Worker → ClaimStream → Leader
          Leader 检查 allocation[node][tenant] > 0 ?
-         是 → 批准  否 → 拒绝
+         是 → 批准；否则仅当 steal=true 且该任务已等待超过 5s 才批准
 4. 批量: Leader 聚批(5ms/128条) → raft.Apply(OpClaimBatch) → pending→inflight
 5. 返回: Leader → ClaimStream → {claimed:[], failed:[]}
 6. 执行: Worker 处理 claimed 任务
 7. 完成: Worker → ResultStream → Leader → raft.Apply(OpCompleteBatch)
 ```
 
-提交请求可以携带 `estimated_duration_ms`（预估处理耗时，0 表示未知）。
-Leader 在同一节点的 claim stream 内按短作业优先（SPT）排序，节点的并发
-worker 负责并行执行；ClaimBatch 和 ResultBatch 分别用一条 Raft 日志提交。
-没有预估值的旧客户端在未知任务之间继续使用 FIFO，保持向后兼容。
+提交请求不携带处理耗时预估。任务进入 FSM 后按 `CreatedAt` FIFO 排队，由实际
+处理结果和待处理时长驱动调度，避免客户端估时不准导致饥饿。
+
+空闲 worker 会在本地队列和本租户恢复任务都为空时，向 leader 请求“偷取”其他租户
+中等待超过 5 秒的 pending 任务。leader 会再次校验任务状态、租户和等待时长，成功
+后仍通过原有批量 Claim Raft 日志提交。work-steal 不增加配额，只复用已经存在的
+空闲并发；ClaimBatch 和 ResultBatch 分别用一条 Raft 日志提交。
 
 ## 限流模型
 
@@ -49,7 +52,7 @@ Allocator (Leader, 每 3s):
   3. 均匀分布到各节点
   4. 空闲检测: inflight=0 连续 3 周期 → idle → 1 worker
   5. 空闲租户释放的 worker 二次分配给活跃租户
-  6. 只有一个 pending 租户时，按自适应试探增加借用 worker
+  6. 只有一个 pending 租户且 backlog 已等待 5s 时，按自适应试探增加借用 worker
   7. raft.Apply(OpUpdateAllocation)
 
 ### 借用额度与写入规则

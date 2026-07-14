@@ -268,15 +268,16 @@ func TestApplyBorrowing_ProbesSpareCapacityExponentially(t *testing.T) {
 	base := map[string]int{"small": 1, "idle": 1}
 	idleSet := map[string]bool{"idle": true}
 
-	first, borrowed := e.applyBorrowing(tenants, base, 20, map[string]int{"small": 100}, map[string]int{"small": 100}, idleSet)
+	oldest := map[string]time.Time{"small": time.Now().Add(-pendingBorrowThreshold - time.Second)}
+	first, borrowed := e.applyBorrowing(tenants, base, 20, map[string]int{"small": 100}, map[string]int{"small": 100}, oldest, idleSet)
 	if first["small"] != 2 || borrowed["small"] != 1 {
 		t.Fatalf("first probe = effective %d borrowed %d, want 2/1", first["small"], borrowed["small"])
 	}
-	second, borrowed := e.applyBorrowing(tenants, base, 20, map[string]int{"small": 100}, map[string]int{"small": 100}, idleSet)
+	second, borrowed := e.applyBorrowing(tenants, base, 20, map[string]int{"small": 100}, map[string]int{"small": 100}, oldest, idleSet)
 	if second["small"] != 4 || borrowed["small"] != 3 {
 		t.Fatalf("second probe = effective %d borrowed %d, want 4/3", second["small"], borrowed["small"])
 	}
-	third, borrowed := e.applyBorrowing(tenants, base, 20, map[string]int{"small": 100}, map[string]int{"small": 100}, idleSet)
+	third, borrowed := e.applyBorrowing(tenants, base, 20, map[string]int{"small": 100}, map[string]int{"small": 100}, oldest, idleSet)
 	if third["small"] != 8 || borrowed["small"] != 7 {
 		t.Fatalf("third probe = effective %d borrowed %d, want 8/7", third["small"], borrowed["small"])
 	}
@@ -297,6 +298,7 @@ func TestApplyBorrowing_ReleasesImmediatelyWhenAnotherTenantBacklogs(t *testing.
 		tenants, base, 20,
 		map[string]int{"small": 100, "other": 1},
 		map[string]int{"small": 100, "other": 1},
+		map[string]time.Time{"small": time.Now().Add(-pendingBorrowThreshold - time.Second)},
 		map[string]bool{},
 	)
 	if len(borrowed) != 0 {
@@ -319,7 +321,8 @@ func TestApplyBorrowing_DoesNotProbeWithoutPendingBacklog(t *testing.T) {
 		map[string]int{"small": 1},
 		20,
 		map[string]int{"small": 1}, // one task is already inflight
-		map[string]int{},              // no queued work remains
+		map[string]int{},           // no queued work remains
+		map[string]time.Time{},
 		map[string]bool{},
 	)
 	if len(borrowed) != 0 || effective["small"] != 1 {
