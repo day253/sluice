@@ -23,6 +23,17 @@ data:
         | sed -n 's/.*"clusterIP"\s*:\s*"\([0-9.]*\)".*/\1/p'
     }
 
+    resolve_leader_ip() {
+      CANDIDATE_IP="$1"
+      HEALTH=$(wget -qO- "http://${CANDIDATE_IP}:{{ .Values.apiPort }}/api/v1/health" 2>/dev/null || true)
+      LEADER_ADDR=$(printf '%s' "${HEALTH}" | sed -n 's/.*"leader":"\([^"]*\)".*/\1/p')
+      LEADER_IP="${LEADER_ADDR%:*}"
+      case "${LEADER_IP}" in
+        ""|"0.0.0.0"|"::") return 1 ;;
+      esac
+      printf '%s' "${LEADER_IP}"
+    }
+
     SELF_IP=$(resolve_service_ip "${POD_NAME}-raft")
     while [ -z "$SELF_IP" ]; do
       echo "   waiting for stable Raft service IP..."
@@ -54,10 +65,20 @@ data:
         sleep 2
         BOOTSTRAP_IP=$(resolve_service_ip "{{ include "sluice.fullname" . }}-0-raft")
       done
-      echo "==> Joining via ${BOOTSTRAP_IP}:{{ .Values.apiPort }}"
+
+      JOIN_PAYLOAD=$(printf '{"node_id":"%s","raft_address":"%s","http_address":"%s","total_workers":%s}' \
+        "${POD_NAME}" "${RAFT_ADVERTISE}" "${API}" "{{ .Values.workersPerNode }}")
+      echo "==> Joining the current Raft leader (discovered via sluice-0)"
       for i in $(seq 1 30); do
-        wget -qO- "http://${BOOTSTRAP_IP}:{{ .Values.apiPort }}/api/v1/health" 2>/dev/null && break
-        echo "   waiting for leader... ${i}"; sleep 2
+        LEADER_IP=$(resolve_leader_ip "${BOOTSTRAP_IP}" || true)
+        if [ -n "${LEADER_IP}" ] && wget -qO- \
+          --header="Content-Type: application/json" \
+          --post-data="${JOIN_PAYLOAD}" \
+          "http://${LEADER_IP}:{{ .Values.apiPort }}/api/v1/cluster/join" 2>/dev/null; then
+          echo
+          break
+        fi
+        echo "   waiting for a reachable Raft leader... ${i}"; sleep 2
       done
       exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
         --raft-advertise="${RAFT_ADVERTISE}" \
