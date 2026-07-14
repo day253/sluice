@@ -120,3 +120,50 @@ HTTP REST:
 - Follower 宕机: Leader 心跳超时 → OpNodeDown → inflight→pending
 - Leader 宕机: 新 Leader 选举 → Allocator 重启 → ClaimClient 重连
 - 任务不丢失: OpCreateTask 即写 Raft → 节点恢复后 FSM 仍有 pending 记录
+
+## 调度正确性不变量与需求边界
+
+必须同时满足：
+
+1. **持久化先于执行**：API 返回 accepted 前，任务已通过 Raft 写入 pending。
+2. **单一 Claim 所有权**：同一时刻一个任务最多属于一个节点；所有 Claim/Complete
+   状态迁移由 Leader 批量提交 Raft，Worker 的本地队列不是事实来源。
+3. **容量有界**：所有节点有效 worker 之和不得超过存活节点总容量；借用只改变
+   当前分配镜像，不改变租户配置的保底 Limit。
+4. **租户隔离**：普通 Claim 必须有该节点/租户额度；work-steal 必须显式标记并由
+   Leader 校验任务状态、tenant、队列来源或等待时间。
+5. **可恢复**：节点宕机使其 inflight 回到 pending；进程整体重启后，遗留 inflight
+   在 30 秒 Claim lease 到期后回到 pending，最终状态只提交一次。
+6. **有界活性**：本地队列立即消费；Leader 扫描没有本地队列的 pending；跨节点
+   steal 只兜底等待超过 5 秒的任务，避免用全局抢占制造 Claim 风暴。
+
+当前需求范围：系统负责 durable queue、并发配额、空闲容量借用、节点内优先和跨节点
+兜底的 work-steal，以及失败后的至少一次执行尝试/单次最终状态提交。系统当前不提供
+业务 Processor 的事务性 exactly-once 副作用；Processor 在结果提交失败或 Claim lease
+过期时可能被重试，因此业务处理器必须幂等。`QueueNodeID` 只用于 pending 阶段的调度
+局部性，不是任务所有权，也不进入历史时序存储。
+
+## 历史故障 Case
+
+### SCHED-001：全节点重复扫描 fresh pending
+
+- **现象**：50 个节点各自用大量 Worker 扫描同一份 Raft pending 集合，每个任务被
+  多节点同时请求 Claim；FSM 拒绝重复 Claim，但线上每分钟产生数千条
+  `failed to claim task: claim rejected`，大部分资源消耗在无效竞争，积压下降很慢。
+- **根因**：把全局恢复扫描当成本地取队列；节点间没有 fresh pending 的扫描所有权。
+- **修复**：普通全局恢复扫描仅由 Leader 执行；Worker 顺序固定为本租户本地队列、
+  本节点其他租户队列、Leader 恢复扫描、超过 5 秒的跨节点 steal。同一 Pool 继续用
+  task reservation 防止本节点多个 Worker 重复 Claim。
+- **边界**：Follower 不扫描 fresh 全局 pending，但仍处理自己的本地队列；旧数据没有
+  `QueueNodeID` 时由 Leader 恢复，超过 5 秒后也允许其他节点兜底偷取。
+- **回归覆盖**：见 `docs/TESTING.md` 的 SCHED-001、STEAL-001 和 RECOVERY-001。
+
+### ALLOC-001：多租户积压时闲置容量未被使用
+
+- **现象**：集群有 5000 Worker，但租户 Limit 合计只有 690；多个租户同时积压时，
+  旧策略仅允许“唯一活跃租户”借用，导致四千多个 Worker 长期空闲。
+- **修复**：所有等待超过 5 秒且仍有 pending 的租户按稳定 tenant ID 顺序共享剩余
+  容量；每租户独立试探并受 pending 数、公平份额和集群总容量约束。
+- **边界**：借用不保证固定吞吐，不把控制器试探值存成历史；pending 消失立即释放，
+  Leader 切换后从正常配额重新试探。
+- **回归覆盖**：见 `docs/TESTING.md` 的 ALLOC-001。

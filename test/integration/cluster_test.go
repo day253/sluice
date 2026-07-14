@@ -17,10 +17,12 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/day253/sluice/pkg/node"
 	"github.com/day253/sluice/pkg/queue"
@@ -51,6 +53,14 @@ type testCluster struct {
 // leader once it is elected.  Accepts testing.TB so both *testing.T and
 // *testing.B can use it.
 func newTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster {
+	logger := zap.NewNop()
+	if os.Getenv("SLUICE_TEST_LOGS") != "" {
+		logger, _ = zap.NewDevelopment()
+	}
+	return newTestClusterWithLogger(tb, n, totalWorkersPerNode, logger)
+}
+
+func newTestClusterWithLogger(tb testing.TB, n int, totalWorkersPerNode int, logger *zap.Logger) *testCluster {
 	tb.Helper()
 
 	if n < 1 {
@@ -66,11 +76,6 @@ func newTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster 
 		proc:      newRecordingProcessor(),
 		results:   make(map[string]*types.TaskResult),
 		workers:   totalWorkersPerNode,
-	}
-
-	logger := zap.NewNop()
-	if os.Getenv("SLUICE_TEST_LOGS") != "" {
-		logger, _ = zap.NewDevelopment()
 	}
 
 	// ---- Allocate random loopback ports ----
@@ -643,6 +648,76 @@ func TestWorkStealUsesAgedPendingWork(t *testing.T) {
 	}, 10*time.Second, "aged task stolen by idle worker")
 	if got := tc.proc.processedByTenant("steal-target"); got != 1 {
 		t.Fatalf("steal-target processed count = %d, want 1", got)
+	}
+}
+
+// TestFreshRecoveryDoesNotCauseCrossNodeClaimStorm preserves the production
+// incident where every node scanned the same global pending set. The Raft FSM
+// protected correctness, but followers repeatedly submitted duplicate claims
+// and consumed most of the cluster on rejected work. Fresh recovery work has
+// one normal scanner (the leader); followers may only cross-node steal after
+// the age threshold.
+func TestFreshRecoveryDoesNotCauseCrossNodeClaimStorm(t *testing.T) {
+	var rejectedClaims atomic.Int64
+	core := zapcore.NewCore(
+		zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
+		zapcore.AddSync(io.Discard),
+		zap.DebugLevel,
+	)
+	logger := zap.New(core, zap.Hooks(func(entry zapcore.Entry) error {
+		if entry.Message == "failed to claim task" {
+			rejectedClaims.Add(1)
+		}
+		return nil
+	}))
+	tc := newTestClusterWithLogger(t, 3, 40, logger)
+	defer tc.shutdown()
+
+	tc.addTenant("recovery-owner", 120)
+	tc.waitAllocation(10 * time.Second)
+	tc.waitFor(func() bool {
+		for _, nd := range tc.nodes {
+			if nd == nil || nd.Pool().GetStatus()["recovery-owner"] == 0 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "recovery workers on every node")
+
+	const taskCount = 120
+	tasks := make([]raftpkg.CreateTaskData, taskCount)
+	for i := range tasks {
+		tasks[i] = raftpkg.CreateTaskData{
+			TaskID:   fmt.Sprintf("fresh-recovery-%d", i),
+			TenantID: "recovery-owner",
+			Payload:  `"raft-only-pending"`,
+		}
+	}
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader while creating recovery backlog")
+	}
+	cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: tasks})
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(cmd, 10*time.Second).Error(); err != nil {
+		t.Fatalf("create fresh recovery backlog: %v", err)
+	}
+
+	tc.waitFor(func() bool {
+		for _, task := range tasks {
+			result := tc.fsms().GetResult(task.TaskID)
+			if result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 15*time.Second, "fresh recovery backlog drained")
+	for _, task := range tasks {
+		if count := tc.proc.processedTaskCount(task.TaskID); count != 1 {
+			t.Errorf("recovery task %s processed %d times, want once", task.TaskID, count)
+		}
+	}
+	if got := rejectedClaims.Load(); got != 0 {
+		t.Fatalf("fresh recovery generated %d rejected claims, want 0", got)
 	}
 }
 
