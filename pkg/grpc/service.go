@@ -69,9 +69,6 @@ func (s *Service) Submit(ctx context.Context, req *grpcv1.SubmitRequest) (*grpcv
 	if req.TenantId == "" {
 		return nil, status.Error(codes.InvalidArgument, "tenant_id is required")
 	}
-	if _, ok := s.fsm.GetTenant(req.TenantId); !ok {
-		return nil, status.Error(codes.NotFound, "tenant not found: "+req.TenantId)
-	}
 	if !s.raft.IsLeader() {
 		client, err := s.leaderClient()
 		if err != nil {
@@ -80,6 +77,12 @@ func (s *Service) Submit(ctx context.Context, req *grpcv1.SubmitRequest) (*grpcv
 		forwardCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		return client.Submit(forwardCtx, req)
+	}
+	// Validate tenant state on the leader only. Followers can briefly lag the
+	// replicated tenant snapshot, so checking here before forwarding would
+	// incorrectly reject otherwise valid submissions with a transient 404.
+	if _, ok := s.fsm.GetTenant(req.TenantId); !ok {
+		return nil, status.Error(codes.NotFound, "tenant not found: "+req.TenantId)
 	}
 
 	taskID := uuid.New().String()
