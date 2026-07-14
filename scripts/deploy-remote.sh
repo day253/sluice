@@ -8,7 +8,9 @@ DEPLOY_DIR="${DEPLOY_DIR:-/home/tiger/Documents/distributed-rate-limiting}"
 RELEASE="${RELEASE:-sluice}"
 NAMESPACE="${NAMESPACE:-default}"
 REGISTRY="${REGISTRY:-localhost:32000}"
-ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-5m}"
+# A 50-replica StatefulSet rolls in ordinal order and routinely needs more
+# than five minutes even when every Pod becomes Ready normally.
+ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-15m}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
