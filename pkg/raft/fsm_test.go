@@ -84,6 +84,29 @@ func TestApplyUpsertTenant_RejectsZeroWorkers(t *testing.T) {
 	}
 }
 
+func TestAllocationBorrowedMirrorPersistsAsCurrentSnapshot(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"node-1": {
+			NodeID:   "node-1",
+			Tenants:  map[string]int{"tenant-a": 8},
+			Borrowed: map[string]int{"tenant-a": 3},
+		},
+	})
+
+	allocation, ok := fsm.GetAllocation("node-1")
+	if !ok || allocation.Tenants["tenant-a"] != 8 || allocation.Borrowed["tenant-a"] != 3 {
+		t.Fatalf("allocation mirror = %+v, want effective=8 borrowed=3", allocation)
+	}
+	// Accessors must return a copy so a UI/API caller cannot mutate replicated
+	// state while inspecting the current mirror.
+	allocation.Borrowed["tenant-a"] = 99
+	again, _ := fsm.GetAllocation("node-1")
+	if again.Borrowed["tenant-a"] != 3 {
+		t.Fatalf("borrowed mirror was mutated through accessor: %+v", again)
+	}
+}
+
 func TestApplyDeleteTenant(t *testing.T) {
 	fsm := newTestFSM(t)
 	applyCmd(t, fsm, OpUpsertTenant, types.TenantConfig{ID: "t1", MaxWorkers: 10})

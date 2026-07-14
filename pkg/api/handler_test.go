@@ -356,7 +356,11 @@ func TestGetAllocations(t *testing.T) {
 	router := newRouter(h)
 
 	applyOp(fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
-		"n1": {NodeID: "n1", Tenants: map[string]int{"company-a": 50}},
+		"n1": {
+			NodeID:   "n1",
+			Tenants:  map[string]int{"company-a": 53},
+			Borrowed: map[string]int{"company-a": 3},
+		},
 	})
 
 	req := httptest.NewRequest("GET", "/api/v1/admin/allocations", nil)
@@ -365,6 +369,13 @@ func TestGetAllocations(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("allocations: status = %d, want 200", rec.Code)
+	}
+	var response types.AllocationResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode allocations: %v", err)
+	}
+	if len(response.Nodes) != 1 || response.Nodes[0].Borrowed["company-a"] != 3 {
+		t.Fatalf("allocation borrowed mirror = %+v, want company-a=3", response.Nodes)
 	}
 }
 

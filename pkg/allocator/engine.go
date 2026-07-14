@@ -15,6 +15,9 @@ package allocator
 import (
 	"context"
 	"encoding/json"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +37,10 @@ const (
 	// one reconciliation cycle. Demo tasks finish in milliseconds, so 30 s
 	// leaves ample headroom while keeping rollout recovery observable.
 	taskClaimLease = 30 * time.Second
+	// borrowProbeStep is the initial additive probe for a single backlogged
+	// tenant using otherwise spare cluster capacity. Later probes double the
+	// previous target (1, 3, 7, ...), bounded by the actual spare capacity.
+	borrowProbeStep = 1
 )
 
 // ---------------------------------------------------------------------------
@@ -55,6 +62,11 @@ type Engine struct {
 	// per-tenant idle tracking (leader-local, not replicated)
 	idleCycles map[string]int // tenantID → consecutive cycles with 0 inflight
 
+	// Borrowed targets are controller state, not historical data. The current
+	// effective allocation and borrowed portion are replicated in the FSM, but
+	// a new leader starts probing from the configured limits again.
+	borrowedTargets map[string]int // tenantID → borrowed workers
+
 	// configuration
 	minWorkersPerTenant int
 }
@@ -72,6 +84,7 @@ func NewEngine(
 		raft:                raft,
 		logger:              logger,
 		idleCycles:          make(map[string]int),
+		borrowedTargets:     make(map[string]int),
 		minWorkersPerTenant: 1,
 	}
 }
@@ -90,6 +103,7 @@ func (e *Engine) SetLeader(leader bool) {
 		e.logger.Info("allocator: became leader — will run reconciliation")
 		// Reset idle tracking on leadership change.
 		e.idleCycles = make(map[string]int)
+		e.borrowedTargets = make(map[string]int)
 	}
 }
 
@@ -180,10 +194,23 @@ func (e *Engine) Reconcile() error {
 	// 6. Apply idle penalty and redistribute released workers.
 	finalAlloc := e.applyIdleAdjustment(tenantList, baseAlloc, idleSet)
 
-	// 7. Distribute each tenant's workers across active nodes.
-	nodeAllocs := e.distributeAcrossNodes(finalAlloc, activeNodes)
+	// 7. If exactly one tenant still has pending work, let it probe spare
+	// capacity above its configured limit. The moment another tenant has
+	// pending work, borrowed workers are released so normal quotas are
+	// restored in this same reconciliation cycle.
+	finalAlloc, borrowed := e.applyBorrowing(
+		tenantList,
+		finalAlloc,
+		totalClusterWorkers,
+		inflightCount,
+		e.fsm.CountPendingPerTenant(),
+		idleSet,
+	)
 
-	// 8. Write to Raft.
+	// 8. Distribute each tenant's effective and borrowed workers across nodes.
+	nodeAllocs := e.distributeAcrossNodesWithBorrowed(finalAlloc, borrowed, activeNodes)
+
+	// 9. Write to Raft.
 	allocMap := make(map[string]*types.NodeAllocation, len(nodeAllocs))
 	for _, na := range nodeAllocs {
 		allocMap[na.NodeID] = na
@@ -218,6 +245,7 @@ func (e *Engine) Reconcile() error {
 		zap.Int("idle_tenants", idleCount),
 		zap.Strings("idle_examples", idleNames),
 		zap.Int("total_workers", totalClusterWorkers),
+		zap.Int("borrowed_workers", sumWorkers(borrowed)),
 	)
 	return nil
 }
@@ -331,6 +359,98 @@ func (e *Engine) applyIdleAdjustment(
 	return final
 }
 
+// applyBorrowing applies the adaptive idle-capacity policy after normal
+// fairness and idle redistribution. A tenant may exceed MaxWorkers only when
+// it is the sole tenant with work and has pending backlog. Its borrowed target
+// ramps as 1,3,7,... workers on successive reconciliation cycles, bounded by
+// the currently unused cluster capacity. As soon as another tenant has work,
+// all borrowed workers are released in one cycle; every tenant then receives
+// only its normal fair/idle-adjusted allocation.
+//
+// The release decision includes inflight work: even if a newly submitted
+// task has already been claimed, its tenant is considered active and causes a
+// borrowed tenant to give capacity back. A tenant with only inflight work and
+// no pending backlog does not receive new borrowed workers.
+func (e *Engine) applyBorrowing(
+	tenants []*types.TenantConfig,
+	allocation map[string]int,
+	totalWorkers int,
+	unfinished map[string]int,
+	pending map[string]int,
+	idleSet map[string]bool,
+) (map[string]int, map[string]int) {
+	effective := make(map[string]int, len(allocation))
+	for tenantID, count := range allocation {
+		effective[tenantID] = count
+	}
+	borrowed := make(map[string]int)
+	if e.borrowedTargets == nil {
+		e.borrowedTargets = make(map[string]int)
+	}
+
+	active := make([]string, 0, 1)
+	known := make(map[string]struct{}, len(tenants))
+	for _, tenant := range tenants {
+		known[tenant.ID] = struct{}{}
+		if unfinished[tenant.ID] > 0 && !idleSet[tenant.ID] {
+			active = append(active, tenant.ID)
+		} else {
+			delete(e.borrowedTargets, tenant.ID)
+		}
+	}
+	for tenantID := range e.borrowedTargets {
+		if _, ok := known[tenantID]; !ok {
+			delete(e.borrowedTargets, tenantID)
+		}
+	}
+
+	// More than one tenant has work: release borrowed capacity
+	// immediately. This is the fast-reaction side of the controller.
+	if len(active) != 1 {
+		for _, tenantID := range active {
+			delete(e.borrowedTargets, tenantID)
+		}
+		return effective, borrowed
+	}
+
+	tenantID := active[0]
+	if pending[tenantID] <= 0 {
+		delete(e.borrowedTargets, tenantID)
+		return effective, borrowed
+	}
+	spare := totalWorkers - sumWorkers(effective)
+	if spare <= 0 {
+		delete(e.borrowedTargets, tenantID)
+		return effective, borrowed
+	}
+
+	previous := e.borrowedTargets[tenantID]
+	target := borrowProbeStep
+	if previous > 0 {
+		target = previous*2 + borrowProbeStep
+	}
+	if target > spare {
+		target = spare
+	}
+	if target <= 0 {
+		delete(e.borrowedTargets, tenantID)
+		return effective, borrowed
+	}
+
+	e.borrowedTargets[tenantID] = target
+	effective[tenantID] += target
+	borrowed[tenantID] = target
+	return effective, borrowed
+}
+
+func sumWorkers(workers map[string]int) int {
+	total := 0
+	for _, count := range workers {
+		total += count
+	}
+	return total
+}
+
 // ---------------------------------------------------------------------------
 // Max-min fairness algorithm
 // ---------------------------------------------------------------------------
@@ -403,34 +523,54 @@ func (e *Engine) maxMinFairness(tenants []*types.TenantConfig, total int) map[st
 // ---------------------------------------------------------------------------
 
 // distributeAcrossNodes takes a per-tenant worker count and spreads it
-// evenly across all active nodes.
+// evenly across all active nodes. It is retained as a small compatibility
+// wrapper for callers and tests that do not need borrowed metadata.
 func (e *Engine) distributeAcrossNodes(
 	tenantAlloc map[string]int,
+	nodes []*types.NodeInfo,
+) []*types.NodeAllocation {
+	return e.distributeAcrossNodesWithBorrowed(tenantAlloc, nil, nodes)
+}
+
+// distributeAcrossNodesWithBorrowed spreads effective and borrowed worker
+// counts using the same deterministic split. Borrowed is a current snapshot
+// field for observability; workers enforce only the effective Tenants count.
+func (e *Engine) distributeAcrossNodesWithBorrowed(
+	tenantAlloc map[string]int,
+	borrowedAlloc map[string]int,
 	nodes []*types.NodeInfo,
 ) []*types.NodeAllocation {
 	nodeCount := len(nodes)
 	result := make([]*types.NodeAllocation, nodeCount)
 	for i, n := range nodes {
 		result[i] = &types.NodeAllocation{
-			NodeID:  n.ID,
-			Tenants: make(map[string]int, len(tenantAlloc)),
+			NodeID:   n.ID,
+			Tenants:  make(map[string]int, len(tenantAlloc)),
+			Borrowed: make(map[string]int, len(borrowedAlloc)),
 		}
 	}
 
-	for tenantID, total := range tenantAlloc {
-		perNode := total / nodeCount
-		remainder := total % nodeCount
-
-		for i, na := range result {
-			count := perNode
-			if i < remainder {
-				count++
+	distribute := func(values map[string]int, field func(*types.NodeAllocation) map[string]int) {
+		for tenantID, total := range values {
+			if total <= 0 {
+				continue
 			}
-			if count > 0 {
-				na.Tenants[tenantID] = count
+			perNode := total / nodeCount
+			remainder := total % nodeCount
+
+			for i, na := range result {
+				count := perNode
+				if i < remainder {
+					count++
+				}
+				if count > 0 {
+					field(na)[tenantID] = count
+				}
 			}
 		}
 	}
+	distribute(tenantAlloc, func(na *types.NodeAllocation) map[string]int { return na.Tenants })
+	distribute(borrowedAlloc, func(na *types.NodeAllocation) map[string]int { return na.Borrowed })
 
 	return result
 }
@@ -446,7 +586,32 @@ func (e *Engine) activeNodes(nodes map[string]*types.NodeInfo) []*types.NodeInfo
 			active = append(active, n)
 		}
 	}
+	sort.Slice(active, func(i, j int) bool { return nodeIDLess(active[i].ID, active[j].ID) })
 	return active
+}
+
+// nodeIDLess keeps allocation placement stable while treating the usual
+// node-2/node-10 suffixes numerically. IDs without a numeric suffix fall back
+// to a lexical comparison.
+func nodeIDLess(left, right string) bool {
+	leftPrefix, leftNum, leftOK := splitNodeID(left)
+	rightPrefix, rightNum, rightOK := splitNodeID(right)
+	if leftOK && rightOK && leftPrefix != rightPrefix {
+		return leftPrefix < rightPrefix
+	}
+	if leftOK && rightOK && leftNum != rightNum {
+		return leftNum < rightNum
+	}
+	return left < right
+}
+
+func splitNodeID(id string) (string, int, bool) {
+	idx := strings.LastIndexByte(id, '-')
+	if idx < 0 || idx == len(id)-1 {
+		return id, 0, false
+	}
+	n, err := strconv.Atoi(id[idx+1:])
+	return id[:idx], n, err == nil
 }
 
 func (e *Engine) tenantList(tenants map[string]*types.TenantConfig) []*types.TenantConfig {

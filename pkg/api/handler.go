@@ -231,20 +231,12 @@ func (h *Handler) listNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) getAllocations(w http.ResponseWriter, r *http.Request) {
-	resp, err := h.svc.ClusterStatus(r.Context(), &grpcv1.ClusterStatusRequest{})
-	if err != nil {
-		h.writeGRPCError(w, err)
-		return
+	allocations, tenants := h.svc.AllocationSnapshot()
+	nodes := make([]*types.NodeAllocation, 0, len(allocations))
+	for _, allocation := range allocations {
+		nodes = append(nodes, allocation)
 	}
-	nodes := make([]*types.NodeAllocation, 0, len(resp.Allocations))
-	for _, na := range resp.Allocations {
-		n := &types.NodeAllocation{NodeID: na.NodeId, Tenants: make(map[string]int)}
-		for _, t := range na.Tenants {
-			n.Tenants[t.TenantId] = int(t.Workers)
-		}
-		nodes = append(nodes, n)
-	}
-	h.writeJSON(w, http.StatusOK, types.AllocationResponse{Nodes: nodes})
+	h.writeJSON(w, http.StatusOK, types.AllocationResponse{Nodes: nodes, Tenants: tenants})
 }
 
 // ---------------------------------------------------------------------------

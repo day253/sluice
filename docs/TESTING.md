@@ -30,3 +30,12 @@ Recent submission regressions are covered by:
   `test/integration.TestHTTPBatchSubmitThroughFollower` (unit/integration):
   batch submission persists multiple tasks in one Raft log entry while
   preserving the follower forwarding path.
+- `pkg/allocator.TestApplyBorrowing_ProbesSpareCapacityExponentially`,
+  `pkg/allocator.TestApplyBorrowing_ReleasesImmediatelyWhenAnotherTenantBacklogs`,
+  and `pkg/raft.TestAllocationBorrowedMirrorPersistsAsCurrentSnapshot` (unit):
+  adaptive borrowing ramps only within spare capacity, releases on a second
+  tenant's backlog, and keeps the current borrowed mirror isolated from
+  caller mutation.
+- `test/integration.TestAdaptiveIdleBorrowing` (integration): a real two-node
+  cluster lets one low-quota tenant borrow idle workers, then verifies the
+  borrowed allocation is removed when another tenant submits queued work.

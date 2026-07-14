@@ -835,6 +835,67 @@ func TestDynamicTenant(t *testing.T) {
 	}
 }
 
+// TestAdaptiveIdleBorrowing verifies the end-to-end controller behavior:
+// one backlogged tenant can probe above its configured limit while the
+// cluster is otherwise idle, and the borrowed workers are released as soon
+// as a second tenant presents queued work.
+func TestAdaptiveIdleBorrowing(t *testing.T) {
+	tc := newTestCluster(t, 2, 5) // 10 total workers
+	defer tc.shutdown()
+
+	tc.addTenant("borrower", 1)
+	tc.addTenant("other", 1)
+	tc.waitFor(func() bool {
+		allocations := tc.fsms().GetAllAllocations()
+		tenantEntries := 0
+		for _, allocation := range allocations {
+			tenantEntries += len(allocation.Tenants)
+		}
+		return len(allocations) == 2 && tenantEntries >= 2
+	}, 10*time.Second, "adaptive allocation mirror")
+
+	createBacklog := func(tenantID, prefix string, count int) {
+		t.Helper()
+		leader := tc.leaderIdx()
+		if leader < 0 {
+			t.Fatal("no leader while creating backlog")
+		}
+		tasks := make([]raftpkg.CreateTaskData, count)
+		for i := range tasks {
+			tasks[i] = raftpkg.CreateTaskData{
+				TaskID:   fmt.Sprintf("%s-%d", prefix, i),
+				TenantID: tenantID,
+				Payload:  `"adaptive-borrowing"`,
+			}
+		}
+		cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: tasks})
+		if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(cmd, 10*time.Second).Error(); err != nil {
+			t.Fatalf("create %s backlog: %v", tenantID, err)
+		}
+	}
+
+	// The first tenant has enough pending work to keep a probe meaningful
+	// through several 3-second allocator cycles.
+	createBacklog("borrower", "borrower-task", 2000)
+	tc.waitFor(func() bool {
+		borrowed := 0
+		for _, allocation := range tc.fsms().GetAllAllocations() {
+			borrowed += allocation.Borrowed["borrower"]
+		}
+		return borrowed > 0
+	}, 12*time.Second, "borrowed workers for sole backlogged tenant")
+
+	createBacklog("other", "other-task", 2000)
+	tc.waitFor(func() bool {
+		for _, allocation := range tc.fsms().GetAllAllocations() {
+			if allocation.Borrowed["borrower"] != 0 {
+				return false
+			}
+		}
+		return true
+	}, 8*time.Second, "borrowed workers released for second tenant")
+}
+
 // TestOversubscription verifies the max-min fairness allocation when the sum
 // of all tenant limits exceeds the total cluster capacity.
 func TestOversubscription(t *testing.T) {

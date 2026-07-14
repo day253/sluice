@@ -24,6 +24,7 @@ func newTestEngine(fsm *raftpkg.FSM) *Engine {
 		fsm:                 fsm,
 		logger:              zap.NewNop(),
 		idleCycles:          make(map[string]int),
+		borrowedTargets:     make(map[string]int),
 		minWorkersPerTenant: 1,
 	}
 }
@@ -251,6 +252,117 @@ func TestApplyIdleAdjustment_AllIdle(t *testing.T) {
 
 	if final["a"] != 1 || final["b"] != 1 {
 		t.Errorf("all-idle: expected {a:1, b:1}, got {a:%d, b:%d}", final["a"], final["b"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive idle-capacity borrowing
+// ---------------------------------------------------------------------------
+
+func TestApplyBorrowing_ProbesSpareCapacityExponentially(t *testing.T) {
+	e := newTestEngine(nil)
+	tenants := []*types.TenantConfig{
+		{ID: "small", MaxWorkers: 1},
+		{ID: "idle", MaxWorkers: 1},
+	}
+	base := map[string]int{"small": 1, "idle": 1}
+	idleSet := map[string]bool{"idle": true}
+
+	first, borrowed := e.applyBorrowing(tenants, base, 20, map[string]int{"small": 100}, map[string]int{"small": 100}, idleSet)
+	if first["small"] != 2 || borrowed["small"] != 1 {
+		t.Fatalf("first probe = effective %d borrowed %d, want 2/1", first["small"], borrowed["small"])
+	}
+	second, borrowed := e.applyBorrowing(tenants, base, 20, map[string]int{"small": 100}, map[string]int{"small": 100}, idleSet)
+	if second["small"] != 4 || borrowed["small"] != 3 {
+		t.Fatalf("second probe = effective %d borrowed %d, want 4/3", second["small"], borrowed["small"])
+	}
+	third, borrowed := e.applyBorrowing(tenants, base, 20, map[string]int{"small": 100}, map[string]int{"small": 100}, idleSet)
+	if third["small"] != 8 || borrowed["small"] != 7 {
+		t.Fatalf("third probe = effective %d borrowed %d, want 8/7", third["small"], borrowed["small"])
+	}
+	if sumWorkers(third) > 20 {
+		t.Fatalf("probe exceeded cluster capacity: %d > 20", sumWorkers(third))
+	}
+}
+
+func TestApplyBorrowing_ReleasesImmediatelyWhenAnotherTenantBacklogs(t *testing.T) {
+	e := newTestEngine(nil)
+	e.borrowedTargets["small"] = 7
+	tenants := []*types.TenantConfig{
+		{ID: "small", MaxWorkers: 1},
+		{ID: "other", MaxWorkers: 1},
+	}
+	base := map[string]int{"small": 1, "other": 1}
+	effective, borrowed := e.applyBorrowing(
+		tenants, base, 20,
+		map[string]int{"small": 100, "other": 1},
+		map[string]int{"small": 100, "other": 1},
+		map[string]bool{},
+	)
+	if len(borrowed) != 0 {
+		t.Fatalf("borrowed allocation = %v, want empty", borrowed)
+	}
+	if effective["small"] != 1 || effective["other"] != 1 {
+		t.Fatalf("effective allocation = %v, want configured base", effective)
+	}
+	if _, ok := e.borrowedTargets["small"]; ok {
+		t.Fatal("borrow target was not released")
+	}
+}
+
+func TestApplyBorrowing_DoesNotProbeWithoutPendingBacklog(t *testing.T) {
+	e := newTestEngine(nil)
+	e.borrowedTargets["small"] = 7
+	tenants := []*types.TenantConfig{{ID: "small", MaxWorkers: 1}}
+	effective, borrowed := e.applyBorrowing(
+		tenants,
+		map[string]int{"small": 1},
+		20,
+		map[string]int{"small": 1}, // one task is already inflight
+		map[string]int{},              // no queued work remains
+		map[string]bool{},
+	)
+	if len(borrowed) != 0 || effective["small"] != 1 {
+		t.Fatalf("inflight-only allocation = effective %v borrowed %v, want 1/no borrow", effective, borrowed)
+	}
+	if _, ok := e.borrowedTargets["small"]; ok {
+		t.Fatal("stale borrow target was retained without pending backlog")
+	}
+}
+
+func TestDistributeAcrossNodesWithBorrowed_PreservesCurrentMirror(t *testing.T) {
+	e := newTestEngine(nil)
+	result := e.distributeAcrossNodesWithBorrowed(
+		map[string]int{"small": 9},
+		map[string]int{"small": 7},
+		[]*types.NodeInfo{{ID: "node-1"}, {ID: "node-2"}},
+	)
+	if len(result) != 2 {
+		t.Fatalf("nodes = %d, want 2", len(result))
+	}
+	effective, borrowed := 0, 0
+	for _, allocation := range result {
+		effective += allocation.Tenants["small"]
+		borrowed += allocation.Borrowed["small"]
+	}
+	if effective != 9 || borrowed != 7 {
+		t.Fatalf("distributed effective/borrowed = %d/%d, want 9/7", effective, borrowed)
+	}
+}
+
+func TestActiveNodes_SortedByID(t *testing.T) {
+	e := newTestEngine(nil)
+	active := e.activeNodes(map[string]*types.NodeInfo{
+		"node-10": {ID: "node-10", Status: types.NodeStatusUp},
+		"node-2":  {ID: "node-2", Status: types.NodeStatusUp},
+		"node-1":  {ID: "node-1", Status: types.NodeStatusUp},
+	})
+	got := []string{active[0].ID, active[1].ID, active[2].ID}
+	want := []string{"node-1", "node-2", "node-10"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("active node order = %v, want %v", got, want)
+		}
 	}
 }
 

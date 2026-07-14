@@ -562,6 +562,10 @@ func (f *FSM) GetAllocation(nodeID string) (*types.NodeAllocation, bool) {
 	for k, v := range a.Tenants {
 		copyA.Tenants[k] = v
 	}
+	copyA.Borrowed = make(map[string]int, len(a.Borrowed))
+	for k, v := range a.Borrowed {
+		copyA.Borrowed[k] = v
+	}
 	return &copyA, true
 }
 
@@ -575,6 +579,10 @@ func (f *FSM) GetAllAllocations() map[string]*types.NodeAllocation {
 		copyV.Tenants = make(map[string]int, len(v.Tenants))
 		for tk, tv := range v.Tenants {
 			copyV.Tenants[tk] = tv
+		}
+		copyV.Borrowed = make(map[string]int, len(v.Borrowed))
+		for tk, tv := range v.Borrowed {
+			copyV.Borrowed[tk] = tv
 		}
 		out[k] = &copyV
 	}
@@ -755,6 +763,10 @@ func (f *FSM) copyState() *types.FSMState {
 		copyV.Tenants = make(map[string]int, len(v.Tenants))
 		for tk, tv := range v.Tenants {
 			copyV.Tenants[tk] = tv
+		}
+		copyV.Borrowed = make(map[string]int, len(v.Borrowed))
+		for tk, tv := range v.Borrowed {
+			copyV.Borrowed[tk] = tv
 		}
 		s.Allocations[k] = &copyV
 	}

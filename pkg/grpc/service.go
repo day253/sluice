@@ -319,6 +319,13 @@ func (s *Service) ClusterStatus(ctx context.Context, req *grpcv1.ClusterStatusRe
 	return resp, nil
 }
 
+// AllocationSnapshot exposes the current allocation mirror for the REST
+// adapter. The effective worker counts and borrowed counts are current FSM
+// state, not historical data; callers that need history should use metrics.
+func (s *Service) AllocationSnapshot() (map[string]*types.NodeAllocation, map[string]*types.TenantConfig) {
+	return s.fsm.GetAllAllocations(), s.fsm.GetAllTenants()
+}
+
 func (s *Service) Health(ctx context.Context, req *grpcv1.HealthRequest) (*grpcv1.HealthResponse, error) {
 	return &grpcv1.HealthResponse{
 		Status: "ok", NodeId: s.nodeID, Leader: s.raft.LeaderAddr(),

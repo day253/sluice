@@ -42,7 +42,7 @@ type NodeInfo struct {
 type TenantConfig struct {
 	ID         string    `json:"id"`
 	Name       string    `json:"name"`
-	MaxWorkers int       `json:"max_workers"` // maximum concurrent workers for this tenant
+	MaxWorkers int       `json:"max_workers"` // normal guaranteed concurrent workers; idle borrowing may exceed it
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
@@ -53,8 +53,9 @@ type TenantConfig struct {
 
 // NodeAllocation maps how many workers a single node should run per tenant.
 type NodeAllocation struct {
-	NodeID  string         `json:"node_id"`
-	Tenants map[string]int `json:"tenants"` // tenantID → worker count
+	NodeID   string         `json:"node_id"`
+	Tenants  map[string]int `json:"tenants"`            // tenantID → effective worker count
+	Borrowed map[string]int `json:"borrowed,omitempty"` // tenantID → workers above max_workers
 }
 
 // ---------------------------------------------------------------------------

@@ -145,3 +145,22 @@ task/s = 1 / (2 × RaftCommitLatency + ProcessTime)
 短作业优先排序，再以最多 128 条为一批提交 `OpClaimBatch`；节点上的多个
 worker 并发执行，ResultStream 以同样的批量窗口提交 `OpCompleteBatch`。
 未提供估时的任务在未知任务之间保持 FIFO，避免旧客户端行为改变。
+
+### 5.2 空闲容量借用
+
+`max_workers` 是租户的正常保底配额，不是集群空闲时的硬上限。Allocator
+先完成 Max-Min Fairness 和 idle redistribution，再查看 FSM 的 pending 数：
+
+```text
+只有 borrower 有任务且仍有 pending backlog:
+  borrowed target = 1 → 3 → 7 → ... ≤ spare cluster workers
+
+出现第二个 tenant 的任务（pending 或 inflight）:
+  borrowed target = 0（当前 reconciliation 周期内立即回收）
+```
+
+这样单租户低配额、其他租户空闲时可以逐步吃满剩余并发；新租户有任务时，
+借用 worker 不会继续挤占其保底配额。`NodeAllocation.Tenants` 和
+`NodeAllocation.Borrowed` 只保存当前镜像，借用的变化不产生额外历史写入，
+因此每轮仍只有一条 `OpUpdateAllocation` Raft 日志。Leader 切换会丢弃试探
+控制器的内存目标并从保底配额重新探测，换取更安全的故障恢复边界。

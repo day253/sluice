@@ -97,7 +97,7 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
     <div class="form-grid">
       <div class="field"><label for="tenant-id">Tenant ID</label><input id="tenant-id" required placeholder="e.g. acme-corp"></div>
       <div class="field"><label for="tenant-name">Display name</label><input id="tenant-name" placeholder="Optional"></div>
-      <div class="field"><label for="tenant-limit">Maximum concurrent workers</label><input id="tenant-limit" type="number" min="1" max="100000" value="50" required></div>
+    <div class="field"><label for="tenant-limit">Guaranteed worker quota</label><input id="tenant-limit" type="number" min="1" max="100000" value="50" required></div>
     </div>
     <div class="dialog-actions"><button id="delete-tenant" class="btn btn-danger danger-left hidden" type="button">Delete tenant</button><button class="btn btn-secondary" type="button" data-close="tenant-dialog">Cancel</button><button class="btn btn-primary" type="submit">Save tenant</button></div>
   </form>
@@ -121,6 +121,7 @@ const nowTime=()=>new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-dig
 async function getJSON(path,options){const response=await fetch(path,options);if(!response.ok){let message=response.statusText;try{message=(await response.json()).error||message}catch(_){ }throw new Error(message||`Request failed (${response.status})`)}return response.json()}
 function allocationsByNode(){const out={};S.allocations.forEach(node=>out[node.node_id]=node.tenants||{});return out}
 function allocationTotals(){const totals={};S.allocations.forEach(node=>Object.entries(node.tenants||{}).forEach(([id,count])=>totals[id]=(totals[id]||0)+Number(count||0)));return totals}
+function borrowedTotals(){const totals={};S.allocations.forEach(node=>Object.entries(node.borrowed||{}).forEach(([id,count])=>totals[id]=(totals[id]||0)+Number(count||0)));return totals}
 function leaderNode(){const address=S.health?.leader;return S.nodes.find(node=>node.raft_address===address)}
 function addEvent(message){const event={time:nowTime(),message};if(S.events[0]?.message!==message)S.events.unshift(event);S.events=S.events.slice(0,4)}
 
@@ -144,9 +145,9 @@ function renderHeader(){
 }
 
 function renderTenants(){
-  const totals=allocationTotals(),byNode=allocationsByNode();
+  const totals=allocationTotals(),borrowed=borrowedTotals(),byNode=allocationsByNode();
   const tenants=[...S.tenants].sort((a,b)=>(Number(b.max_workers||0)-Number(a.max_workers||0))||String(a.name||a.id).localeCompare(String(b.name||b.id),undefined,{numeric:true,sensitivity:'base'}));
-  $('tenant-list').innerHTML=tenants.map(tenant=>{const allocated=totals[tenant.id]||0,limit=Number(tenant.max_workers||0),rate=limit?Math.min(100,Math.round(allocated/limit*100)):0,inflight=Number(tenant.inflight||0),idle=allocated<=1&&!inflight,state=inflight?'Active':idle?'Idle':'Reserved';const placements=S.nodes.map(node=>({node:shortNode(node.node_id),count:Number(byNode[node.node_id]?.[tenant.id]||0)})).filter(x=>x.count>0);return `<tr data-tenant="${esc(tenant.id)}"><td><div class="tenant-name">${esc(tenant.name||tenant.id)}</div>${tenant.name&&tenant.name!==tenant.id?`<div class="tenant-id">${esc(tenant.id)}</div>`:''}</td><td><span class="state-badge ${inflight?'queued':idle?'idle':''}"><span class="status-dot"></span>${state}</span></td><td>${fmt(limit)}</td><td class="quota-cell"><div class="quota-line"><strong>${fmt(allocated)}</strong><span>${rate}% of limit</span></div><div class="meter"><i style="width:${rate}%"></i></div></td><td><strong>${fmt(inflight)}</strong></td><td><div class="placement">${placements.map(p=>`<span>${esc(p.node)} · ${p.count}</span>`).join('')||'<span>unassigned</span>'}</div></td><td><button class="btn icon-btn load-control" type="button" data-action="load" data-tenant="${esc(tenant.id)}">+ Tasks</button></td></tr>`}).join('')||'<tr><td colspan="7" class="empty">No tenants configured.</td></tr>';
+  $('tenant-list').innerHTML=tenants.map(tenant=>{const allocated=totals[tenant.id]||0,borrowedCount=borrowed[tenant.id]||0,limit=Number(tenant.max_workers||0),rate=limit?Math.min(100,Math.round(allocated/limit*100)):0,inflight=Number(tenant.inflight||0),idle=allocated<=1&&!inflight,state=inflight?'Active':idle?'Idle':'Reserved';const placements=S.nodes.map(node=>({node:shortNode(node.node_id),count:Number(byNode[node.node_id]?.[tenant.id]||0)})).filter(x=>x.count>0);return `<tr data-tenant="${esc(tenant.id)}"><td><div class="tenant-name">${esc(tenant.name||tenant.id)}</div>${tenant.name&&tenant.name!==tenant.id?`<div class="tenant-id">${esc(tenant.id)}</div>`:''}</td><td><span class="state-badge ${inflight?'queued':idle?'idle':''}"><span class="status-dot"></span>${state}</span></td><td>${fmt(limit)}</td><td class="quota-cell"><div class="quota-line"><strong>${fmt(allocated)}</strong><span>${rate}% of limit${borrowedCount?` · +${fmt(borrowedCount)} borrowed`:''}</span></div><div class="meter"><i style="width:${rate}%"></i></div></td><td><strong>${fmt(inflight)}</strong></td><td><div class="placement">${placements.map(p=>`<span>${esc(p.node)} · ${p.count}</span>`).join('')||'<span>unassigned</span>'}</div></td><td><button class="btn icon-btn load-control" type="button" data-action="load" data-tenant="${esc(tenant.id)}">+ Tasks</button></td></tr>`}).join('')||'<tr><td colspan="7" class="empty">No tenants configured.</td></tr>';
 }
 
 function drawSeriesChart(canvasID,legendID,inputSeries,sortByCurrent,colors,emptyLabel){
