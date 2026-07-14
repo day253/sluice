@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 	googlegrpc "google.golang.org/grpc"
@@ -15,6 +16,15 @@ import (
 	"github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/types"
 )
+
+type deadlineSluiceService struct {
+	grpcv1.UnimplementedSluiceServer
+}
+
+func (deadlineSluiceService) SubmitBatch(ctx context.Context, _ *grpcv1.SubmitBatchRequest) (*grpcv1.SubmitBatchResponse, error) {
+	<-ctx.Done()
+	return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
+}
 
 func TestLeaderAPIAddressUsesRegisteredNodeAddress(t *testing.T) {
 	nodes := map[string]*types.NodeInfo{
@@ -91,6 +101,46 @@ func TestSubmitForwardsBeforeFollowerTenantValidation(t *testing.T) {
 	}
 }
 
+func TestSubmitBatchFollowerUsesConfiguredForwardTimeout(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := googlegrpc.NewServer()
+	grpcv1.RegisterSluiceServer(server, deadlineSluiceService{})
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+	})
+
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpNodeUp, types.NodeInfo{
+		ID: "leader", Address: listener.Addr().String(), RaftAddress: "test:7000",
+	})
+	followerRaft := &internalTestRaft{fsm: fsm}
+	follower := NewService("follower", queue.NewMemoryQueue(), fsm, followerRaft, nil, zap.NewNop())
+	follower.submitForwardTimeout = 50 * time.Millisecond
+	t.Cleanup(func() {
+		follower.forwardMu.Lock()
+		if follower.forwardConn != nil {
+			_ = follower.forwardConn.Close()
+		}
+		follower.forwardMu.Unlock()
+	})
+
+	started := time.Now()
+	_, err = follower.SubmitBatch(context.Background(), &grpcv1.SubmitBatchRequest{Tasks: []*grpcv1.SubmitRequest{
+		{TenantId: "tenant-a", Payload: []byte(`{}`)},
+	}})
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("forward timeout error = %v, want DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("configured 50ms forward timeout took %s", elapsed)
+	}
+}
+
 func TestSubmitBatchUsesOneRaftApply(t *testing.T) {
 	fsm := raft.NewFSM(zap.NewNop())
 	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{ID: "tenant-a", MaxWorkers: 10})
@@ -116,6 +166,39 @@ func TestSubmitBatchUsesOneRaftApply(t *testing.T) {
 		if task.GetTaskId() == "" || fsm.GetTask(task.GetTaskId()) == nil {
 			t.Fatalf("batch task was not persisted: %+v", task)
 		}
+	}
+}
+
+func TestSubmitBatchIdempotencyKeysReuseTaskIDs(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{ID: "tenant-a", MaxWorkers: 10})
+	testRaft := &internalTestRaft{fsm: fsm}
+	testRaft.leader.Store(true)
+	q := queue.NewMemoryQueue()
+	svc := NewService("leader", q, fsm, testRaft, nil, zap.NewNop())
+	request := &grpcv1.SubmitBatchRequest{Tasks: []*grpcv1.SubmitRequest{
+		{TenantId: "tenant-a", Payload: []byte(`{"n":1}`), IdempotencyKey: "retry-1"},
+		{TenantId: "tenant-a", Payload: []byte(`{"n":2}`), IdempotencyKey: "retry-2"},
+	}}
+
+	first, err := svc.SubmitBatch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := svc.SubmitBatch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range first.Tasks {
+		if first.Tasks[i].TaskId != second.Tasks[i].TaskId {
+			t.Fatalf("retry task[%d] id changed: %s != %s", i, first.Tasks[i].TaskId, second.Tasks[i].TaskId)
+		}
+	}
+	if got := len(fsm.FindAllPendingTasks()); got != len(request.Tasks) {
+		t.Fatalf("pending tasks after retry = %d, want %d unique tasks", got, len(request.Tasks))
+	}
+	if got, err := q.Len("tenant-a"); err != nil || got != len(request.Tasks) {
+		t.Fatalf("queue hints after retry = %d, err=%v, want %d unique hints", got, err, len(request.Tasks))
 	}
 }
 

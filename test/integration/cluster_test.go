@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,6 +24,7 @@ import (
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/day253/sluice/pkg/node"
 	"github.com/day253/sluice/pkg/queue"
@@ -584,14 +586,14 @@ func TestHTTPSubmitThroughFollower(t *testing.T) {
 	}, 30*time.Second, "HTTP follower task result")
 }
 
-// TestHTTPBatchSubmitThroughFollower verifies the optimized submission path:
-// one HTTP request entering through a follower creates all tasks with one
-// create_task_batch Raft entry and every task is eventually processed.
+// TestHTTPBatchSubmitThroughFollower verifies the maximum-size optimized
+// submission path and SUBMIT-003: a retry after an unknown follower-forward
+// outcome returns the same IDs and cannot create duplicate work.
 func TestHTTPBatchSubmitThroughFollower(t *testing.T) {
-	tc := newTestCluster(t, 2, 20)
+	tc := newTestCluster(t, 2, 100)
 	defer tc.shutdown()
 
-	const taskCount = 24
+	const taskCount = 1000
 	tc.addTenant("batch-http-tenant", taskCount)
 	tc.waitAllocation(10 * time.Second)
 	leader := tc.leaderIdx()
@@ -603,15 +605,17 @@ func TestHTTPBatchSubmitThroughFollower(t *testing.T) {
 	request := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, taskCount)}
 	for i := range request.Tasks {
 		request.Tasks[i] = types.TaskSubmitRequest{
-			TenantID: "batch-http-tenant",
-			Payload:  json.RawMessage(fmt.Sprintf(`{"index":%d}`, i)),
+			TenantID:       "batch-http-tenant",
+			Payload:        json.RawMessage(fmt.Sprintf(`{"index":%d}`, i)),
+			IdempotencyKey: fmt.Sprintf("batch-retry-%d", i),
 		}
 	}
 	body, err := json.Marshal(request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Post(
+	client := &http.Client{Timeout: 70 * time.Second}
+	resp, err := client.Post(
 		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch", "application/json", bytes.NewReader(body),
 	)
 	if err != nil {
@@ -629,6 +633,31 @@ func TestHTTPBatchSubmitThroughFollower(t *testing.T) {
 	if len(result.Tasks) != taskCount {
 		t.Fatalf("batch response tasks = %d, want %d", len(result.Tasks), taskCount)
 	}
+	_ = resp.Body.Close()
+
+	retryResp, err := client.Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch", "application/json", bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("retry batch POST through follower: %v", err)
+	}
+	defer retryResp.Body.Close()
+	if retryResp.StatusCode != http.StatusAccepted {
+		data, _ := io.ReadAll(retryResp.Body)
+		t.Fatalf("retry batch POST status = %d, want 202; body=%s", retryResp.StatusCode, data)
+	}
+	var retryResult types.BatchTaskResponse
+	if err := json.NewDecoder(retryResp.Body).Decode(&retryResult); err != nil {
+		t.Fatalf("decode retry batch response: %v", err)
+	}
+	if len(retryResult.Tasks) != taskCount {
+		t.Fatalf("retry batch response tasks = %d, want %d", len(retryResult.Tasks), taskCount)
+	}
+	for i := range result.Tasks {
+		if result.Tasks[i].TaskID != retryResult.Tasks[i].TaskID {
+			t.Fatalf("retry task[%d] id changed: %s != %s", i, result.Tasks[i].TaskID, retryResult.Tasks[i].TaskID)
+		}
+	}
 	tc.waitProcessed(taskCount, 30*time.Second)
 	for _, task := range result.Tasks {
 		if task.TaskID == "" {
@@ -638,6 +667,9 @@ func TestHTTPBatchSubmitThroughFollower(t *testing.T) {
 			completed := tc.fsms().GetResult(task.TaskID)
 			return completed != nil && completed.Status == types.TaskStatusDone
 		}, 30*time.Second, "batch task completion")
+	}
+	if got := tc.proc.totalProcessed(); got != taskCount {
+		t.Fatalf("idempotent batch retry processed %d tasks, want %d", got, taskCount)
 	}
 }
 
@@ -824,6 +856,65 @@ func TestFreshRecoveryDoesNotCauseCrossNodeClaimStorm(t *testing.T) {
 	}
 	if got := rejectedClaims.Load(); got != 0 {
 		t.Fatalf("fresh recovery generated %d rejected claims, want 0", got)
+	}
+}
+
+// TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery preserves SCHED-003 and
+// RESULT-001. Assignment and completion traffic from all follower streams is
+// aggregated before Raft Apply, so healthy work cannot time out and sit
+// inflight until the 30-second lease repair cycle.
+func TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	tc := newTestClusterWithLogger(t, 7, 60, zap.New(core))
+	defer tc.shutdown()
+
+	const taskCount = 360
+	tc.addTenant("global-batch", taskCount)
+	tc.waitAllocation(10 * time.Second)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader while creating global batching backlog")
+	}
+	tasks := make([]raftpkg.CreateTaskData, taskCount)
+	for i := range tasks {
+		tasks[i] = raftpkg.CreateTaskData{
+			TaskID: fmt.Sprintf("global-batch-%d", i), TenantID: "global-batch", Payload: `{"batch":true}`,
+		}
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: tasks}),
+		10*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("create global batching backlog: %v", err)
+	}
+
+	started := time.Now()
+	tc.waitFor(func() bool {
+		for _, task := range tasks {
+			if result := tc.fsms().GetResult(task.TaskID); result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 15*time.Second, "global assignment/result batches drain before lease recovery")
+	if elapsed := time.Since(started); elapsed >= 30*time.Second {
+		t.Fatalf("backlog drained in %s, crossed the claim lease boundary", elapsed)
+	}
+	for _, task := range tasks {
+		if got := tc.proc.processedTaskCount(task.TaskID); got != 1 {
+			t.Fatalf("global batch task %s processed %d times, want once", task.TaskID, got)
+		}
+	}
+	for _, entry := range logs.All() {
+		fields := entry.ContextMap()
+		errText := fmt.Sprint(fields["error"])
+		if entry.Message == "worker client stream invalidated" &&
+			(strings.Contains(errText, "assignment timeout") || strings.Contains(errText, "completion timeout")) {
+			t.Fatalf("healthy global batch invalidated a worker stream: %s", errText)
+		}
+		if entry.Message == "allocator: expired task claims returned to pending" {
+			t.Fatalf("healthy global batch required claim lease recovery: %+v", fields)
+		}
 	}
 }
 

@@ -18,7 +18,11 @@ import (
 	"github.com/day253/sluice/pkg/types"
 )
 
-const workerStreamTimeout = 5 * time.Second
+// A global assignment/result batch may include every execution node and one
+// Raft round trip. Keep this above the normal 5s apply budget so a healthy,
+// large voter set does not abandon already committed work and wait for lease
+// recovery merely because the response arrives just after Apply completes.
+const workerStreamTimeout = 15 * time.Second
 
 // ClaimClient owns the worker-to-leader claim and result streams. Both
 // streams are replaced together whenever leadership or connectivity changes.

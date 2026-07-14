@@ -41,6 +41,8 @@ type Service struct {
 	pool   *worker.Pool
 	logger *zap.Logger
 
+	submitForwardTimeout time.Duration
+
 	forwardMu     sync.Mutex
 	forwardAddr   string
 	forwardConn   *googlegrpc.ClientConn
@@ -58,6 +60,7 @@ func NewService(
 	return &Service{
 		nodeID: nodeID, queue: q, fsm: fsm,
 		raft: raft, pool: pool, logger: logger,
+		submitForwardTimeout: 60 * time.Second,
 	}
 }
 
@@ -93,7 +96,7 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 		if err != nil {
 			return nil, status.Error(codes.Unavailable, err.Error())
 		}
-		forwardCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		forwardCtx, cancel := context.WithTimeout(ctx, s.submitForwardTimeout)
 		defer cancel()
 		return client.SubmitBatch(forwardCtx, req)
 	}
@@ -110,6 +113,11 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 			return nil, status.Error(codes.NotFound, "tenant not found: "+item.TenantId)
 		}
 		taskID := uuid.New().String()
+		if item.IdempotencyKey != "" {
+			// Stable IDs turn an unknown follower-forward outcome into a safe
+			// retry while the task/result remains in the bounded FSM window.
+			taskID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(item.TenantId+"\x00"+item.IdempotencyKey)).String()
+		}
 		create[i] = raftpkg.CreateTaskData{
 			TaskID:      taskID,
 			TenantID:    item.TenantId,
@@ -120,11 +128,23 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 	}
 
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: create})
-	if err := s.raft.Apply(cmd, 5000).Error(); err != nil {
+	result := s.raft.Apply(cmd, 5000)
+	if err := result.Error(); err != nil {
 		s.logger.Error("submit batch raft apply failed", zap.Error(err), zap.Int("tasks", len(create)))
 		return nil, status.Error(codes.Internal, "failed to create task batch")
 	}
+	createdResult, ok := result.Response().(*raftpkg.CreateTaskBatchResult)
+	if !ok {
+		return nil, status.Error(codes.Internal, "create task batch returned an invalid response")
+	}
+	created := make(map[string]struct{}, len(createdResult.Created))
+	for _, taskID := range createdResult.Created {
+		created[taskID] = struct{}{}
+	}
 	for i, item := range req.Tasks {
+		if _, ok := created[create[i].TaskID]; !ok {
+			continue
+		}
 		// Also enqueue locally so local workers pick tasks up quickly
 		// (best-effort); the batch Raft entry remains the durable source.
 		_ = s.queue.Enqueue(item.TenantId, &queue.TaskEnvelope{

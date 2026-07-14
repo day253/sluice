@@ -20,7 +20,7 @@
          b. preferred tenant 的任意节点队列
          c. 本节点其他 tenant
          d. 已等待超过 5s 的任意 tenant（work steal）
-4. 批量: Leader 按节点流聚批(5ms/128条) → raft.Apply(OpClaimBatch)
+4. 批量: Leader 跨所有节点流全局聚批(5ms/最多2048条) → raft.Apply(OpClaimBatch)
          原子提交 task: pending→inflight、NodeID=执行节点
 5. 返回: Leader → AssignmentStream → 已提交的 task_id/tenant/payload
 6. 执行: Follower Worker 只处理 Leader 返回的已提交任务
@@ -79,7 +79,7 @@ Allocator (Leader, 每 3s):
 Follower workers                         Leader
      │                                     │
      │──Assignment(node, preferred)───────►│  每个请求代表一个空闲槽位
-     │──Assignment(node, preferred)───────►│  按节点流聚批 5ms / 128
+     │──Assignment(node, preferred)───────►│  跨全部节点流全局聚批 5ms / 2048
      │                                     │  从全局 FIFO pending 中选不同 task
      │                                     │  raft.Apply(OpClaimBatch)
      │                                     │  pending→inflight + execution NodeID
@@ -88,10 +88,16 @@ Follower workers                         Leader
      │──ResultStream───────────────────────►│  raft.Apply(OpCompleteBatch)
 ```
 
-跨节点的 AssignmentStream 共享 Leader 进程内的选择临界区，保证“读 pending、选不同
-task、提交 ClaimBatch”不会被另一个节点流交叉重复选择。Raft FSM 仍保留最终防线：若
-状态已变化，未成功 claim 的任务不会返回给 Worker。响应丢失时任务保持 inflight，30 秒
-lease 到期后由 Leader 重新放回 pending。
+Leader 只有一个 Assignment dispatcher：来自所有节点流的空闲槽位先进入同一 5ms
+窗口，最多 2048 条请求只读一次 pending/allocation 并提交一条 `OpClaimBatch`。提交结果
+再路由回原节点流，每条流按 5ms/128 条合并响应。这样 Raft 往返次数随总吞吐增长，而不
+随节点流数量线性增长；也保证“读 pending、选不同 task、提交 ClaimBatch”不会被另一个
+节点流交叉重复选择。ResultStream 同样使用跨所有节点流的全局 dispatcher，把完成状态
+合并为 `OpCompleteBatch`，避免大量节点分别提交完成日志。
+
+Raft FSM 仍保留最终防线：若状态已变化，未成功 claim 的任务不会返回给 Worker。响应
+丢失时任务保持 inflight，30 秒 lease 到期后由 Leader 重新放回 pending。Worker 流等待
+上限为 15 秒，高于正常 5 秒 Raft Apply 预算；超时仍只触发重连，不允许回退自发 Claim。
 
 `ClaimStream` 保留为滚动升级兼容路径：新 Worker 连接不支持 AssignmentStream 的旧
 Leader 时才退回旧 Claim 协议；连接支持新协议的 Leader 后，不允许因超时回退到自发
@@ -130,6 +136,18 @@ HTTP REST:
 
 所有节点可接任务（OpCreateTask）、可查询（FSM 本地读）。
 只有 Leader 执行 Raft Apply（claim/complete/allocation）。
+
+### 批量提交、转发与幂等边界
+
+- `SubmitBatch` 最多接收 1000 条任务，只写一条 `OpCreateTaskBatch` Raft 日志。
+- Follower 把完整请求转发给 Leader，转发窗口为 60 秒，覆盖大 voter 集群的正常提交
+  延迟；客户端自己的更短 deadline 仍优先。
+- 携带非空 `idempotency_key` 时，任务 ID 由 `tenant_id + idempotency_key` 稳定生成。
+  请求结果未知后用相同键重试，会返回相同 task ID；FSM 已存在 unfinished task 或仍保留
+  completed result 时不会重复插入任务，也不会追加重复的本地 Queue hint。
+- 幂等去重窗口与查询结果窗口一致：当前保留最近 10000 个完成结果。结果淘汰后再次使用
+  同一键不保证去重；需要更长业务幂等周期时由上游保存 task ID/去重记录。空键维持每次
+  创建新任务的语义。
 
 ## 故障处理
 
@@ -197,6 +215,42 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   不是让 Worker 自发竞争。
 - **回归覆盖**：`TestAssignmentStreamBatchesDistinctLeaderCommittedTasks`、
   `TestLeaderAssignmentDrainsAgedBacklogWithoutClaimCompetition`。
+
+### SCHED-003：按节点流批处理导致健康任务等待 lease
+
+- **现象**：50 个 Pod 都有空闲 Worker 时，每条 AssignmentStream 各自聚批并持有全局
+  `claimMu` 完成一次 Raft Apply；后续节点排队超过 Worker 的 5 秒等待上限。客户端已经
+  不再收到 Leader 已提交的 assignment，任务停在 inflight，积压以 30 秒 lease 为台阶
+  缓慢下降；线上一次出现 44、49 条 claim 到期回收。
+- **根因**：调度权虽然集中到 Leader，但日志批次仍按连接划分，Raft 往返次数与节点数
+  线性增长；锁只消除了重复选择，没有合并共识成本。
+- **修复**：所有节点的空闲槽位进入 Leader 全局 dispatcher，一次选择、一次
+  `OpClaimBatch`；Worker 等待上限调整为 15 秒，但不能依靠放大超时替代全局聚批。
+- **边界**：单 shard dispatcher 仍是一个 Leader 内存组件；Leader 切换后旧流取消，未
+  确认 assignment 仍按 30 秒 lease 恢复。Multi-Raft 按 shard 各自拥有 dispatcher。
+- **回归覆盖**：`TestAssignmentStreamBatchesDistinctLeaderCommittedTasks` 使用两个独立
+  节点流并断言仅一条 Raft Apply；真实 7 节点 Case
+  `TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery` 要求在 lease 前完成且零流超时/回收。
+
+### RESULT-001：每节点完成流放大 Raft 日志
+
+- **风险**：Assignment 修复后，大量节点可能同时完成任务；若 ResultStream 各自提交
+  `OpCompleteBatch`，同样会造成节点数级别的 Raft 往返和 completion timeout。
+- **修复**：完成请求跨全部节点流全局聚批；只有已提交的 task ID 才向原流确认，流在
+  提交前取消不得误回 ACK。
+- **回归覆盖**：`TestResultStreamBatchesCompletionsAcrossNodeStreams`、
+  `TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery`。
+
+### SUBMIT-003：Follower 超时返回但批次已经提交
+
+- **现象**：1000 条批次经 Follower 转发时，硬编码 10 秒 deadline 返回 HTTP 408，但
+  Leader 随后完成了 Raft commit；调用方无法判断是否应该重试。
+- **修复**：Follower 转发窗口扩为 60 秒；非空幂等键生成稳定 task ID，重试不会重复
+  pending/result 或本地 Queue hint。
+- **边界**：网络调用无法消除未知结果；60 秒不是 exactly-once 保证。幂等去重受最近
+  10000 个完成结果窗口约束，业务 Processor 副作用仍必须幂等。
+- **回归覆盖**：`TestSubmitBatchFollowerUsesConfiguredForwardTimeout`、
+  `TestSubmitBatchIdempotencyKeysReuseTaskIDs`、`TestHTTPBatchSubmitThroughFollower`。
 
 ### LEADER-001：Leader 同时调度和执行
 

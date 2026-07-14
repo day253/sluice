@@ -30,17 +30,17 @@ type mockRaft struct {
 
 func (m *mockRaft) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {
 	// Route to FSM so state is consistent.
-	_ = m.fsm.Apply(&hashicorpraft.Log{Data: cmd, Type: hashicorpraft.LogCommand})
-	return &mockResult{}
+	response := m.fsm.Apply(&hashicorpraft.Log{Data: cmd, Type: hashicorpraft.LogCommand})
+	return &mockResult{response: response}
 }
 
 func (m *mockRaft) IsLeader() bool     { return m.leader }
 func (m *mockRaft) LeaderAddr() string { return "mock:7000" }
 
-type mockResult struct{}
+type mockResult struct{ response interface{} }
 
 func (r *mockResult) Error() error          { return nil }
-func (r *mockResult) Response() interface{} { return nil }
+func (r *mockResult) Response() interface{} { return r.response }
 
 func setupHandler(t *testing.T) (*Handler, *raftpkg.FSM, *queue.MemoryQueue) {
 	t.Helper()

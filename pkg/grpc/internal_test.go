@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,8 @@ import (
 	hashicorpraft "github.com/hashicorp/raft"
 	"go.uber.org/zap"
 	googlegrpc "google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	grpcv1 "github.com/day253/sluice/pkg/grpc/v1"
 	raftpkg "github.com/day253/sluice/pkg/raft"
@@ -162,7 +165,8 @@ func TestSelectPendingForSlot_PreservesLocalityAndAgeBoundary(t *testing.T) {
 func TestAssignmentStreamBatchesDistinctLeaderCommittedTasks(t *testing.T) {
 	fsm := raftpkg.NewFSM(zap.NewNop())
 	applyInternalTestCommand(fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
-		"worker-node": {NodeID: "worker-node", Tenants: map[string]int{"tenant-a": 2}},
+		"worker-a": {NodeID: "worker-a", Tenants: map[string]int{"tenant-a": 1}},
+		"worker-b": {NodeID: "worker-b", Tenants: map[string]int{"tenant-a": 1}},
 		// Even a stale/malformed mirror entry must never let the leader execute.
 		"leader": {NodeID: "leader", Tenants: map[string]int{"tenant-a": 1}},
 	})
@@ -179,23 +183,34 @@ func TestAssignmentStreamBatchesDistinctLeaderCommittedTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := googlegrpc.NewServer()
-	grpcv1.RegisterSluiceInternalServer(server, NewInternalService("leader", fsm, raft, zap.NewNop()))
+	service := NewInternalService("leader", fsm, raft, zap.NewNop())
+	service.assignmentWindow = 50 * time.Millisecond
+	grpcv1.RegisterSluiceInternalServer(server, service)
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() {
 		server.Stop()
 		_ = listener.Close()
 	})
 
-	client := NewClaimClient("worker-node", zap.NewNop())
-	client.SetLeader(listener.Addr().String())
-	t.Cleanup(client.Close)
+	clients := map[string]*ClaimClient{
+		"worker-a": NewClaimClient("worker-a", zap.NewNop()),
+		"worker-b": NewClaimClient("worker-b", zap.NewNop()),
+	}
+	for _, client := range clients {
+		client.SetLeader(listener.Addr().String())
+		t.Cleanup(client.Close)
+	}
 	start := make(chan struct{})
-	assigned := make(chan *types.TaskRecord, 2)
-	errs := make(chan error, 2)
+	type assignedResult struct {
+		node string
+		task *types.TaskRecord
+	}
+	assigned := make(chan assignedResult, len(clients))
+	errs := make(chan error, len(clients))
 	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
+	for nodeID, client := range clients {
 		wg.Add(1)
-		go func() {
+		go func(nodeID string, client *ClaimClient) {
 			defer wg.Done()
 			<-start
 			task, supported, err := client.Assign("tenant-a")
@@ -207,8 +222,8 @@ func TestAssignmentStreamBatchesDistinctLeaderCommittedTasks(t *testing.T) {
 				errs <- fmt.Errorf("assignment supported=%v task=%+v", supported, task)
 				return
 			}
-			assigned <- task
-		}()
+			assigned <- assignedResult{node: nodeID, task: task}
+		}(nodeID, client)
 	}
 	close(start)
 	wg.Wait()
@@ -218,11 +233,11 @@ func TestAssignmentStreamBatchesDistinctLeaderCommittedTasks(t *testing.T) {
 	}
 	close(assigned)
 	seen := map[string]bool{}
-	for task := range assigned {
-		seen[task.TaskID] = true
-		record := fsm.GetTask(task.TaskID)
-		if record == nil || record.Status != types.TaskStatusInflight || record.NodeID != "worker-node" {
-			t.Fatalf("committed assignment = %+v, want inflight on worker-node", record)
+	for result := range assigned {
+		seen[result.task.TaskID] = true
+		record := fsm.GetTask(result.task.TaskID)
+		if record == nil || record.Status != types.TaskStatusInflight || record.NodeID != result.node {
+			t.Fatalf("committed assignment = %+v, want inflight on %s", record, result.node)
 		}
 	}
 	if len(seen) != 2 || !seen["assigned-1"] || !seen["assigned-2"] {
@@ -243,6 +258,102 @@ func TestAssignmentStreamBatchesDistinctLeaderCommittedTasks(t *testing.T) {
 	}
 	if task := fsm.GetTask("leader-must-not-run"); task == nil || task.Status != types.TaskStatusPending {
 		t.Fatalf("leader-only task state = %+v, want pending", task)
+	}
+}
+
+func TestResultStreamBatchesCompletionsAcrossNodeStreams(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	for _, task := range []raftpkg.CreateTaskData{
+		{TaskID: "done-a", TenantID: "tenant-a", Payload: `{}`},
+		{TaskID: "done-b", TenantID: "tenant-a", Payload: `{}`},
+	} {
+		applyInternalTestCommand(fsm, raftpkg.OpCreateTask, task)
+	}
+	applyInternalTestCommand(fsm, raftpkg.OpClaimBatch, raftpkg.ClaimBatchData{Tasks: []raftpkg.ClaimTaskData{
+		{TaskID: "done-a", TenantID: "tenant-a", NodeID: "worker-a", Payload: `{}`},
+		{TaskID: "done-b", TenantID: "tenant-a", NodeID: "worker-b", Payload: `{}`},
+	}})
+
+	raft := &internalTestRaft{fsm: fsm}
+	raft.leader.Store(true)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := googlegrpc.NewServer()
+	service := NewInternalService("leader", fsm, raft, zap.NewNop())
+	service.completionWindow = 50 * time.Millisecond
+	grpcv1.RegisterSluiceInternalServer(server, service)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+	})
+
+	clients := map[string]*ClaimClient{
+		"done-a": NewClaimClient("worker-a", zap.NewNop()),
+		"done-b": NewClaimClient("worker-b", zap.NewNop()),
+	}
+	for _, client := range clients {
+		client.SetLeader(listener.Addr().String())
+		t.Cleanup(client.Close)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, len(clients))
+	var wg sync.WaitGroup
+	for taskID, client := range clients {
+		wg.Add(1)
+		go func(taskID string, client *ClaimClient) {
+			defer wg.Done()
+			<-start
+			if err := client.Complete(taskID, "tenant-a", "ok", "", false); err != nil {
+				errs <- err
+			}
+		}(taskID, client)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	if got := raft.applyCount.Load(); got != 1 {
+		t.Fatalf("Raft completion applies = %d, want one cross-stream batch", got)
+	}
+	for taskID := range clients {
+		result := fsm.GetResult(taskID)
+		if result == nil || result.Status != types.TaskStatusDone {
+			t.Fatalf("completion %s = %+v, want done", taskID, result)
+		}
+	}
+}
+
+func TestDispatchCompletionsDoesNotAcknowledgeCanceledJob(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	raft := &internalTestRaft{fsm: fsm}
+	raft.leader.Store(true)
+	service := NewInternalService("leader", fsm, raft, zap.NewNop())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	outcomes := make(chan completionOutcome, 1)
+	service.dispatchCompletions([]completionJob{{
+		ctx: ctx,
+		task: raftpkg.CompleteTaskData{
+			TaskID: "canceled", TenantID: "tenant-a", Status: types.TaskStatusDone,
+		},
+		outcome: outcomes,
+	}})
+	if got := raft.applyCount.Load(); got != 0 {
+		t.Fatalf("canceled completion caused %d Raft applies, want 0", got)
+	}
+	select {
+	case outcome := <-outcomes:
+		if status.Code(outcome.err) != codes.Canceled {
+			t.Fatalf("canceled completion outcome = %v, want Canceled", outcome.err)
+		}
+	default:
+		// The dispatcher may drop the error because the originating stream is
+		// already canceled; it must never emit a successful acknowledgement.
 	}
 }
 

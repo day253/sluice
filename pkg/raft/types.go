@@ -49,6 +49,13 @@ type CreateTaskBatchData struct {
 	Tasks []CreateTaskData `json:"tasks"`
 }
 
+// CreateTaskBatchResult identifies only newly inserted tasks. Idempotent
+// retries still return their stable task IDs to callers, but must not append
+// duplicate best-effort queue hints.
+type CreateTaskBatchResult struct {
+	Created []string
+}
+
 // ClaimTaskData is the payload for OpClaimTask.
 type ClaimTaskData struct {
 	TaskID   string `json:"task_id"`

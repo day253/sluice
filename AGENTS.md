@@ -18,6 +18,9 @@ These rules apply to the entire repository.
   leader runs no business workers, and followers never self-claim from a
   replicated global pending snapshot. Scale assignment with additional Raft
   shards, not decentralized claim races.
+- Aggregate assignment and completion requests across all node streams before
+  Raft Apply. Per-node-stream batches multiply consensus round trips by cluster
+  size and can strand already claimed tasks behind client timeouts and leases.
 
 ## Mandatory regression coverage
 
