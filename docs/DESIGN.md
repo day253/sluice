@@ -12,7 +12,7 @@
 ## 任务生命周期
 
 ```
-1. 提交: Client → 任意 Node → raft.Apply(OpCreateTask) → FSM (pending)
+1. 提交: Client → 任意 Node → raft.Apply(OpCreateTaskBatch) → FSM (pending)
 2. 发现: Worker → fsm.FindPendingTasks(tenantID) → 发现 pending 任务
 3. 认领: Worker → ClaimStream → Leader
          Leader 检查 allocation[node][tenant] > 0 ?
@@ -63,6 +63,7 @@ Worker (任意节点)                    Leader
 ```
 外部 (gRPC, 全部 unary):
   Submit(SubmitRequest) → SubmitResponse
+  SubmitBatch(SubmitBatchRequest) → SubmitBatchResponse
   GetTask(GetTaskRequest) → TaskStatus
   WaitTask(WaitTaskRequest) → TaskStatus
   UpsertTenant / DeleteTenant / ListTenants / ClusterStatus / Health

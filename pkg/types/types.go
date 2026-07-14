@@ -122,6 +122,17 @@ type TaskSubmitRequest struct {
 	IdempotencyKey string          `json:"idempotency_key,omitempty"`
 }
 
+// BatchTaskSubmitRequest is the JSON body for POST /api/v1/tasks/batch.
+type BatchTaskSubmitRequest struct {
+	Tasks []TaskSubmitRequest `json:"tasks"`
+}
+
+// BatchTaskResponse is returned by the batch submission endpoint. Results
+// preserve the input order so callers can correlate task IDs deterministically.
+type BatchTaskResponse struct {
+	Tasks []TaskResponse `json:"tasks"`
+}
+
 // TaskResponse is the JSON body returned for task endpoints.
 type TaskResponse struct {
 	TaskID   string `json:"task_id"`

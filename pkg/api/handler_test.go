@@ -8,13 +8,13 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	hashicorpraft "github.com/hashicorp/raft"
 	"github.com/gorilla/mux"
+	hashicorpraft "github.com/hashicorp/raft"
 	"go.uber.org/zap"
 
 	grpcpkg "github.com/day253/sluice/pkg/grpc"
-	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/queue"
+	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/types"
 	"github.com/day253/sluice/pkg/worker"
 )
@@ -34,7 +34,7 @@ func (m *mockRaft) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {
 	return &mockResult{}
 }
 
-func (m *mockRaft) IsLeader() bool    { return m.leader }
+func (m *mockRaft) IsLeader() bool     { return m.leader }
 func (m *mockRaft) LeaderAddr() string { return "mock:7000" }
 
 type mockResult struct{}
@@ -131,6 +131,36 @@ func TestSubmitTask_Success(t *testing.T) {
 	}
 	if resp.Status != types.TaskStatusPending {
 		t.Errorf("submit: status = %s, want pending", resp.Status)
+	}
+}
+
+func TestSubmitBatch_Success(t *testing.T) {
+	h, fsm, _ := setupHandler(t)
+	router := newRouter(h)
+
+	body := mustMarshal(types.BatchTaskSubmitRequest{Tasks: []types.TaskSubmitRequest{
+		{TenantID: "company-a", Payload: json.RawMessage(`{"n":1}`)},
+		{TenantID: "company-a", Payload: json.RawMessage(`{"n":2}`)},
+	}})
+	req := httptest.NewRequest("POST", "/api/v1/tasks/batch", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("batch submit: status = %d, want 202\nbody: %s", rec.Code, rec.Body.String())
+	}
+	var resp types.BatchTaskResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Tasks) != 2 {
+		t.Fatalf("batch response length = %d, want 2", len(resp.Tasks))
+	}
+	for _, task := range resp.Tasks {
+		if task.TaskID == "" || fsm.GetTask(task.TaskID) == nil {
+			t.Fatalf("batch task not persisted: %+v", task)
+		}
 	}
 }
 

@@ -9,6 +9,7 @@ const (
 	OpNodeUp           = "node_up"
 	OpNodeDown         = "node_down"
 	OpCreateTask       = "create_task"
+	OpCreateTaskBatch  = "create_task_batch"
 	OpClaimTask        = "claim_task"
 	OpCompleteTask     = "complete_task"
 	OpFailTask         = "fail_task"
@@ -38,6 +39,13 @@ type CreateTaskData struct {
 	TaskID   string `json:"task_id"`
 	TenantID string `json:"tenant_id"`
 	Payload  string `json:"payload"`
+}
+
+// CreateTaskBatchData is the payload for OpCreateTaskBatch. All tasks in the
+// batch are persisted by one Raft log entry, reducing consensus overhead for
+// high-volume submissions.
+type CreateTaskBatchData struct {
+	Tasks []CreateTaskData `json:"tasks"`
 }
 
 // ClaimTaskData is the payload for OpClaimTask.

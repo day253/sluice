@@ -201,6 +201,29 @@ func TestCompletedTaskCannotBeResurrected(t *testing.T) {
 	}
 }
 
+func TestCreateTaskBatchPersistsAllTasksAndIsIdempotent(t *testing.T) {
+	fsm := newTestFSM(t)
+	batch := CreateTaskBatchData{Tasks: []CreateTaskData{
+		{TaskID: "batch-1", TenantID: "tenant-a", Payload: `{"n":1}`},
+		{TaskID: "batch-2", TenantID: "tenant-b", Payload: `{"n":2}`},
+	}}
+	applyCmd(t, fsm, OpCreateTaskBatch, batch)
+	applyCmd(t, fsm, OpCreateTaskBatch, batch)
+
+	for _, want := range batch.Tasks {
+		task := fsm.GetTask(want.TaskID)
+		if task == nil {
+			t.Fatalf("batch task %s missing", want.TaskID)
+		}
+		if task.TenantID != want.TenantID || task.Payload != want.Payload || task.Status != types.TaskStatusPending {
+			t.Fatalf("batch task %s = %+v", want.TaskID, task)
+		}
+	}
+	if got := fsm.CountUnfinishedPerTenant(); got["tenant-a"] != 1 || got["tenant-b"] != 1 {
+		t.Fatalf("unfinished counts after duplicate batch = %+v", got)
+	}
+}
+
 func TestRestoreRepairsHistoricalCompletedAndUnfinishedOverlap(t *testing.T) {
 	state := types.NewFSMState()
 	state.Tasks["historical-duplicate"] = &types.TaskRecord{

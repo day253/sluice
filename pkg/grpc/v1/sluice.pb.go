@@ -141,6 +141,94 @@ func (x *SubmitResponse) GetStatus() string {
 	return ""
 }
 
+type SubmitBatchRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Tasks         []*SubmitRequest       `protobuf:"bytes,1,rep,name=tasks,proto3" json:"tasks,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SubmitBatchRequest) Reset() {
+	*x = SubmitBatchRequest{}
+	mi := &file_sluice_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubmitBatchRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubmitBatchRequest) ProtoMessage() {}
+
+func (x *SubmitBatchRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_sluice_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubmitBatchRequest.ProtoReflect.Descriptor instead.
+func (*SubmitBatchRequest) Descriptor() ([]byte, []int) {
+	return file_sluice_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *SubmitBatchRequest) GetTasks() []*SubmitRequest {
+	if x != nil {
+		return x.Tasks
+	}
+	return nil
+}
+
+type SubmitBatchResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Tasks         []*SubmitResponse      `protobuf:"bytes,1,rep,name=tasks,proto3" json:"tasks,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SubmitBatchResponse) Reset() {
+	*x = SubmitBatchResponse{}
+	mi := &file_sluice_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubmitBatchResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubmitBatchResponse) ProtoMessage() {}
+
+func (x *SubmitBatchResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_sluice_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubmitBatchResponse.ProtoReflect.Descriptor instead.
+func (*SubmitBatchResponse) Descriptor() ([]byte, []int) {
+	return file_sluice_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *SubmitBatchResponse) GetTasks() []*SubmitResponse {
+	if x != nil {
+		return x.Tasks
+	}
+	return nil
+}
+
 type GetTaskRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TaskId        string                 `protobuf:"bytes,1,opt,name=task_id,json=taskId,proto3" json:"task_id,omitempty"`
@@ -150,7 +238,7 @@ type GetTaskRequest struct {
 
 func (x *GetTaskRequest) Reset() {
 	*x = GetTaskRequest{}
-	mi := &file_sluice_proto_msgTypes[2]
+	mi := &file_sluice_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -162,7 +250,7 @@ func (x *GetTaskRequest) String() string {
 func (*GetTaskRequest) ProtoMessage() {}
 
 func (x *GetTaskRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[2]
+	mi := &file_sluice_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -175,7 +263,7 @@ func (x *GetTaskRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetTaskRequest.ProtoReflect.Descriptor instead.
 func (*GetTaskRequest) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{2}
+	return file_sluice_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *GetTaskRequest) GetTaskId() string {
@@ -198,7 +286,7 @@ type TaskStatus struct {
 
 func (x *TaskStatus) Reset() {
 	*x = TaskStatus{}
-	mi := &file_sluice_proto_msgTypes[3]
+	mi := &file_sluice_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -210,7 +298,7 @@ func (x *TaskStatus) String() string {
 func (*TaskStatus) ProtoMessage() {}
 
 func (x *TaskStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[3]
+	mi := &file_sluice_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -223,7 +311,7 @@ func (x *TaskStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TaskStatus.ProtoReflect.Descriptor instead.
 func (*TaskStatus) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{3}
+	return file_sluice_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *TaskStatus) GetTaskId() string {
@@ -271,7 +359,7 @@ type WaitTaskRequest struct {
 
 func (x *WaitTaskRequest) Reset() {
 	*x = WaitTaskRequest{}
-	mi := &file_sluice_proto_msgTypes[4]
+	mi := &file_sluice_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -283,7 +371,7 @@ func (x *WaitTaskRequest) String() string {
 func (*WaitTaskRequest) ProtoMessage() {}
 
 func (x *WaitTaskRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[4]
+	mi := &file_sluice_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -296,7 +384,7 @@ func (x *WaitTaskRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WaitTaskRequest.ProtoReflect.Descriptor instead.
 func (*WaitTaskRequest) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{4}
+	return file_sluice_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *WaitTaskRequest) GetTaskId() string {
@@ -324,7 +412,7 @@ type UpsertTenantRequest struct {
 
 func (x *UpsertTenantRequest) Reset() {
 	*x = UpsertTenantRequest{}
-	mi := &file_sluice_proto_msgTypes[5]
+	mi := &file_sluice_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -336,7 +424,7 @@ func (x *UpsertTenantRequest) String() string {
 func (*UpsertTenantRequest) ProtoMessage() {}
 
 func (x *UpsertTenantRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[5]
+	mi := &file_sluice_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -349,7 +437,7 @@ func (x *UpsertTenantRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpsertTenantRequest.ProtoReflect.Descriptor instead.
 func (*UpsertTenantRequest) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{5}
+	return file_sluice_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *UpsertTenantRequest) GetTenantId() string {
@@ -382,7 +470,7 @@ type UpsertTenantResponse struct {
 
 func (x *UpsertTenantResponse) Reset() {
 	*x = UpsertTenantResponse{}
-	mi := &file_sluice_proto_msgTypes[6]
+	mi := &file_sluice_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -394,7 +482,7 @@ func (x *UpsertTenantResponse) String() string {
 func (*UpsertTenantResponse) ProtoMessage() {}
 
 func (x *UpsertTenantResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[6]
+	mi := &file_sluice_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -407,7 +495,7 @@ func (x *UpsertTenantResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpsertTenantResponse.ProtoReflect.Descriptor instead.
 func (*UpsertTenantResponse) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{6}
+	return file_sluice_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *UpsertTenantResponse) GetOk() bool {
@@ -426,7 +514,7 @@ type DeleteTenantRequest struct {
 
 func (x *DeleteTenantRequest) Reset() {
 	*x = DeleteTenantRequest{}
-	mi := &file_sluice_proto_msgTypes[7]
+	mi := &file_sluice_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -438,7 +526,7 @@ func (x *DeleteTenantRequest) String() string {
 func (*DeleteTenantRequest) ProtoMessage() {}
 
 func (x *DeleteTenantRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[7]
+	mi := &file_sluice_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -451,7 +539,7 @@ func (x *DeleteTenantRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteTenantRequest.ProtoReflect.Descriptor instead.
 func (*DeleteTenantRequest) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{7}
+	return file_sluice_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *DeleteTenantRequest) GetTenantId() string {
@@ -470,7 +558,7 @@ type DeleteTenantResponse struct {
 
 func (x *DeleteTenantResponse) Reset() {
 	*x = DeleteTenantResponse{}
-	mi := &file_sluice_proto_msgTypes[8]
+	mi := &file_sluice_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -482,7 +570,7 @@ func (x *DeleteTenantResponse) String() string {
 func (*DeleteTenantResponse) ProtoMessage() {}
 
 func (x *DeleteTenantResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[8]
+	mi := &file_sluice_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -495,7 +583,7 @@ func (x *DeleteTenantResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteTenantResponse.ProtoReflect.Descriptor instead.
 func (*DeleteTenantResponse) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{8}
+	return file_sluice_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *DeleteTenantResponse) GetOk() bool {
@@ -513,7 +601,7 @@ type ListTenantsRequest struct {
 
 func (x *ListTenantsRequest) Reset() {
 	*x = ListTenantsRequest{}
-	mi := &file_sluice_proto_msgTypes[9]
+	mi := &file_sluice_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -525,7 +613,7 @@ func (x *ListTenantsRequest) String() string {
 func (*ListTenantsRequest) ProtoMessage() {}
 
 func (x *ListTenantsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[9]
+	mi := &file_sluice_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -538,7 +626,7 @@ func (x *ListTenantsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTenantsRequest.ProtoReflect.Descriptor instead.
 func (*ListTenantsRequest) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{9}
+	return file_sluice_proto_rawDescGZIP(), []int{11}
 }
 
 type TenantInfo struct {
@@ -553,7 +641,7 @@ type TenantInfo struct {
 
 func (x *TenantInfo) Reset() {
 	*x = TenantInfo{}
-	mi := &file_sluice_proto_msgTypes[10]
+	mi := &file_sluice_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -565,7 +653,7 @@ func (x *TenantInfo) String() string {
 func (*TenantInfo) ProtoMessage() {}
 
 func (x *TenantInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[10]
+	mi := &file_sluice_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -578,7 +666,7 @@ func (x *TenantInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TenantInfo.ProtoReflect.Descriptor instead.
 func (*TenantInfo) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{10}
+	return file_sluice_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *TenantInfo) GetTenantId() string {
@@ -618,7 +706,7 @@ type ListTenantsResponse struct {
 
 func (x *ListTenantsResponse) Reset() {
 	*x = ListTenantsResponse{}
-	mi := &file_sluice_proto_msgTypes[11]
+	mi := &file_sluice_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -630,7 +718,7 @@ func (x *ListTenantsResponse) String() string {
 func (*ListTenantsResponse) ProtoMessage() {}
 
 func (x *ListTenantsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[11]
+	mi := &file_sluice_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -643,7 +731,7 @@ func (x *ListTenantsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListTenantsResponse.ProtoReflect.Descriptor instead.
 func (*ListTenantsResponse) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{11}
+	return file_sluice_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ListTenantsResponse) GetTenants() []*TenantInfo {
@@ -661,7 +749,7 @@ type ClusterStatusRequest struct {
 
 func (x *ClusterStatusRequest) Reset() {
 	*x = ClusterStatusRequest{}
-	mi := &file_sluice_proto_msgTypes[12]
+	mi := &file_sluice_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -673,7 +761,7 @@ func (x *ClusterStatusRequest) String() string {
 func (*ClusterStatusRequest) ProtoMessage() {}
 
 func (x *ClusterStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[12]
+	mi := &file_sluice_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -686,7 +774,7 @@ func (x *ClusterStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClusterStatusRequest.ProtoReflect.Descriptor instead.
 func (*ClusterStatusRequest) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{12}
+	return file_sluice_proto_rawDescGZIP(), []int{14}
 }
 
 type NodeInfo struct {
@@ -702,7 +790,7 @@ type NodeInfo struct {
 
 func (x *NodeInfo) Reset() {
 	*x = NodeInfo{}
-	mi := &file_sluice_proto_msgTypes[13]
+	mi := &file_sluice_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -714,7 +802,7 @@ func (x *NodeInfo) String() string {
 func (*NodeInfo) ProtoMessage() {}
 
 func (x *NodeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[13]
+	mi := &file_sluice_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -727,7 +815,7 @@ func (x *NodeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeInfo.ProtoReflect.Descriptor instead.
 func (*NodeInfo) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{13}
+	return file_sluice_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *NodeInfo) GetNodeId() string {
@@ -775,7 +863,7 @@ type TenantAllocation struct {
 
 func (x *TenantAllocation) Reset() {
 	*x = TenantAllocation{}
-	mi := &file_sluice_proto_msgTypes[14]
+	mi := &file_sluice_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -787,7 +875,7 @@ func (x *TenantAllocation) String() string {
 func (*TenantAllocation) ProtoMessage() {}
 
 func (x *TenantAllocation) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[14]
+	mi := &file_sluice_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -800,7 +888,7 @@ func (x *TenantAllocation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TenantAllocation.ProtoReflect.Descriptor instead.
 func (*TenantAllocation) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{14}
+	return file_sluice_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *TenantAllocation) GetTenantId() string {
@@ -827,7 +915,7 @@ type NodeAllocation struct {
 
 func (x *NodeAllocation) Reset() {
 	*x = NodeAllocation{}
-	mi := &file_sluice_proto_msgTypes[15]
+	mi := &file_sluice_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -839,7 +927,7 @@ func (x *NodeAllocation) String() string {
 func (*NodeAllocation) ProtoMessage() {}
 
 func (x *NodeAllocation) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[15]
+	mi := &file_sluice_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -852,7 +940,7 @@ func (x *NodeAllocation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeAllocation.ProtoReflect.Descriptor instead.
 func (*NodeAllocation) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{15}
+	return file_sluice_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *NodeAllocation) GetNodeId() string {
@@ -880,7 +968,7 @@ type ClusterStatusResponse struct {
 
 func (x *ClusterStatusResponse) Reset() {
 	*x = ClusterStatusResponse{}
-	mi := &file_sluice_proto_msgTypes[16]
+	mi := &file_sluice_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -892,7 +980,7 @@ func (x *ClusterStatusResponse) String() string {
 func (*ClusterStatusResponse) ProtoMessage() {}
 
 func (x *ClusterStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[16]
+	mi := &file_sluice_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -905,7 +993,7 @@ func (x *ClusterStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ClusterStatusResponse.ProtoReflect.Descriptor instead.
 func (*ClusterStatusResponse) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{16}
+	return file_sluice_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ClusterStatusResponse) GetNodes() []*NodeInfo {
@@ -937,7 +1025,7 @@ type HealthRequest struct {
 
 func (x *HealthRequest) Reset() {
 	*x = HealthRequest{}
-	mi := &file_sluice_proto_msgTypes[17]
+	mi := &file_sluice_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -949,7 +1037,7 @@ func (x *HealthRequest) String() string {
 func (*HealthRequest) ProtoMessage() {}
 
 func (x *HealthRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[17]
+	mi := &file_sluice_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -962,7 +1050,7 @@ func (x *HealthRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthRequest.ProtoReflect.Descriptor instead.
 func (*HealthRequest) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{17}
+	return file_sluice_proto_rawDescGZIP(), []int{19}
 }
 
 type HealthResponse struct {
@@ -976,7 +1064,7 @@ type HealthResponse struct {
 
 func (x *HealthResponse) Reset() {
 	*x = HealthResponse{}
-	mi := &file_sluice_proto_msgTypes[18]
+	mi := &file_sluice_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -988,7 +1076,7 @@ func (x *HealthResponse) String() string {
 func (*HealthResponse) ProtoMessage() {}
 
 func (x *HealthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sluice_proto_msgTypes[18]
+	mi := &file_sluice_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1001,7 +1089,7 @@ func (x *HealthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthResponse.ProtoReflect.Descriptor instead.
 func (*HealthResponse) Descriptor() ([]byte, []int) {
-	return file_sluice_proto_rawDescGZIP(), []int{18}
+	return file_sluice_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *HealthResponse) GetStatus() string {
@@ -1037,7 +1125,11 @@ const file_sluice_proto_rawDesc = "" +
 	"\x0eSubmitResponse\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12\x1b\n" +
 	"\ttenant_id\x18\x02 \x01(\tR\btenantId\x12\x16\n" +
-	"\x06status\x18\x03 \x01(\tR\x06status\")\n" +
+	"\x06status\x18\x03 \x01(\tR\x06status\"D\n" +
+	"\x12SubmitBatchRequest\x12.\n" +
+	"\x05tasks\x18\x01 \x03(\v2\x18.sluice.v1.SubmitRequestR\x05tasks\"F\n" +
+	"\x13SubmitBatchResponse\x12/\n" +
+	"\x05tasks\x18\x01 \x03(\v2\x19.sluice.v1.SubmitResponseR\x05tasks\")\n" +
 	"\x0eGetTaskRequest\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\"\x88\x01\n" +
 	"\n" +
@@ -1092,9 +1184,10 @@ const file_sluice_proto_rawDesc = "" +
 	"\x0eHealthResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12\x17\n" +
 	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x16\n" +
-	"\x06leader\x18\x03 \x01(\tR\x06leader2\xc6\x04\n" +
+	"\x06leader\x18\x03 \x01(\tR\x06leader2\x94\x05\n" +
 	"\x06Sluice\x12=\n" +
-	"\x06Submit\x12\x18.sluice.v1.SubmitRequest\x1a\x19.sluice.v1.SubmitResponse\x12;\n" +
+	"\x06Submit\x12\x18.sluice.v1.SubmitRequest\x1a\x19.sluice.v1.SubmitResponse\x12L\n" +
+	"\vSubmitBatch\x12\x1d.sluice.v1.SubmitBatchRequest\x1a\x1e.sluice.v1.SubmitBatchResponse\x12;\n" +
 	"\aGetTask\x12\x19.sluice.v1.GetTaskRequest\x1a\x15.sluice.v1.TaskStatus\x12=\n" +
 	"\bWaitTask\x12\x1a.sluice.v1.WaitTaskRequest\x1a\x15.sluice.v1.TaskStatus\x12O\n" +
 	"\fUpsertTenant\x12\x1e.sluice.v1.UpsertTenantRequest\x1a\x1f.sluice.v1.UpsertTenantResponse\x12O\n" +
@@ -1115,54 +1208,60 @@ func file_sluice_proto_rawDescGZIP() []byte {
 	return file_sluice_proto_rawDescData
 }
 
-var file_sluice_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_sluice_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
 var file_sluice_proto_goTypes = []any{
 	(*SubmitRequest)(nil),         // 0: sluice.v1.SubmitRequest
 	(*SubmitResponse)(nil),        // 1: sluice.v1.SubmitResponse
-	(*GetTaskRequest)(nil),        // 2: sluice.v1.GetTaskRequest
-	(*TaskStatus)(nil),            // 3: sluice.v1.TaskStatus
-	(*WaitTaskRequest)(nil),       // 4: sluice.v1.WaitTaskRequest
-	(*UpsertTenantRequest)(nil),   // 5: sluice.v1.UpsertTenantRequest
-	(*UpsertTenantResponse)(nil),  // 6: sluice.v1.UpsertTenantResponse
-	(*DeleteTenantRequest)(nil),   // 7: sluice.v1.DeleteTenantRequest
-	(*DeleteTenantResponse)(nil),  // 8: sluice.v1.DeleteTenantResponse
-	(*ListTenantsRequest)(nil),    // 9: sluice.v1.ListTenantsRequest
-	(*TenantInfo)(nil),            // 10: sluice.v1.TenantInfo
-	(*ListTenantsResponse)(nil),   // 11: sluice.v1.ListTenantsResponse
-	(*ClusterStatusRequest)(nil),  // 12: sluice.v1.ClusterStatusRequest
-	(*NodeInfo)(nil),              // 13: sluice.v1.NodeInfo
-	(*TenantAllocation)(nil),      // 14: sluice.v1.TenantAllocation
-	(*NodeAllocation)(nil),        // 15: sluice.v1.NodeAllocation
-	(*ClusterStatusResponse)(nil), // 16: sluice.v1.ClusterStatusResponse
-	(*HealthRequest)(nil),         // 17: sluice.v1.HealthRequest
-	(*HealthResponse)(nil),        // 18: sluice.v1.HealthResponse
+	(*SubmitBatchRequest)(nil),    // 2: sluice.v1.SubmitBatchRequest
+	(*SubmitBatchResponse)(nil),   // 3: sluice.v1.SubmitBatchResponse
+	(*GetTaskRequest)(nil),        // 4: sluice.v1.GetTaskRequest
+	(*TaskStatus)(nil),            // 5: sluice.v1.TaskStatus
+	(*WaitTaskRequest)(nil),       // 6: sluice.v1.WaitTaskRequest
+	(*UpsertTenantRequest)(nil),   // 7: sluice.v1.UpsertTenantRequest
+	(*UpsertTenantResponse)(nil),  // 8: sluice.v1.UpsertTenantResponse
+	(*DeleteTenantRequest)(nil),   // 9: sluice.v1.DeleteTenantRequest
+	(*DeleteTenantResponse)(nil),  // 10: sluice.v1.DeleteTenantResponse
+	(*ListTenantsRequest)(nil),    // 11: sluice.v1.ListTenantsRequest
+	(*TenantInfo)(nil),            // 12: sluice.v1.TenantInfo
+	(*ListTenantsResponse)(nil),   // 13: sluice.v1.ListTenantsResponse
+	(*ClusterStatusRequest)(nil),  // 14: sluice.v1.ClusterStatusRequest
+	(*NodeInfo)(nil),              // 15: sluice.v1.NodeInfo
+	(*TenantAllocation)(nil),      // 16: sluice.v1.TenantAllocation
+	(*NodeAllocation)(nil),        // 17: sluice.v1.NodeAllocation
+	(*ClusterStatusResponse)(nil), // 18: sluice.v1.ClusterStatusResponse
+	(*HealthRequest)(nil),         // 19: sluice.v1.HealthRequest
+	(*HealthResponse)(nil),        // 20: sluice.v1.HealthResponse
 }
 var file_sluice_proto_depIdxs = []int32{
-	10, // 0: sluice.v1.ListTenantsResponse.tenants:type_name -> sluice.v1.TenantInfo
-	14, // 1: sluice.v1.NodeAllocation.tenants:type_name -> sluice.v1.TenantAllocation
-	13, // 2: sluice.v1.ClusterStatusResponse.nodes:type_name -> sluice.v1.NodeInfo
-	15, // 3: sluice.v1.ClusterStatusResponse.allocations:type_name -> sluice.v1.NodeAllocation
-	0,  // 4: sluice.v1.Sluice.Submit:input_type -> sluice.v1.SubmitRequest
-	2,  // 5: sluice.v1.Sluice.GetTask:input_type -> sluice.v1.GetTaskRequest
-	4,  // 6: sluice.v1.Sluice.WaitTask:input_type -> sluice.v1.WaitTaskRequest
-	5,  // 7: sluice.v1.Sluice.UpsertTenant:input_type -> sluice.v1.UpsertTenantRequest
-	7,  // 8: sluice.v1.Sluice.DeleteTenant:input_type -> sluice.v1.DeleteTenantRequest
-	9,  // 9: sluice.v1.Sluice.ListTenants:input_type -> sluice.v1.ListTenantsRequest
-	12, // 10: sluice.v1.Sluice.ClusterStatus:input_type -> sluice.v1.ClusterStatusRequest
-	17, // 11: sluice.v1.Sluice.Health:input_type -> sluice.v1.HealthRequest
-	1,  // 12: sluice.v1.Sluice.Submit:output_type -> sluice.v1.SubmitResponse
-	3,  // 13: sluice.v1.Sluice.GetTask:output_type -> sluice.v1.TaskStatus
-	3,  // 14: sluice.v1.Sluice.WaitTask:output_type -> sluice.v1.TaskStatus
-	6,  // 15: sluice.v1.Sluice.UpsertTenant:output_type -> sluice.v1.UpsertTenantResponse
-	8,  // 16: sluice.v1.Sluice.DeleteTenant:output_type -> sluice.v1.DeleteTenantResponse
-	11, // 17: sluice.v1.Sluice.ListTenants:output_type -> sluice.v1.ListTenantsResponse
-	16, // 18: sluice.v1.Sluice.ClusterStatus:output_type -> sluice.v1.ClusterStatusResponse
-	18, // 19: sluice.v1.Sluice.Health:output_type -> sluice.v1.HealthResponse
-	12, // [12:20] is the sub-list for method output_type
-	4,  // [4:12] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	0,  // 0: sluice.v1.SubmitBatchRequest.tasks:type_name -> sluice.v1.SubmitRequest
+	1,  // 1: sluice.v1.SubmitBatchResponse.tasks:type_name -> sluice.v1.SubmitResponse
+	12, // 2: sluice.v1.ListTenantsResponse.tenants:type_name -> sluice.v1.TenantInfo
+	16, // 3: sluice.v1.NodeAllocation.tenants:type_name -> sluice.v1.TenantAllocation
+	15, // 4: sluice.v1.ClusterStatusResponse.nodes:type_name -> sluice.v1.NodeInfo
+	17, // 5: sluice.v1.ClusterStatusResponse.allocations:type_name -> sluice.v1.NodeAllocation
+	0,  // 6: sluice.v1.Sluice.Submit:input_type -> sluice.v1.SubmitRequest
+	2,  // 7: sluice.v1.Sluice.SubmitBatch:input_type -> sluice.v1.SubmitBatchRequest
+	4,  // 8: sluice.v1.Sluice.GetTask:input_type -> sluice.v1.GetTaskRequest
+	6,  // 9: sluice.v1.Sluice.WaitTask:input_type -> sluice.v1.WaitTaskRequest
+	7,  // 10: sluice.v1.Sluice.UpsertTenant:input_type -> sluice.v1.UpsertTenantRequest
+	9,  // 11: sluice.v1.Sluice.DeleteTenant:input_type -> sluice.v1.DeleteTenantRequest
+	11, // 12: sluice.v1.Sluice.ListTenants:input_type -> sluice.v1.ListTenantsRequest
+	14, // 13: sluice.v1.Sluice.ClusterStatus:input_type -> sluice.v1.ClusterStatusRequest
+	19, // 14: sluice.v1.Sluice.Health:input_type -> sluice.v1.HealthRequest
+	1,  // 15: sluice.v1.Sluice.Submit:output_type -> sluice.v1.SubmitResponse
+	3,  // 16: sluice.v1.Sluice.SubmitBatch:output_type -> sluice.v1.SubmitBatchResponse
+	5,  // 17: sluice.v1.Sluice.GetTask:output_type -> sluice.v1.TaskStatus
+	5,  // 18: sluice.v1.Sluice.WaitTask:output_type -> sluice.v1.TaskStatus
+	8,  // 19: sluice.v1.Sluice.UpsertTenant:output_type -> sluice.v1.UpsertTenantResponse
+	10, // 20: sluice.v1.Sluice.DeleteTenant:output_type -> sluice.v1.DeleteTenantResponse
+	13, // 21: sluice.v1.Sluice.ListTenants:output_type -> sluice.v1.ListTenantsResponse
+	18, // 22: sluice.v1.Sluice.ClusterStatus:output_type -> sluice.v1.ClusterStatusResponse
+	20, // 23: sluice.v1.Sluice.Health:output_type -> sluice.v1.HealthResponse
+	15, // [15:24] is the sub-list for method output_type
+	6,  // [6:15] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_sluice_proto_init() }
@@ -1176,7 +1275,7 @@ func file_sluice_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_sluice_proto_rawDesc), len(file_sluice_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   19,
+			NumMessages:   21,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

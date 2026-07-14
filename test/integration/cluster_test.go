@@ -8,10 +8,13 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"sync"
 	"testing"
@@ -478,6 +481,104 @@ func TestBasicAgreement(t *testing.T) {
 		t.Errorf("alice: processed %d / %d tasks", aliceCount, nTasks)
 	}
 	t.Logf("basic agreement: %d/%d tasks processed", aliceCount, nTasks)
+}
+
+// TestHTTPSubmitThroughFollower covers the production API path that was
+// previously missing from the integration suite. The request enters through
+// a real follower HTTP listener, is forwarded to the leader, and is then
+// processed and committed by the cluster.
+func TestHTTPSubmitThroughFollower(t *testing.T) {
+	tc := newTestCluster(t, 2, 20)
+	defer tc.shutdown()
+
+	tc.addTenant("http-tenant", 20)
+	tc.waitAllocation(10 * time.Second)
+	follower := tc.leaderIdx()
+	if follower < 0 {
+		t.Fatal("no leader found")
+	}
+	follower = 1 - follower
+
+	body := []byte(`{"tenant_id":"http-tenant","payload":{"source":"follower"}}`)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post("http://"+tc.httpAddrs[follower]+"/api/v1/tasks", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST through follower: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("POST through follower status = %d, want 202; body=%s", resp.StatusCode, data)
+	}
+	var task types.TaskResponse
+	if err := json.NewDecoder(resp.Body).Decode(&task); err != nil {
+		t.Fatalf("decode follower response: %v", err)
+	}
+	if task.TaskID == "" || task.TenantID != "http-tenant" {
+		t.Fatalf("follower response = %+v, want task for http-tenant", task)
+	}
+	tc.waitProcessed(1, 30*time.Second)
+	tc.waitFor(func() bool {
+		result := tc.fsms().GetResult(task.TaskID)
+		return result != nil && result.Status == types.TaskStatusDone
+	}, 30*time.Second, "HTTP follower task result")
+}
+
+// TestHTTPBatchSubmitThroughFollower verifies the optimized submission path:
+// one HTTP request entering through a follower creates all tasks with one
+// create_task_batch Raft entry and every task is eventually processed.
+func TestHTTPBatchSubmitThroughFollower(t *testing.T) {
+	tc := newTestCluster(t, 2, 20)
+	defer tc.shutdown()
+
+	const taskCount = 24
+	tc.addTenant("batch-http-tenant", taskCount)
+	tc.waitAllocation(10 * time.Second)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
+	follower := 1 - leader
+
+	request := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, taskCount)}
+	for i := range request.Tasks {
+		request.Tasks[i] = types.TaskSubmitRequest{
+			TenantID: "batch-http-tenant",
+			Payload:  json.RawMessage(fmt.Sprintf(`{"index":%d}`, i)),
+		}
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch", "application/json", bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("batch POST through follower: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("batch POST status = %d, want 202; body=%s", resp.StatusCode, data)
+	}
+	var result types.BatchTaskResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode batch response: %v", err)
+	}
+	if len(result.Tasks) != taskCount {
+		t.Fatalf("batch response tasks = %d, want %d", len(result.Tasks), taskCount)
+	}
+	tc.waitProcessed(taskCount, 30*time.Second)
+	for _, task := range result.Tasks {
+		if task.TaskID == "" {
+			t.Fatal("batch response contained an empty task ID")
+		}
+		tc.waitFor(func() bool {
+			completed := tc.fsms().GetResult(task.TaskID)
+			return completed != nil && completed.Status == types.TaskStatusDone
+		}, 30*time.Second, "batch task completion")
+	}
 }
 
 // TestFailover kills the leader and verifies a new leader is elected and

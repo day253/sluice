@@ -16,11 +16,13 @@ import (
 )
 
 type internalTestRaft struct {
-	fsm    *raftpkg.FSM
-	leader atomic.Bool
+	fsm        *raftpkg.FSM
+	leader     atomic.Bool
+	applyCount atomic.Int32
 }
 
 func (r *internalTestRaft) Apply(cmd []byte, _ int) raftpkg.ApplyResult {
+	r.applyCount.Add(1)
 	response := r.fsm.Apply(&hashicorpraft.Log{Data: cmd, Type: hashicorpraft.LogCommand})
 	return internalTestApplyResult{response: response}
 }

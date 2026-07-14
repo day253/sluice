@@ -20,6 +20,7 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	Sluice_Submit_FullMethodName        = "/sluice.v1.Sluice/Submit"
+	Sluice_SubmitBatch_FullMethodName   = "/sluice.v1.Sluice/SubmitBatch"
 	Sluice_GetTask_FullMethodName       = "/sluice.v1.Sluice/GetTask"
 	Sluice_WaitTask_FullMethodName      = "/sluice.v1.Sluice/WaitTask"
 	Sluice_UpsertTenant_FullMethodName  = "/sluice.v1.Sluice/UpsertTenant"
@@ -35,6 +36,9 @@ const (
 type SluiceClient interface {
 	// Submit a task.  Returns immediately with task_id + status=pending.
 	Submit(ctx context.Context, in *SubmitRequest, opts ...grpc.CallOption) (*SubmitResponse, error)
+	// Submit multiple tasks in one Raft log entry. Returns one pending result
+	// per input task in the same order.
+	SubmitBatch(ctx context.Context, in *SubmitBatchRequest, opts ...grpc.CallOption) (*SubmitBatchResponse, error)
 	// Get the current status of a task.
 	GetTask(ctx context.Context, in *GetTaskRequest, opts ...grpc.CallOption) (*TaskStatus, error)
 	// Wait for a task to complete (blocking).  Returns the final status
@@ -64,6 +68,16 @@ func (c *sluiceClient) Submit(ctx context.Context, in *SubmitRequest, opts ...gr
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SubmitResponse)
 	err := c.cc.Invoke(ctx, Sluice_Submit_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sluiceClient) SubmitBatch(ctx context.Context, in *SubmitBatchRequest, opts ...grpc.CallOption) (*SubmitBatchResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SubmitBatchResponse)
+	err := c.cc.Invoke(ctx, Sluice_SubmitBatch_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +160,9 @@ func (c *sluiceClient) Health(ctx context.Context, in *HealthRequest, opts ...gr
 type SluiceServer interface {
 	// Submit a task.  Returns immediately with task_id + status=pending.
 	Submit(context.Context, *SubmitRequest) (*SubmitResponse, error)
+	// Submit multiple tasks in one Raft log entry. Returns one pending result
+	// per input task in the same order.
+	SubmitBatch(context.Context, *SubmitBatchRequest) (*SubmitBatchResponse, error)
 	// Get the current status of a task.
 	GetTask(context.Context, *GetTaskRequest) (*TaskStatus, error)
 	// Wait for a task to complete (blocking).  Returns the final status
@@ -173,6 +190,9 @@ type UnimplementedSluiceServer struct{}
 
 func (UnimplementedSluiceServer) Submit(context.Context, *SubmitRequest) (*SubmitResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Submit not implemented")
+}
+func (UnimplementedSluiceServer) SubmitBatch(context.Context, *SubmitBatchRequest) (*SubmitBatchResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SubmitBatch not implemented")
 }
 func (UnimplementedSluiceServer) GetTask(context.Context, *GetTaskRequest) (*TaskStatus, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTask not implemented")
@@ -230,6 +250,24 @@ func _Sluice_Submit_Handler(srv interface{}, ctx context.Context, dec func(inter
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SluiceServer).Submit(ctx, req.(*SubmitRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Sluice_SubmitBatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SubmitBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SluiceServer).SubmitBatch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Sluice_SubmitBatch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SluiceServer).SubmitBatch(ctx, req.(*SubmitBatchRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -370,6 +408,10 @@ var Sluice_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Submit",
 			Handler:    _Sluice_Submit_Handler,
+		},
+		{
+			MethodName: "SubmitBatch",
+			Handler:    _Sluice_SubmitBatch_Handler,
 		},
 		{
 			MethodName: "GetTask",

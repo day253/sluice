@@ -12,6 +12,10 @@ service Sluice {
   // Submit a task.  Returns immediately with task_id + status=pending.
   rpc Submit(SubmitRequest) returns (SubmitResponse);
 
+  // Submit multiple tasks in one Raft log entry. Returns one pending result
+  // per input task in the same order.
+  rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchResponse);
+
   // Get the current status of a task.
   rpc GetTask(GetTaskRequest) returns (TaskStatus);
 
@@ -49,6 +53,14 @@ message SubmitResponse {
   string task_id   = 1;
   string tenant_id = 2;
   string status    = 3;  // always "pending" on submit
+}
+
+message SubmitBatchRequest {
+  repeated SubmitRequest tasks = 1;
+}
+
+message SubmitBatchResponse {
+  repeated SubmitResponse tasks = 1;
 }
 
 message GetTaskRequest {

@@ -1,4 +1,4 @@
-.PHONY: all build test bench clean deps proto docker push-docker remote-deploy multipass multipass-clean run-dev run-node1 run-node2 run-node3
+.PHONY: all build test unit-test integration-test bench clean deps proto docker push-docker remote-deploy multipass multipass-clean run-dev run-node1 run-node2 run-node3
 
 APP      := sluice
 CMD_DIR  := ./cmd/sluice
@@ -21,8 +21,15 @@ build-operator:
 	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/sluice-operator $(OP_DIR)
 
 # ---- Test ----
-test:
-	go test -v -race -count=1 ./...
+UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/...
+
+unit-test:
+	go test -v -race -count=1 $(UNIT_PACKAGES)
+
+integration-test:
+	go test -v -race -count=1 ./test/integration
+
+test: unit-test integration-test
 
 # ---- Proto ----
 proto:

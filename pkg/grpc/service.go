@@ -66,46 +66,67 @@ func NewService(
 // ---------------------------------------------------------------------------
 
 func (s *Service) Submit(ctx context.Context, req *grpcv1.SubmitRequest) (*grpcv1.SubmitResponse, error) {
-	if req.TenantId == "" {
-		return nil, status.Error(codes.InvalidArgument, "tenant_id is required")
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+	resp, err := s.SubmitBatch(ctx, &grpcv1.SubmitBatchRequest{Tasks: []*grpcv1.SubmitRequest{req}})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Tasks[0], nil
+}
+
+const maxSubmitBatchTasks = 1000
+
+// SubmitBatch persists multiple pending tasks in one Raft log entry. Tenant
+// validation happens only on the leader: a follower may have a briefly stale
+// FSM snapshot and must forward the complete request before validating it.
+func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchRequest) (*grpcv1.SubmitBatchResponse, error) {
+	if req == nil || len(req.Tasks) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "at least one task is required")
+	}
+	if len(req.Tasks) > maxSubmitBatchTasks {
+		return nil, status.Errorf(codes.InvalidArgument, "batch exceeds maximum of %d tasks", maxSubmitBatchTasks)
 	}
 	if !s.raft.IsLeader() {
 		client, err := s.leaderClient()
 		if err != nil {
 			return nil, status.Error(codes.Unavailable, err.Error())
 		}
-		forwardCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		forwardCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		return client.Submit(forwardCtx, req)
-	}
-	// Validate tenant state on the leader only. Followers can briefly lag the
-	// replicated tenant snapshot, so checking here before forwarding would
-	// incorrectly reject otherwise valid submissions with a transient 404.
-	if _, ok := s.fsm.GetTenant(req.TenantId); !ok {
-		return nil, status.Error(codes.NotFound, "tenant not found: "+req.TenantId)
+		return client.SubmitBatch(forwardCtx, req)
 	}
 
-	taskID := uuid.New().String()
-	payloadStr := string(req.Payload)
+	create := make([]raftpkg.CreateTaskData, len(req.Tasks))
+	resp := &grpcv1.SubmitBatchResponse{Tasks: make([]*grpcv1.SubmitResponse, len(req.Tasks))}
+	for i, item := range req.Tasks {
+		if item == nil || item.TenantId == "" {
+			return nil, status.Errorf(codes.InvalidArgument, "tasks[%d].tenant_id is required", i)
+		}
+		// Validate tenant state on the leader only. Followers can lag the
+		// replicated tenant snapshot and must not return a transient 404.
+		if _, ok := s.fsm.GetTenant(item.TenantId); !ok {
+			return nil, status.Error(codes.NotFound, "tenant not found: "+item.TenantId)
+		}
+		taskID := uuid.New().String()
+		create[i] = raftpkg.CreateTaskData{TaskID: taskID, TenantID: item.TenantId, Payload: string(item.Payload)}
+		resp.Tasks[i] = &grpcv1.SubmitResponse{TaskId: taskID, TenantId: item.TenantId, Status: types.TaskStatusPending}
+	}
 
-	// Write directly to Raft FSM as "pending". Any node's workers can
-	// claim it — no local-queue routing problem.
-	cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTask, raftpkg.CreateTaskData{
-		TaskID: taskID, TenantID: req.TenantId, Payload: payloadStr,
-	})
+	cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: create})
 	if err := s.raft.Apply(cmd, 5000).Error(); err != nil {
-		s.logger.Error("submit raft apply failed", zap.Error(err))
-		return nil, status.Error(codes.Internal, "failed to create task")
+		s.logger.Error("submit batch raft apply failed", zap.Error(err), zap.Int("tasks", len(create)))
+		return nil, status.Error(codes.Internal, "failed to create task batch")
 	}
-
-	// Also enqueue locally so local workers pick it up quickly (best-effort).
-	_ = s.queue.Enqueue(req.TenantId, &queue.TaskEnvelope{
-		TaskID: taskID, TenantID: req.TenantId, Payload: req.Payload, CreatedAt: time.Now().UTC(),
-	})
-
-	return &grpcv1.SubmitResponse{
-		TaskId: taskID, TenantId: req.TenantId, Status: types.TaskStatusPending,
-	}, nil
+	for i, item := range req.Tasks {
+		// Also enqueue locally so local workers pick tasks up quickly
+		// (best-effort); the batch Raft entry remains the durable source.
+		_ = s.queue.Enqueue(item.TenantId, &queue.TaskEnvelope{
+			TaskID: create[i].TaskID, TenantID: item.TenantId, Payload: item.Payload, CreatedAt: time.Now().UTC(),
+		})
+	}
+	return resp, nil
 }
 
 // ---------------------------------------------------------------------------

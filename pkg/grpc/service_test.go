@@ -7,6 +7,8 @@ import (
 
 	"go.uber.org/zap"
 	googlegrpc "google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	grpcv1 "github.com/day253/sluice/pkg/grpc/v1"
 	"github.com/day253/sluice/pkg/queue"
@@ -86,5 +88,68 @@ func TestSubmitForwardsBeforeFollowerTenantValidation(t *testing.T) {
 	}
 	if task := leaderFSM.GetTask(resp.GetTaskId()); task == nil || task.TenantID != "tenant-a" {
 		t.Fatalf("leader task = %+v, want tenant-a", task)
+	}
+}
+
+func TestSubmitBatchUsesOneRaftApply(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{ID: "tenant-a", MaxWorkers: 10})
+	testRaft := &internalTestRaft{fsm: fsm}
+	testRaft.leader.Store(true)
+	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
+
+	resp, err := svc.SubmitBatch(context.Background(), &grpcv1.SubmitBatchRequest{Tasks: []*grpcv1.SubmitRequest{
+		{TenantId: "tenant-a", Payload: []byte(`{"n":1}`)},
+		{TenantId: "tenant-a", Payload: []byte(`{"n":2}`)},
+		{TenantId: "tenant-a", Payload: []byte(`{"n":3}`)},
+	}})
+	if err != nil {
+		t.Fatalf("submit batch: %v", err)
+	}
+	if len(resp.GetTasks()) != 3 {
+		t.Fatalf("batch response length = %d, want 3", len(resp.GetTasks()))
+	}
+	if got := testRaft.applyCount.Load(); got != 1 {
+		t.Fatalf("Raft Apply calls = %d, want one batch entry", got)
+	}
+	for _, task := range resp.GetTasks() {
+		if task.GetTaskId() == "" || fsm.GetTask(task.GetTaskId()) == nil {
+			t.Fatalf("batch task was not persisted: %+v", task)
+		}
+	}
+}
+
+func TestSubmitBatchRejectsUnknownTenantAtomically(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	testRaft := &internalTestRaft{fsm: fsm}
+	testRaft.leader.Store(true)
+	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
+
+	_, err := svc.SubmitBatch(context.Background(), &grpcv1.SubmitBatchRequest{Tasks: []*grpcv1.SubmitRequest{
+		{TenantId: "missing", Payload: []byte(`{}`)},
+	}})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("unknown tenant error = %v, want NotFound", err)
+	}
+	if got := testRaft.applyCount.Load(); got != 0 {
+		t.Fatalf("unknown tenant caused %d Raft Apply calls", got)
+	}
+}
+
+func TestSubmitBatchRejectsOversizedRequest(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	testRaft := &internalTestRaft{fsm: fsm}
+	testRaft.leader.Store(true)
+	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
+	tasks := make([]*grpcv1.SubmitRequest, maxSubmitBatchTasks+1)
+	for i := range tasks {
+		tasks[i] = &grpcv1.SubmitRequest{TenantId: "tenant-a"}
+	}
+	_, err := svc.SubmitBatch(context.Background(), &grpcv1.SubmitBatchRequest{Tasks: tasks})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("oversized batch error = %v, want InvalidArgument", err)
+	}
+	if got := testRaft.applyCount.Load(); got != 0 {
+		t.Fatalf("oversized batch caused %d Raft Apply calls", got)
 	}
 }

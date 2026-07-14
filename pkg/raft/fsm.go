@@ -66,6 +66,8 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		return f.applyNodeDown(cmd.Data)
 	case OpCreateTask:
 		return f.applyCreateTask(cmd.Data)
+	case OpCreateTaskBatch:
+		return f.applyCreateTaskBatch(cmd.Data)
 	case OpClaimTask:
 		return f.applyClaimTask(cmd.Data)
 	case OpClaimBatch:
@@ -253,15 +255,33 @@ func (f *FSM) applyCreateTask(data json.RawMessage) interface{} {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return err
 	}
+	f.insertPendingTask(req)
+	return nil
+}
+
+func (f *FSM) applyCreateTaskBatch(data json.RawMessage) interface{} {
+	var req CreateTaskBatchData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+	for _, task := range req.Tasks {
+		f.insertPendingTask(task)
+	}
+	return nil
+}
+
+// insertPendingTask applies the idempotent pending-task insertion shared by
+// single and batch create commands. The caller holds f.mu through Apply.
+func (f *FSM) insertPendingTask(req CreateTaskData) {
 	// If a task with this ID already exists or has already completed
 	// (idempotency), skip. A delayed duplicate submission must not resurrect a
 	// completed task.
 	if _, ok := f.state.Tasks[req.TaskID]; ok {
-		return nil
+		return
 	}
 	if _, ok := f.state.Results[req.TaskID]; ok {
 		delete(f.state.Tasks, req.TaskID)
-		return nil
+		return
 	}
 	f.state.Tasks[req.TaskID] = &types.TaskRecord{
 		TaskID:    req.TaskID,
@@ -270,7 +290,6 @@ func (f *FSM) applyCreateTask(data json.RawMessage) interface{} {
 		Payload:   req.Payload,
 		CreatedAt: time.Now().UTC(),
 	}
-	return nil
 }
 
 func (f *FSM) applyClaimTask(data json.RawMessage) interface{} {

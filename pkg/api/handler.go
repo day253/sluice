@@ -21,11 +21,13 @@ import (
 // Handler adapts the gRPC Sluice service to HTTP REST.  Every endpoint
 // converts the HTTP request to a gRPC call and the response back to JSON.
 type Handler struct {
-	nodeID     string
-	svc        *grpcpkg.Service
-	joinFunc   func(nodeID, raftAddr, httpAddr string, workers int) error
-	collector  interface{ Query(name string) ([]MetricsData, int) }
-	logger     *zap.Logger
+	nodeID    string
+	svc       *grpcpkg.Service
+	joinFunc  func(nodeID, raftAddr, httpAddr string, workers int) error
+	collector interface {
+		Query(name string) ([]MetricsData, int)
+	}
+	logger *zap.Logger
 }
 
 type MetricsData struct {
@@ -43,7 +45,9 @@ func NewHandler(nodeID string, svc *grpcpkg.Service, logger *zap.Logger) *Handle
 }
 
 // SetCollector sets the metrics collector for /api/v1/metrics endpoint.
-func (h *Handler) SetCollector(c interface{ Query(name string) ([]MetricsData, int) }) {
+func (h *Handler) SetCollector(c interface {
+	Query(name string) ([]MetricsData, int)
+}) {
 	h.collector = c
 }
 
@@ -55,6 +59,7 @@ func (h *Handler) SetJoinFunc(fn func(nodeID, raftAddr, httpAddr string, workers
 // RegisterRoutes attaches all endpoints to the given router.
 func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/tasks", h.submitTask).Methods("POST")
+	r.HandleFunc("/api/v1/tasks/batch", h.submitBatch).Methods("POST")
 	r.HandleFunc("/api/v1/tasks/{task_id}", h.getTask).Methods("GET")
 	r.HandleFunc("/api/v1/tasks/{task_id}/wait", h.waitTask).Methods("GET")
 
@@ -94,6 +99,30 @@ func (h *Handler) submitTask(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusAccepted, types.TaskResponse{
 		TaskID: resp.TaskId, TenantID: resp.TenantId, Status: resp.Status,
 	})
+}
+
+func (h *Handler) submitBatch(w http.ResponseWriter, r *http.Request) {
+	var body types.BatchTaskSubmitRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	req := &grpcv1.SubmitBatchRequest{Tasks: make([]*grpcv1.SubmitRequest, len(body.Tasks))}
+	for i, task := range body.Tasks {
+		req.Tasks[i] = &grpcv1.SubmitRequest{
+			TenantId: task.TenantID, Payload: task.Payload, IdempotencyKey: task.IdempotencyKey,
+		}
+	}
+	resp, err := h.svc.SubmitBatch(r.Context(), req)
+	if err != nil {
+		h.writeGRPCError(w, err)
+		return
+	}
+	out := types.BatchTaskResponse{Tasks: make([]types.TaskResponse, len(resp.Tasks))}
+	for i, task := range resp.Tasks {
+		out.Tasks[i] = types.TaskResponse{TaskID: task.TaskId, TenantID: task.TenantId, Status: task.Status}
+	}
+	h.writeJSON(w, http.StatusAccepted, out)
 }
 
 func (h *Handler) getTask(w http.ResponseWriter, r *http.Request) {
