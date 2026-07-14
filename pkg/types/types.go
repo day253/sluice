@@ -66,13 +66,14 @@ type NodeAllocation struct {
 // inflight (currently being processed).  Once finished the task is moved into
 // TaskResult.
 type TaskRecord struct {
-	TaskID    string    `json:"task_id"`
-	TenantID  string    `json:"tenant_id"`
-	Status    string    `json:"status"` // "pending" | "inflight"
-	NodeID    string    `json:"node_id,omitempty"`
-	Payload   string    `json:"payload,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	ClaimedAt time.Time `json:"claimed_at,omitempty"`
+	TaskID      string    `json:"task_id"`
+	TenantID    string    `json:"tenant_id"`
+	Status      string    `json:"status"` // "pending" | "inflight"
+	NodeID      string    `json:"node_id,omitempty"`
+	QueueNodeID string    `json:"queue_node_id,omitempty"` // node-local queue origin while pending
+	Payload     string    `json:"payload,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	ClaimedAt   time.Time `json:"claimed_at,omitempty"`
 }
 
 // TaskResult is the final outcome of a task.

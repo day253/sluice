@@ -26,6 +26,10 @@ type mockRaftApplier struct {
 	appliedCmds [][]byte
 }
 
+type followerRaftApplier struct{ mockRaftApplier }
+
+func (f *followerRaftApplier) IsLeader() bool { return false }
+
 func (m *mockRaftApplier) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {
 	m.mu.Lock()
 	m.appliedCmds = append(m.appliedCmds, cmd)
@@ -326,6 +330,32 @@ func TestPoolWorker_RecoveryTasks(t *testing.T) {
 	pool.Shutdown(2 * time.Second)
 }
 
+func TestPoolWorker_FollowerDoesNotRaceFreshGlobalPendingTask(t *testing.T) {
+	q := queue.NewMemoryQueue()
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "leader-owned-pending", TenantID: "a", Payload: `"payload"`,
+	})
+	raft := &followerRaftApplier{}
+	proc := &mockProcessor{}
+	pool := NewPool("follower", q, fsm, raft, proc, zap.NewNop())
+	pool.Reconcile(map[string]int{"a": 1})
+	time.Sleep(250 * time.Millisecond)
+
+	if proc.processedCount() != 0 {
+		t.Fatal("follower raced the leader's fresh pending task")
+	}
+	if raft.appliedCount() != 0 {
+		t.Fatalf("follower issued %d direct Raft claims, want 0", raft.appliedCount())
+	}
+	if task := fsm.GetTask("leader-owned-pending"); task == nil || task.Status != types.TaskStatusPending {
+		t.Fatalf("fresh pending task changed unexpectedly: %+v", task)
+	}
+	if err := pool.Shutdown(2 * time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+}
+
 func TestPoolWorker_StealsAgedTaskFromAnotherTenant(t *testing.T) {
 	q := queue.NewMemoryQueue()
 	fsm := raftpkg.NewFSM(zap.NewNop())
@@ -357,6 +387,40 @@ func TestPoolWorker_StealsAgedTaskFromAnotherTenant(t *testing.T) {
 	}
 	if !client.didSteal() {
 		t.Fatal("worker completed another tenant's task without the steal claim path")
+	}
+	if err := pool.Shutdown(2 * time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+}
+
+func TestPoolWorker_PrefersLocalQueueStealBeforeGlobalAge(t *testing.T) {
+	q := queue.NewMemoryQueue()
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyOp(fsm, raftpkg.OpUpsertTenant, types.TenantConfig{ID: "worker", MaxWorkers: 1})
+	applyOp(fsm, raftpkg.OpUpsertTenant, types.TenantConfig{ID: "local-target", MaxWorkers: 1})
+	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "local-steal-task", TenantID: "local-target", QueueNodeID: "n1", Payload: `"payload"`,
+	})
+	if err := q.Enqueue("local-target", &queue.TaskEnvelope{
+		TaskID: "local-steal-task", TenantID: "local-target", Payload: json.RawMessage(`"payload"`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &stealTrackingClient{fsmTaskClient: &fsmTaskClient{fsm: fsm}}
+	pool := NewPool("n1", q, fsm, &mockRaftApplier{}, &mockProcessor{}, zap.NewNop())
+	pool.SetClaimer(client)
+	pool.SetCompleter(client)
+	pool.Reconcile(map[string]int{"worker": 1})
+
+	for i := 0; i < 40 && fsm.GetResult("local-steal-task") == nil; i++ {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if result := fsm.GetResult("local-steal-task"); result == nil || result.Status != types.TaskStatusDone {
+		t.Fatalf("local stolen task result = %+v", result)
+	}
+	if !client.didSteal() {
+		t.Fatal("local other-tenant queue was not claimed through steal path")
 	}
 	if err := pool.Shutdown(2 * time.Second); err != nil {
 		t.Fatalf("shutdown: %v", err)

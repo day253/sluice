@@ -111,9 +111,10 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 		}
 		taskID := uuid.New().String()
 		create[i] = raftpkg.CreateTaskData{
-			TaskID:   taskID,
-			TenantID: item.TenantId,
-			Payload:  string(item.Payload),
+			TaskID:      taskID,
+			TenantID:    item.TenantId,
+			Payload:     string(item.Payload),
+			QueueNodeID: s.nodeID,
 		}
 		resp.Tasks[i] = &grpcv1.SubmitResponse{TaskId: taskID, TenantId: item.TenantId, Status: types.TaskStatusPending}
 	}

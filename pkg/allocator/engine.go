@@ -198,10 +198,9 @@ func (e *Engine) Reconcile() error {
 	// 6. Apply idle penalty and redistribute released workers.
 	finalAlloc := e.applyIdleAdjustment(tenantList, baseAlloc, idleSet)
 
-	// 7. If exactly one tenant still has pending work, let it probe spare
-	// capacity above its configured limit. The moment another tenant has
-	// work, borrowed workers are released so normal quotas are
-	// restored in this same reconciliation cycle.
+	// 7. Let every tenant with an aged pending backlog probe otherwise spare
+	// capacity above its configured limit. Probes are shared fairly and shrink
+	// as soon as a tenant's backlog disappears.
 	pendingCount := e.fsm.CountPendingPerTenant()
 	finalAlloc, borrowed := e.applyBorrowing(
 		tenantList,
@@ -366,12 +365,12 @@ func (e *Engine) applyIdleAdjustment(
 }
 
 // applyBorrowing applies the adaptive idle-capacity policy after normal
-// fairness and idle redistribution. A tenant may exceed MaxWorkers only when
-// it is the sole tenant with work and has pending backlog. Its borrowed target
-// ramps as 1,3,7,... workers on successive reconciliation cycles, bounded by
-// the currently unused cluster capacity. As soon as another tenant has work,
-// all borrowed workers are released in one cycle; every tenant then receives
-// only its normal fair/idle-adjusted allocation.
+// fairness and idle redistribution. Any tenant with an aged pending backlog
+// may borrow otherwise unused cluster capacity; multiple backlogged tenants
+// share the spare capacity deterministically. Each tenant's target ramps as
+// 1,3,7,... (or a larger initial probe on a very large cluster), bounded by
+// its pending count and the remaining capacity. Borrowing is a current
+// allocation mirror, not history.
 //
 // The release decision includes inflight work: even if a newly submitted
 // task has already been claimed, its tenant is considered active and causes a
@@ -395,12 +394,14 @@ func (e *Engine) applyBorrowing(
 		e.borrowedTargets = make(map[string]int)
 	}
 
-	active := make([]string, 0, 1)
+	backlogged := make([]string, 0, len(tenants))
 	known := make(map[string]struct{}, len(tenants))
 	for _, tenant := range tenants {
 		known[tenant.ID] = struct{}{}
-		if unfinished[tenant.ID] > 0 && !idleSet[tenant.ID] {
-			active = append(active, tenant.ID)
+		oldest := oldestPending[tenant.ID]
+		aged := !oldest.IsZero() && time.Since(oldest) >= pendingBorrowThreshold
+		if unfinished[tenant.ID] > 0 && pending[tenant.ID] > 0 && !idleSet[tenant.ID] && aged {
+			backlogged = append(backlogged, tenant.ID)
 		} else {
 			delete(e.borrowedTargets, tenant.ID)
 		}
@@ -411,50 +412,56 @@ func (e *Engine) applyBorrowing(
 		}
 	}
 
-	// More than one tenant has work: release borrowed capacity
-	// immediately. This is the fast-reaction side of the controller.
-	if len(active) != 1 {
-		for _, tenantID := range active {
+	sort.Strings(backlogged)
+	if len(backlogged) == 0 {
+		return effective, borrowed
+	}
+
+	spare := totalWorkers - sumWorkers(effective)
+	if spare <= 0 {
+		for _, tenantID := range backlogged {
 			delete(e.borrowedTargets, tenantID)
 		}
 		return effective, borrowed
 	}
 
-	tenantID := active[0]
-	if pending[tenantID] <= 0 {
-		delete(e.borrowedTargets, tenantID)
-		return effective, borrowed
+	// Give every aged tenant a bounded probe in this cycle. A large cluster
+	// should not spend dozens of 3-second cycles discovering that thousands of
+	// workers are available, while small-cluster behavior stays conservative.
+	remainingTenants := len(backlogged)
+	for _, tenantID := range backlogged {
+		if spare <= 0 {
+			delete(e.borrowedTargets, tenantID)
+			continue
+		}
+		previous := e.borrowedTargets[tenantID]
+		step := borrowProbeStep
+		if previous == 0 && totalWorkers >= 1000 {
+			step = 64
+		}
+		target := step
+		if previous > 0 {
+			target = previous*2 + step
+		}
+		if target > pending[tenantID] {
+			target = pending[tenantID]
+		}
+		// Keep the probe fair when several tenants are backlogged.
+		share := (spare + remainingTenants - 1) / remainingTenants
+		if target > share {
+			target = share
+		}
+		if target <= 0 {
+			delete(e.borrowedTargets, tenantID)
+			remainingTenants--
+			continue
+		}
+		e.borrowedTargets[tenantID] = target
+		effective[tenantID] += target
+		borrowed[tenantID] = target
+		spare -= target
+		remainingTenants--
 	}
-	oldest := oldestPending[tenantID]
-	if oldest.IsZero() || time.Since(oldest) < pendingBorrowThreshold {
-		delete(e.borrowedTargets, tenantID)
-		return effective, borrowed
-	}
-	spare := totalWorkers - sumWorkers(effective)
-	if spare <= 0 {
-		delete(e.borrowedTargets, tenantID)
-		return effective, borrowed
-	}
-
-	previous := e.borrowedTargets[tenantID]
-	target := borrowProbeStep
-	if previous > 0 {
-		target = previous*2 + borrowProbeStep
-	}
-	if target > spare {
-		target = spare
-	}
-	if target > pending[tenantID] {
-		target = pending[tenantID]
-	}
-	if target <= 0 {
-		delete(e.borrowedTargets, tenantID)
-		return effective, borrowed
-	}
-
-	e.borrowedTargets[tenantID] = target
-	effective[tenantID] += target
-	borrowed[tenantID] = target
 	return effective, borrowed
 }
 
@@ -634,5 +641,6 @@ func (e *Engine) tenantList(tenants map[string]*types.TenantConfig) []*types.Ten
 	for _, t := range tenants {
 		list = append(list, t)
 	}
+	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
 	return list
 }

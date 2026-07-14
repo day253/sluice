@@ -75,21 +75,24 @@ func TestCanStealRequiresAgedPendingTask(t *testing.T) {
 	}
 
 	service := NewInternalService("leader", fsm, &internalTestRaft{}, zap.NewNop())
-	if !service.canSteal(raftpkg.ClaimTaskData{TaskID: "old-task", TenantID: "target", Steal: true}) {
+	if !service.canSteal(raftpkg.ClaimTaskData{TaskID: "old-task", TenantID: "target", NodeID: "worker-node", Steal: true}) {
 		t.Fatal("aged pending task was not admitted for stealing")
 	}
-	if service.canSteal(raftpkg.ClaimTaskData{TaskID: "old-task", TenantID: "target"}) {
+	if service.canSteal(raftpkg.ClaimTaskData{TaskID: "old-task", TenantID: "target", NodeID: "worker-node"}) {
 		t.Fatal("claim without steal flag was admitted")
 	}
-	if service.canSteal(raftpkg.ClaimTaskData{TaskID: "old-task", TenantID: "wrong", Steal: true}) {
+	if service.canSteal(raftpkg.ClaimTaskData{TaskID: "old-task", TenantID: "wrong", NodeID: "worker-node", Steal: true}) {
 		t.Fatal("wrong tenant was admitted for stealing")
 	}
 
 	applyInternalTestCommand(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
-		TaskID: "fresh-task", TenantID: "target", Payload: `{}`,
+		TaskID: "fresh-task", TenantID: "target", QueueNodeID: "worker-node", Payload: `{}`,
 	})
-	if service.canSteal(raftpkg.ClaimTaskData{TaskID: "fresh-task", TenantID: "target", Steal: true}) {
-		t.Fatal("fresh pending task was admitted for stealing")
+	if !service.canSteal(raftpkg.ClaimTaskData{TaskID: "fresh-task", TenantID: "target", NodeID: "worker-node", Steal: true}) {
+		t.Fatal("same-node pending task was not admitted for stealing")
+	}
+	if service.canSteal(raftpkg.ClaimTaskData{TaskID: "fresh-task", TenantID: "target", NodeID: "other-node", Steal: true}) {
+		t.Fatal("fresh cross-node task was admitted for stealing")
 	}
 }
 

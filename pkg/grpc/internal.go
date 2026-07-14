@@ -213,6 +213,12 @@ func (s *InternalService) canSteal(task raftpkg.ClaimTaskData) bool {
 	if record == nil || record.Status != "pending" || record.TenantID != task.TenantID {
 		return false
 	}
+	// A worker may immediately steal a task sitting in another tenant's queue
+	// on the same node. Cross-node steals remain age-gated so idle workers do
+	// not stampede the leader's recovery scan on fresh submissions.
+	if record.QueueNodeID != "" && record.QueueNodeID == task.NodeID {
+		return true
+	}
 	return !record.CreatedAt.IsZero() && record.CreatedAt.Before(time.Now().UTC().Add(-workStealThreshold))
 }
 

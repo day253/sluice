@@ -36,9 +36,10 @@ type Command struct {
 // CreateTaskData is the payload for OpCreateTask — writes a task directly
 // into the FSM as "pending" so any node's workers can claim it.
 type CreateTaskData struct {
-	TaskID   string `json:"task_id"`
-	TenantID string `json:"tenant_id"`
-	Payload  string `json:"payload"`
+	TaskID      string `json:"task_id"`
+	TenantID    string `json:"tenant_id"`
+	Payload     string `json:"payload"`
+	QueueNodeID string `json:"queue_node_id,omitempty"`
 }
 
 // CreateTaskBatchData is the payload for OpCreateTaskBatch. All tasks in the

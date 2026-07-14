@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -253,15 +254,24 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 
 		// 1. Try local queue first.
 		task := p.dequeueLocal(tenantID)
+		steal := false
 
-		// 2. If local is empty, scan FSM for recovery-pending tasks.
+		// 2. Prefer another tenant's queue on this same node before looking
+		// across the cluster. This is the cheapest steal and preserves locality.
+		if task == nil {
+			task = p.dequeueLocalOtherTenant(tenantID)
+			steal = task != nil
+		}
+
+		// 3. Only the leader performs the normal global recovery scan. All
+		// submissions are durably queued on the leader, and restricting this
+		// path prevents every node from racing on the same pending task.
 		if task == nil {
 			task = p.findRecoveryTask(tenantID)
 		}
 
-		// 3. An idle worker may steal an aged task from another tenant. This
+		// 4. An idle worker may steal an aged task from another tenant. This
 		// reuses existing capacity; it does not change the replicated allocation.
-		steal := false
 		if task == nil {
 			task = p.findStealTask(tenantID)
 			steal = task != nil
@@ -341,9 +351,32 @@ func (p *Pool) dequeueLocal(tenantID string) *types.TaskRecord {
 	}
 }
 
+// dequeueLocalOtherTenant scans node-local queues in deterministic tenant
+// order. A worker first gets a chance to consume its assigned tenant, then
+// reuses the same node's idle capacity for another tenant's local backlog.
+func (p *Pool) dequeueLocalOtherTenant(tenantID string) *types.TaskRecord {
+	tenants := p.fsm.GetAllTenants()
+	ids := make([]string, 0, len(tenants))
+	for id := range tenants {
+		if id != tenantID {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if task := p.dequeueLocal(id); task != nil {
+			return task
+		}
+	}
+	return nil
+}
+
 // findRecoveryTask scans the FSM for tasks that were re-queued after a node
 // failure and tries to claim one.
 func (p *Pool) findRecoveryTask(tenantID string) *types.TaskRecord {
+	if p.raft == nil || !p.raft.IsLeader() {
+		return nil
+	}
 	tasks := p.fsm.FindPendingTasks(tenantID)
 	if len(tasks) == 0 {
 		return nil

@@ -900,9 +900,8 @@ func TestDynamicTenant(t *testing.T) {
 }
 
 // TestAdaptiveIdleBorrowing verifies the end-to-end controller behavior:
-// one backlogged tenant can probe above its configured limit while the
-// cluster is otherwise idle, and the borrowed workers are released as soon
-// as a second tenant presents queued work.
+// every aged backlog can probe above its configured limit, multiple tenants
+// share spare capacity, and total effective workers never exceed the cluster.
 func TestAdaptiveIdleBorrowing(t *testing.T) {
 	tc := newTestCluster(t, 2, 5) // 10 total workers
 	defer tc.shutdown()
@@ -947,17 +946,21 @@ func TestAdaptiveIdleBorrowing(t *testing.T) {
 			borrowed += allocation.Borrowed["borrower"]
 		}
 		return borrowed > 0
-	}, 12*time.Second, "borrowed workers for sole backlogged tenant")
+	}, 12*time.Second, "borrowed workers for first backlogged tenant")
 
 	createBacklog("other", "other-task", 2000)
 	tc.waitFor(func() bool {
+		borrowed := map[string]int{}
+		effectiveTotal := 0
 		for _, allocation := range tc.fsms().GetAllAllocations() {
-			if allocation.Borrowed["borrower"] != 0 {
-				return false
+			borrowed["borrower"] += allocation.Borrowed["borrower"]
+			borrowed["other"] += allocation.Borrowed["other"]
+			for _, workers := range allocation.Tenants {
+				effectiveTotal += workers
 			}
 		}
-		return true
-	}, 8*time.Second, "borrowed workers released for second tenant")
+		return borrowed["borrower"] > 0 && borrowed["other"] > 0 && effectiveTotal <= 10
+	}, 12*time.Second, "spare workers shared by two backlogged tenants")
 }
 
 // TestOversubscription verifies the max-min fairness allocation when the sum

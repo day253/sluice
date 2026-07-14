@@ -286,7 +286,7 @@ func TestApplyBorrowing_ProbesSpareCapacityExponentially(t *testing.T) {
 	}
 }
 
-func TestApplyBorrowing_ReleasesImmediatelyWhenAnotherTenantBacklogs(t *testing.T) {
+func TestApplyBorrowing_SharesCapacityAcrossBackloggedTenants(t *testing.T) {
 	e := newTestEngine(nil)
 	e.borrowedTargets["small"] = 7
 	tenants := []*types.TenantConfig{
@@ -298,17 +298,20 @@ func TestApplyBorrowing_ReleasesImmediatelyWhenAnotherTenantBacklogs(t *testing.
 		tenants, base, 20,
 		map[string]int{"small": 100, "other": 1},
 		map[string]int{"small": 100, "other": 1},
-		map[string]time.Time{"small": time.Now().Add(-pendingBorrowThreshold - time.Second)},
+		map[string]time.Time{
+			"small": time.Now().Add(-pendingBorrowThreshold - time.Second),
+			"other": time.Now().Add(-pendingBorrowThreshold - time.Second),
+		},
 		map[string]bool{},
 	)
-	if len(borrowed) != 0 {
-		t.Fatalf("borrowed allocation = %v, want empty", borrowed)
+	if borrowed["small"] != 15 || borrowed["other"] != 1 {
+		t.Fatalf("borrowed allocation = %v, want small=15 other=1", borrowed)
 	}
-	if effective["small"] != 1 || effective["other"] != 1 {
-		t.Fatalf("effective allocation = %v, want configured base", effective)
+	if effective["small"] != 16 || effective["other"] != 2 {
+		t.Fatalf("effective allocation = %v, want small=16 other=2", effective)
 	}
-	if _, ok := e.borrowedTargets["small"]; ok {
-		t.Fatal("borrow target was not released")
+	if _, ok := e.borrowedTargets["small"]; !ok {
+		t.Fatal("small borrow target was unexpectedly released")
 	}
 }
 

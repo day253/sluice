@@ -284,11 +284,12 @@ func (f *FSM) insertPendingTask(req CreateTaskData) {
 		return
 	}
 	f.state.Tasks[req.TaskID] = &types.TaskRecord{
-		TaskID:    req.TaskID,
-		TenantID:  req.TenantID,
-		Status:    types.TaskStatusPending,
-		Payload:   req.Payload,
-		CreatedAt: time.Now().UTC(),
+		TaskID:      req.TaskID,
+		TenantID:    req.TenantID,
+		Status:      types.TaskStatusPending,
+		QueueNodeID: req.QueueNodeID,
+		Payload:     req.Payload,
+		CreatedAt:   time.Now().UTC(),
 	}
 }
 

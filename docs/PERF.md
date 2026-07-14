@@ -143,8 +143,8 @@ task/s = 1 / (2 × RaftCommitLatency + ProcessTime)
 
 ClaimStream 保持 worker 到达顺序并以最多 128 条为一批提交 `OpClaimBatch`；节点上的
 多个 worker 并发执行，ResultStream 以同样的批量窗口提交 `OpCompleteBatch`。空闲 worker
-可标记 work-steal，leader 只放行等待超过 5 秒的跨租户 pending 任务，排序依据是实际
-`CreatedAt`，不依赖客户端估时。
+优先偷取本机其他租户队列，跨节点 work-steal 只放行等待超过 5 秒的 pending 任务；
+排序依据是实际 `CreatedAt`，不依赖客户端估时。
 
 ### 5.2 空闲容量借用
 
@@ -152,11 +152,11 @@ ClaimStream 保持 worker 到达顺序并以最多 128 条为一批提交 `OpCla
 先完成 Max-Min Fairness 和 idle redistribution，再查看 FSM 的 pending 数：
 
 ```text
-只有 borrower 有任务且仍有 pending backlog:
-  borrowed target = 1 → 3 → 7 → ... ≤ spare cluster workers
+每个 backlog 等待超过 5 秒的 tenant:
+  borrowed target = 1 → 3 → 7 → ...（大集群首轮 64）≤ spare / pending
 
-出现第二个 tenant 的任务（pending 或 inflight）:
-  borrowed target = 0（当前 reconciliation 周期内立即回收）
+某个 tenant 的 pending backlog 消失:
+  该 tenant borrowed target = 0（当前 reconciliation 周期内立即回收）
 ```
 
 这样单租户低配额、其他租户空闲时可以逐步吃满剩余并发；新租户有任务时，

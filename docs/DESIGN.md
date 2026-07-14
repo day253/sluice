@@ -26,10 +26,10 @@
 提交请求不携带处理耗时预估。任务进入 FSM 后按 `CreatedAt` FIFO 排队，由实际
 处理结果和待处理时长驱动调度，避免客户端估时不准导致饥饿。
 
-空闲 worker 会在本地队列和本租户恢复任务都为空时，向 leader 请求“偷取”其他租户
-中等待超过 5 秒的 pending 任务。leader 会再次校验任务状态、租户和等待时长，成功
-后仍通过原有批量 Claim Raft 日志提交。work-steal 不增加配额，只复用已经存在的
-空闲并发；ClaimBatch 和 ResultBatch 分别用一条 Raft 日志提交。
+空闲 worker 先尝试本节点其他租户的本地队列，再在本地队列为空时向 leader 请求“偷取”
+其他租户中等待超过 5 秒的 pending 任务。leader 会再次校验任务状态、租户和等待时长，
+同节点队列任务可立即放行。成功后仍通过原有批量 Claim Raft 日志提交。work-steal 不
+增加配额，只复用已经存在的空闲并发；ClaimBatch 和 ResultBatch 分别用一条 Raft 日志提交。
 
 ## 限流模型
 
@@ -38,10 +38,9 @@
 - **执行**: Leader 在 ClaimStream 中检查 `inflight[node][tenant] < alloc[node][tenant]`
 - **空闲**: 连续 3 周期 0 inflight → idle → 降为 1 worker
 - **超售**: sum(limits) > total_workers → Max-Min Fairness 按比例分配
-- **借用**: `max_workers` 是正常保底配额；当只有一个租户仍有任务且它还有
-  pending backlog、集群有剩余容量时，该租户可以临时超过配额。借用目标由 Leader
-  试探为 `1, 3, 7, ...`，每次不超过当前剩余容量；一旦第二个租户出现任务
-  （即使已经被 claim、只剩 inflight），本轮立即清零所有借用，先恢复各租户正常配额。
+- **借用**: `max_workers` 是正常保底配额；所有等待超过 5 秒的 tenant backlog 都可以
+  共享集群剩余容量。借用目标按 tenant 独立试探为 `1, 3, 7, ...`（大集群首轮为 64），
+  每轮受 pending 数、剩余容量和公平份额限制；backlog 消失后立即回收。
 
 ## 分配算法
 
@@ -52,7 +51,7 @@ Allocator (Leader, 每 3s):
   3. 均匀分布到各节点
   4. 空闲检测: inflight=0 连续 3 周期 → idle → 1 worker
   5. 空闲租户释放的 worker 二次分配给活跃租户
-  6. 只有一个 pending 租户且 backlog 已等待 5s 时，按自适应试探增加借用 worker
+  6. 对所有 backlog 已等待 5s 的租户，按公平份额自适应试探增加借用 worker
   7. raft.Apply(OpUpdateAllocation)
 
 ### 借用额度与写入规则
