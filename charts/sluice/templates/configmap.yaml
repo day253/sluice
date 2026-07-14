@@ -80,8 +80,11 @@ data:
         fi
         echo "   waiting for a reachable Raft leader... ${i}"; sleep 2
       done
+      # The join request above already registered this member on the current
+      # leader. Do not send a second request to the bootstrap follower; it can
+      # reject the duplicate while the member is already being replicated.
       exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
         --raft-advertise="${RAFT_ADVERTISE}" \
-        --data="${DATA}" --join="${BOOTSTRAP_IP}:{{ .Values.apiPort }}" \
-        --workers={{ .Values.workersPerNode }} --log-level={{ .Values.logLevel }}
+        --data="${DATA}" --workers={{ .Values.workersPerNode }} \
+        --log-level={{ .Values.logLevel }}
     fi
