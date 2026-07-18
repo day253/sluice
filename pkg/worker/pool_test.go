@@ -298,6 +298,29 @@ type slowProcessor struct {
 	ignoreCancel bool
 }
 
+type gatedProcessor struct {
+	started  chan struct{}
+	release  chan struct{}
+	canceled chan struct{}
+}
+
+func newGatedProcessor() *gatedProcessor {
+	return &gatedProcessor{
+		started: make(chan struct{}, 1), release: make(chan struct{}), canceled: make(chan struct{}, 1),
+	}
+}
+
+func (p *gatedProcessor) Process(ctx context.Context, _, _ string, _ json.RawMessage) (string, error) {
+	p.started <- struct{}{}
+	select {
+	case <-p.release:
+		return "done", nil
+	case <-ctx.Done():
+		p.canceled <- struct{}{}
+		return "", ctx.Err()
+	}
+}
+
 func (p *slowProcessor) Process(ctx context.Context, taskID, tenantID string, payload json.RawMessage) (string, error) {
 	if p.ignoreCancel {
 		time.Sleep(p.delay)
@@ -309,6 +332,61 @@ func (p *slowProcessor) Process(ctx context.Context, taskID, tenantID string, pa
 	case <-time.After(p.delay):
 		return "done", nil
 	}
+}
+
+func TestPoolReconcileScaleDownRetiresAfterInflightCompletion(t *testing.T) {
+	q := queue.NewMemoryQueue()
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "graceful-retire", TenantID: "a", Payload: `{"work":true}`,
+	})
+	applyOp(fsm, raftpkg.OpClaimTask, raftpkg.ClaimTaskData{
+		TaskID: "graceful-retire", TenantID: "a", NodeID: "worker-node", Payload: `{"work":true}`,
+	})
+	client := &leaderAssignmentClient{
+		fsm: fsm,
+		task: &types.TaskRecord{
+			TaskID: "graceful-retire", TenantID: "a", Status: types.TaskStatusInflight,
+			NodeID: "worker-node", Payload: `{"work":true}`,
+		},
+	}
+	processor := newGatedProcessor()
+	pool := NewPool("worker-node", q, fsm, &mockRaftApplier{}, processor, zap.NewNop())
+	pool.SetClaimer(client)
+	pool.SetCompleter(client)
+	pool.Reconcile(map[string]int{"a": 1})
+	select {
+	case <-processor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processor did not start")
+	}
+
+	pool.Reconcile(map[string]int{})
+	if got := pool.GetStatus()["a"]; got != 0 {
+		t.Fatalf("eligible workers after scale-down = %d, want 0", got)
+	}
+	select {
+	case <-processor.canceled:
+		t.Fatal("allocation scale-down canceled an in-flight processor")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if result := fsm.GetResult("graceful-retire"); result != nil {
+		t.Fatalf("task completed before processor release: %+v", result)
+	}
+	close(processor.release)
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if result := fsm.GetResult("graceful-retire"); result != nil {
+			if result.Status != types.TaskStatusDone {
+				t.Fatalf("result = %+v, want done", result)
+			}
+			if err := pool.Shutdown(2 * time.Second); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("retiring worker did not commit the final result")
 }
 
 // ---------------------------------------------------------------------------

@@ -88,7 +88,7 @@ type tenantGroup struct {
 	tenantID string
 	desired  int
 	current  int
-	cancels  []context.CancelFunc // one per running worker
+	retires  []chan struct{} // one per worker still eligible to request work
 }
 
 // ---------------------------------------------------------------------------
@@ -221,30 +221,30 @@ func (p *Pool) Shutdown(timeout time.Duration) error {
 
 func (p *Pool) spawnWorkers(grp *tenantGroup, count int) {
 	for i := 0; i < count; i++ {
-		ctx, cancel := context.WithCancel(p.ctx)
-		grp.cancels = append(grp.cancels, cancel)
+		retire := make(chan struct{})
+		grp.retires = append(grp.retires, retire)
 		grp.current++
 
 		p.wg.Add(1)
-		go p.workerLoop(ctx, cancel, grp.tenantID)
+		go p.workerLoop(p.ctx, retire, grp.tenantID)
 	}
 }
 
 func (p *Pool) killWorkers(grp *tenantGroup, count int) {
-	// Cancel the oldest workers; they will finish their current task and exit.
-	for i := 0; i < count && len(grp.cancels) > 0; i++ {
-		// Cancel the last (newest) worker.
-		cancel := grp.cancels[len(grp.cancels)-1]
-		grp.cancels = grp.cancels[:len(grp.cancels)-1]
-		cancel()
+	// Retire the newest workers. Retirement stops the next assignment request
+	// but deliberately does not cancel an already claimed business task; only
+	// Pool.Shutdown/leadership shutdown cancels the shared hard-stop context.
+	for i := 0; i < count && len(grp.retires) > 0; i++ {
+		retire := grp.retires[len(grp.retires)-1]
+		grp.retires = grp.retires[:len(grp.retires)-1]
+		close(retire)
 		grp.current--
 	}
 }
 
 // workerLoop is the main goroutine for a single worker.
-func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenantID string) {
+func (p *Pool) workerLoop(ctx context.Context, retire <-chan struct{}, tenantID string) {
 	defer func() {
-		cancel()
 		p.wg.Done()
 	}()
 
@@ -256,11 +256,16 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 		case <-ctx.Done():
 			logger.Debug("worker exiting")
 			return
+		case <-retire:
+			logger.Debug("worker retired")
+			return
 		default:
 		}
 		if p.workerGuard != nil && !p.workerGuard() {
 			select {
 			case <-ctx.Done():
+				return
+			case <-retire:
 				return
 			case <-time.After(100 * time.Millisecond):
 			}
@@ -323,6 +328,8 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 			select {
 			case <-ctx.Done():
 				return
+			case <-retire:
+				return
 			case <-time.After(100 * time.Millisecond):
 			}
 			continue
@@ -376,6 +383,14 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 		if completeErr != nil {
 			logger.Error("task result was not committed; lease recovery will retry the task",
 				zap.String("task_id", task.TaskID), zap.Error(completeErr))
+		}
+		// A scale-down that raced with this assignment is graceful: commit the
+		// final state above, then retire without requesting another task.
+		select {
+		case <-retire:
+			logger.Debug("worker retired after completing in-flight task")
+			return
+		default:
 		}
 	}
 }

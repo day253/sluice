@@ -42,6 +42,9 @@ work steal 也是 Leader 的调度决策，不是各节点自发抢占。空闲 
 - **全局**: Allocator 只在活跃 Follower 上计算每租户每节点的有效 worker 配额
 - **执行**: 每个 Worker 同步持有至多一个 Assignment 请求/任务；Leader 校验请求节点
   确实拥有其 preferred tenant 配额，实际并发由 Worker 数硬限制
+- **缩容**: allocation 减少只让多余 Worker 停止请求下一条 assignment；已 claim 并开始
+  的 Processor 必须先完成并提交最终状态。进程关闭仍使用硬取消和 lease 恢复，普通借用
+  回收或 Leader 角色切换不能制造 30 秒尾部重试
 - **空闲**: 连续 3 周期 0 inflight → idle → 降为 1 worker
 - **超售**: sum(limits) > total_workers → Max-Min Fairness 按比例分配
 - **借用**: `max_workers` 是正常保底配额；所有等待超过 5 秒的 tenant backlog 都可以
@@ -211,6 +214,9 @@ HTTP REST:
    Raft 日志不超过 128 个任务。单请求等待不能关闭同节点其他健康请求共用的流。
 9. **共识规模有界**：单 shard voter 数不超过配置的正奇数上限；执行副本扩容只能增加
    non-voter。已有超大 voter 集合必须先转移 leadership 再 demote，不能删除 FSM 副本。
+10. **缩容不抢占执行**：allocation 缩容只禁止 retiring Worker 获取下一条任务；已经由
+    Leader claim 的 Processor 允许完成并提交。它可在缩容窗口内暂时高于新 allocation，
+    但不得追加新 claim；本版本不提供业务任务抢占或安全取消协议。
 
 当前需求范围：系统负责 durable queue、Leader 单一调度、并发配额、空闲容量借用、
 节点内优先和跨节点兜底的 work-steal，以及失败后的至少一次执行尝试/单次最终状态提交。系统当前不提供
@@ -312,6 +318,25 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **验证**：本机真实 7 实例/3 voter、4 tenant、Follower HTTP 路径的 20000 条提交由旧
   实现首批 1000 条超过 15 秒，改善为全部 20000 条 1.338 秒提交、43.800 秒排空；每条
   只执行一次。单测和完整集成映射见 `docs/TESTING.md` 的 PERF-001。
+
+### SCHED-005：借用回收取消正在执行的任务
+
+- **现象**：PERF-001 首轮优化部署后，20000 条提交只需 3.290 秒，33.9 秒已降到 388
+  unfinished，但 44.0 秒仍是 388，最终到 61.0 秒才归零。多个 Pod 在 allocation 更新
+  周期同时记录 `task interrupted; waiting for lease recovery`，尾部正好等待 30 秒 lease。
+- **根因**：`Pool.Reconcile` 缩小 tenant Worker 数时直接 cancel 每个 Worker 的 context；
+  同一个 context 也传给正在运行的 Processor。借用试探/回收本是普通容量调整，却被当成
+  节点关闭，已经 claim 的任务被中断且没有最终状态，只能等 lease 重派。
+- **修复**：Worker 分离 `retire` 信号和 Pool 硬停止 context。缩容关闭 retire 信号；空闲
+  Worker 立即退出，已获得 assignment 的 Worker 完成 Processor、提交 Complete 后退出，
+  不再请求新任务。只有进程 Shutdown 会 cancel Processor context。
+- **边界**：系统没有通用业务取消/抢占协议；已开始 Processor 不因 Limit/借用回收中断。
+  缩容期间旧 inflight 可短暂超过新的 allocation，但 retiring Worker 不得产生新 claim。
+  节点/进程真实丢失仍由 30 秒 lease 恢复，Processor 副作用仍要求幂等。
+- **回归覆盖**：`TestPoolReconcileScaleDownRetiresAfterInflightCompletion` 确定性阻塞
+  Processor 后缩容；真实 3 节点 `TestAllocationScaleDownLetsInflightProcessorsFinish` 走
+  Leader assignment、Raft claim/complete、Pool Reconcile，断言零取消、零 lease 等待、
+  每任务只处理一次。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 

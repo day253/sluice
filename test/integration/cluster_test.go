@@ -455,6 +455,11 @@ func (tc *testCluster) fsms() *raftpkg.FSM {
 type recordingProcessor struct {
 	mu        sync.Mutex
 	processed []processedRecord
+
+	gateTenant  string
+	gateStarted chan string
+	gateRelease chan struct{}
+	canceled    int
 }
 
 type processedRecord struct {
@@ -472,10 +477,40 @@ func (p *recordingProcessor) Process(ctx context.Context, taskID, tenantID strin
 	p.processed = append(p.processed, processedRecord{
 		TaskID: taskID, TenantID: tenantID,
 	})
+	gateStarted := p.gateStarted
+	gateRelease := p.gateRelease
+	gated := tenantID == p.gateTenant && gateStarted != nil && gateRelease != nil
 	p.mu.Unlock()
+	if gated {
+		gateStarted <- taskID
+		select {
+		case <-gateRelease:
+		case <-ctx.Done():
+			p.mu.Lock()
+			p.canceled++
+			p.mu.Unlock()
+			return "", ctx.Err()
+		}
+	}
 	// Simulate a small amount of work.
 	time.Sleep(10 * time.Millisecond)
 	return fmt.Sprintf(`{"echo":%s}`, string(payload)), nil
+}
+
+func (p *recordingProcessor) gate(tenantID string) (<-chan string, func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.gateTenant = tenantID
+	p.gateStarted = make(chan string, 128)
+	p.gateRelease = make(chan struct{})
+	var once sync.Once
+	return p.gateStarted, func() { once.Do(func() { close(p.gateRelease) }) }
+}
+
+func (p *recordingProcessor) canceledCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.canceled
 }
 
 func (p *recordingProcessor) totalProcessed() int {
@@ -1046,6 +1081,70 @@ func TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery(t *testing.T
 	}
 	if assignmentBatches == 0 || completionBatches == 0 {
 		t.Fatalf("observed assignment batches=%d completion batches=%d, want both", assignmentBatches, completionBatches)
+	}
+}
+
+// TestAllocationScaleDownLetsInflightProcessorsFinish preserves SCHED-005.
+// The real allocator/pool boundary may reduce borrowed workers while tasks are
+// executing; retirement must stop future assignments without canceling the
+// already claimed Processor or forcing a 30-second lease recovery.
+func TestAllocationScaleDownLetsInflightProcessorsFinish(t *testing.T) {
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	const tenantID = "graceful-scale-down"
+	started, release := tc.proc.gate(tenantID)
+	defer release()
+	tc.addTenant(tenantID, 4)
+	tc.waitAllocation(10 * time.Second)
+
+	const taskCount = 4
+	taskIDs := make([]string, 0, taskCount)
+	for i := 0; i < taskCount; i++ {
+		taskIDs = append(taskIDs, tc.submitTask(0, tenantID, fmt.Sprintf(`{"task":%d}`, i)))
+	}
+	seen := make(map[string]struct{}, taskCount)
+	deadline := time.After(10 * time.Second)
+	for len(seen) < taskCount {
+		select {
+		case taskID := <-started:
+			seen[taskID] = struct{}{}
+		case <-deadline:
+			t.Fatalf("only %d/%d processors started", len(seen), taskCount)
+		}
+	}
+
+	leader := tc.leaderIdx()
+	for i, nd := range tc.nodes {
+		if i != leader {
+			nd.Pool().Reconcile(map[string]int{})
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := tc.proc.canceledCount(); got != 0 {
+		t.Fatalf("allocation scale-down canceled %d in-flight processors, want 0", got)
+	}
+	for _, taskID := range taskIDs {
+		if result := tc.fsms().GetResult(taskID); result != nil {
+			t.Fatalf("task %s completed before gated processor release: %+v", taskID, result)
+		}
+	}
+
+	release()
+	tc.waitFor(func() bool {
+		for _, taskID := range taskIDs {
+			result := tc.fsms().GetResult(taskID)
+			if result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "retiring workers commit in-flight results without lease recovery")
+	processed := tc.proc.processedTaskCounts()
+	for _, taskID := range taskIDs {
+		if got := processed[taskID]; got != 1 {
+			t.Fatalf("task %s processed %d times, want once", taskID, got)
+		}
 	}
 }
 
