@@ -337,6 +337,10 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   Processor 后缩容；真实 3 节点 `TestAllocationScaleDownLetsInflightProcessorsFinish` 走
   Leader assignment、Raft claim/complete、Pool Reconcile，断言零取消、零 lease 等待、
   每任务只处理一次。
+- **远程复测**：50 个执行实例、5 voter/45 non-voter、4 tenant 按条目轮转提交同一组
+  20000 条任务，批量写入 2.880 秒，端到端 29.688 秒（写入后排空 26.808 秒）；原有
+  30 秒 lease 尾部消失。测试窗口内所有 Pod 的执行中断、lease recovery、提交失败与
+  error 日志均为 0，最终四个租户 unfinished 均为 0。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 

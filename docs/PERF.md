@@ -111,6 +111,10 @@ PERF-001 的故障环境是 50 voter/多数派 26 且共用一台物理机磁盘
 Follower HTTP 提交为 1.338 秒、消费为 43.800 秒。环境、磁盘与 Processor 不同，数值
 不能直接当生产 SLA，但 Case 会阻止复杂度、重复存储和 quorum 规模回退。
 
+远程 50 实例改为 5 voter/45 non-voter，并修复 allocation 缩容取消正在执行任务后，
+相同 4 tenant/20000 条按 tenant 轮转的批量测试提交为 2.880 秒，端到端为 29.688 秒；
+测试窗口没有任务中断、lease recovery、提交失败或 error，最终 unfinished 为 0。
+
 ---
 
 ## 4. 极限值
