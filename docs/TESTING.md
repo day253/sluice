@@ -33,6 +33,7 @@ Case、单元回归测试和真实集成回归测试；修复后仍保留这些 
 | SCHED-001 | Worker 只能执行 Leader 已提交的具体 assignment，不能从复制的 fresh pending 自发 Claim；任务最终只处理一次 | `pkg/worker.TestPoolWorker_ExecutesLeaderAssignmentWithoutWorkerClaim`、`pkg/grpc.TestAssignmentStreamBatchesDistinctLeaderCommittedTasks` | `test/integration.TestFreshRecoveryDoesNotCauseCrossNodeClaimStorm` |
 | SCHED-002 | aged pending 也必须由 Leader 唯一选择并批量 Claim；多节点不能因同时扫描产生 rejected-claim 风暴 | `pkg/grpc.TestSelectPendingForSlot_PreservesLocalityAndAgeBoundary`、`TestAssignmentStreamBatchesDistinctLeaderCommittedTasks` | `test/integration.TestLeaderAssignmentDrainsAgedBacklogWithoutClaimCompetition` |
 | SCHED-003 | Assignment 必须跨所有节点流全局聚批；节点数增加不能把健康请求拖过流超时并让已 claim 任务等待 30 秒 lease | `pkg/grpc.TestAssignmentStreamBatchesDistinctLeaderCommittedTasks`（两个独立节点流仅一条 Apply） | `test/integration.TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery`（7 节点、lease 前排空、零 assignment/completion timeout 与 lease 回收） |
+| SCHED-004 | 4900 Worker 同时拉取/完成不能形成无界请求尖峰；单节点每类未决请求≤8、Raft Claim/Complete 批次≤128，单请求等待不能关闭共享流；Leader 仍唯一分配且业务 Worker 并发不受 credit 限制 | `pkg/grpc.TestClaimClientBoundsPerNodeRaftRequests`、`TestInternalServiceBoundsGlobalRaftBatchSize` | `test/integration.TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery`（真实 8 节点/4900 执行 Worker/4096 任务、批次边界、lease 前排空、exactly-once final state） |
 | RESULT-001 | Completion 必须跨所有节点流全局聚批；只有 Raft 已提交结果可 ACK，取消流不能确认未提交结果 | `pkg/grpc.TestResultStreamBatchesCompletionsAcrossNodeStreams`、`TestDispatchCompletionsDoesNotAcknowledgeCanceledJob` | `test/integration.TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery` |
 | STEAL-001 | work steal 是 Leader 对既有空闲槽位的调度：同 tenant/同节点优先，本节点其他 tenant 可立即分配，跨节点 fresh 必须等待 5 秒 | `pkg/grpc.TestSelectPendingForSlot_PreservesLocalityAndAgeBoundary`、旧协议边界 `TestCanStealRequiresAgedPendingTask` | `test/integration.TestWorkStealUsesAgedPendingWork`（跨节点 5 秒边界） |
 | LEADER-001 | Leader 只调度与提交，不接收 allocation、不运行或获取业务任务；选主后立即清空 Worker，Follower 继续完成任务 | `pkg/allocator.TestReconcile_LeaderHasNoAllocation`、`TestReconcile_OnlyLeaderClearsStaleAllocation`、`pkg/worker.TestPoolWorker_GuardPreventsLeaderExecution`、`pkg/grpc.TestAssignmentStreamBatchesDistinctLeaderCommittedTasks` | `test/integration.TestLeaderIsControlPlaneOnly`、`TestFailover` |
@@ -52,6 +53,9 @@ Case、单元回归测试和真实集成回归测试；修复后仍保留这些 
 - 节点宕机和全量重启后，任务在有界时间内继续处理；
 - Leader 不出现在 allocation，normal + borrowed 不超过存活 Follower 容量；
 - Worker 不选择 task ID；work-steal 不绕过 tenant/status/queue locality/age 校验；
-- AssignmentStream 超时或响应未知时不能回退自发 Claim；只有明确的旧 Leader
+- AssignmentStream 响应未知时不能回退自发 Claim；当前 Assignment/Result 不使用会关闭
+  节点共享流的单请求固定超时，只有明确的旧 Leader
   `Unimplemented` 才允许滚动升级兼容路径；
+- 单节点 Assignment/Result 未决请求各不超过 8，Leader 的 Claim/Complete Raft 批次
+  不超过 128；credit 不能降低已分配的业务 Worker 并发；
 - 测试在 race detector 下没有数据竞争，且没有无界等待。

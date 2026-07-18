@@ -78,7 +78,7 @@ type leaderAssignmentClient struct {
 	claimCalls int
 }
 
-func (c *leaderAssignmentClient) Assign(string) (*types.TaskRecord, bool, error) {
+func (c *leaderAssignmentClient) Assign(context.Context, string) (*types.TaskRecord, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	task := c.task

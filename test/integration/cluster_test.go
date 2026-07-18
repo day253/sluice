@@ -468,6 +468,16 @@ func (p *recordingProcessor) processedTaskCount(taskID string) int {
 	return n
 }
 
+func (p *recordingProcessor) processedTaskCounts() map[string]int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	counts := make(map[string]int, len(p.processed))
+	for _, record := range p.processed {
+		counts[record.TaskID]++
+	}
+	return counts
+}
+
 // ===================================================================
 // MIT 6.824‑style integration tests
 // ===================================================================
@@ -915,6 +925,87 @@ func TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery(t *testing.T) {
 		if entry.Message == "allocator: expired task claims returned to pending" {
 			t.Fatalf("healthy global batch required claim lease recovery: %+v", fields)
 		}
+	}
+}
+
+// TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery preserves
+// SCHED-004. The eight-node cluster has seven execution nodes with 700 workers
+// each: the same 4,900-slot fanout that previously flooded the leader with one
+// request per Worker, invalidated every shared stream after 15 seconds, and
+// left committed claims waiting for the 30-second lease scanner.
+func TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
+	tc := newTestClusterWithLogger(t, 8, 700, zap.New(core))
+	defer tc.shutdown()
+
+	const (
+		taskCount      = 4096
+		executionSlots = 4900
+	)
+	tc.addTenant("credit-backpressure", executionSlots)
+	tc.waitAllocation(15 * time.Second)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader while creating credit-backpressure backlog")
+	}
+	tasks := make([]raftpkg.CreateTaskData, taskCount)
+	for i := range tasks {
+		tasks[i] = raftpkg.CreateTaskData{
+			TaskID: fmt.Sprintf("credit-backpressure-%d", i), TenantID: "credit-backpressure", Payload: `{"credit":true}`,
+		}
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: tasks}),
+		15*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("create credit-backpressure backlog: %v", err)
+	}
+
+	started := time.Now()
+	tc.waitFor(func() bool {
+		for _, task := range tasks {
+			if result := tc.fsms().GetResult(task.TaskID); result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 25*time.Second, "4,900 worker slots drain without a stream reconnect storm")
+	if elapsed := time.Since(started); elapsed >= 30*time.Second {
+		t.Fatalf("backlog drained in %s, crossed the claim lease boundary", elapsed)
+	}
+	processed := tc.proc.processedTaskCounts()
+	for _, task := range tasks {
+		if got := processed[task.TaskID]; got != 1 {
+			t.Fatalf("credit-backpressure task %s processed %d times, want once", task.TaskID, got)
+		}
+	}
+	assignmentBatches := 0
+	completionBatches := 0
+	for _, entry := range logs.All() {
+		fields := entry.ContextMap()
+		errText := fmt.Sprint(fields["error"])
+		if entry.Message == "worker client stream invalidated" &&
+			(strings.Contains(errText, "assignment timeout") || strings.Contains(errText, "completion timeout")) {
+			t.Fatalf("worker fanout invalidated a shared stream: %s", errText)
+		}
+		if entry.Message == "allocator: expired task claims returned to pending" {
+			t.Fatalf("worker fanout required claim lease recovery: %+v", fields)
+		}
+		if entry.Message == "assignment raft batch committed" {
+			assignmentBatches++
+			if size, ok := fields["tasks"].(int64); !ok || size < 1 || size > 128 {
+				t.Fatalf("assignment Raft batch size = %v, want 1..128", fields["tasks"])
+			}
+		}
+		if entry.Message == "completion raft batch committed" {
+			completionBatches++
+			if size, ok := fields["tasks"].(int64); !ok || size < 1 || size > 128 {
+				t.Fatalf("completion Raft batch size = %v, want 1..128", fields["tasks"])
+			}
+		}
+	}
+	if assignmentBatches == 0 || completionBatches == 0 {
+		t.Fatalf("observed assignment batches=%d completion batches=%d, want both", assignmentBatches, completionBatches)
 	}
 }
 

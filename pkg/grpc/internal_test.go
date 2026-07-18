@@ -50,6 +50,101 @@ type legacyInternalService struct {
 	delegate *InternalService
 }
 
+// creditRecordingService deliberately withholds acknowledgements so a test
+// can observe how many requests one ClaimClient places on each shared stream
+// before Raft (represented by the acknowledgement) makes progress.
+type creditRecordingService struct {
+	grpcv1.UnimplementedSluiceInternalServer
+	assignments    chan *grpcv1.AssignmentRequest
+	assignmentAcks chan *grpcv1.AssignmentBatch
+	results        chan *grpcv1.ResultRequest
+	resultAcks     chan *grpcv1.ResultBatch
+	assignStreams  atomic.Int32
+	resultStreams  atomic.Int32
+}
+
+func newCreditRecordingService() *creditRecordingService {
+	return &creditRecordingService{
+		assignments:    make(chan *grpcv1.AssignmentRequest, 64),
+		assignmentAcks: make(chan *grpcv1.AssignmentBatch),
+		results:        make(chan *grpcv1.ResultRequest, 64),
+		resultAcks:     make(chan *grpcv1.ResultBatch),
+	}
+}
+
+func (s *creditRecordingService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamServer) error {
+	<-stream.Context().Done()
+	return stream.Context().Err()
+}
+
+func (s *creditRecordingService) AssignmentStream(stream grpcv1.SluiceInternal_AssignmentStreamServer) error {
+	s.assignStreams.Add(1)
+	received := make(chan *grpcv1.AssignmentRequest)
+	recvErr := make(chan error, 1)
+	go func() {
+		for {
+			request, err := stream.Recv()
+			if err != nil {
+				recvErr <- err
+				return
+			}
+			select {
+			case received <- request:
+			case <-stream.Context().Done():
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case request := <-received:
+			s.assignments <- request
+		case batch := <-s.assignmentAcks:
+			if err := stream.Send(batch); err != nil {
+				return err
+			}
+		case err := <-recvErr:
+			return err
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+	}
+}
+
+func (s *creditRecordingService) ResultStream(stream grpcv1.SluiceInternal_ResultStreamServer) error {
+	s.resultStreams.Add(1)
+	received := make(chan *grpcv1.ResultRequest)
+	recvErr := make(chan error, 1)
+	go func() {
+		for {
+			request, err := stream.Recv()
+			if err != nil {
+				recvErr <- err
+				return
+			}
+			select {
+			case received <- request:
+			case <-stream.Context().Done():
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case request := <-received:
+			s.results <- request
+		case batch := <-s.resultAcks:
+			if err := stream.Send(batch); err != nil {
+				return err
+			}
+		case err := <-recvErr:
+			return err
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+	}
+}
+
 func (s *legacyInternalService) ClaimStream(stream grpcv1.SluiceInternal_ClaimStreamServer) error {
 	return s.delegate.ClaimStream(stream)
 }
@@ -62,6 +157,118 @@ func applyInternalTestCommand(fsm *raftpkg.FSM, op string, data interface{}) {
 	fsm.Apply(&hashicorpraft.Log{
 		Data: raftpkg.MustMarshalCommand(op, data), Type: hashicorpraft.LogCommand,
 	})
+}
+
+func TestClaimClientBoundsPerNodeRaftRequests(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := newCreditRecordingService()
+	server := googlegrpc.NewServer()
+	grpcv1.RegisterSluiceInternalServer(server, service)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+	})
+
+	client := NewClaimClient("worker-node", zap.NewNop())
+	client.SetLeader(listener.Addr().String())
+	t.Cleanup(client.Close)
+
+	const requestCount = workerRequestCredits * 3
+	assignmentErrs := make(chan error, requestCount)
+	for i := 0; i < requestCount; i++ {
+		go func() {
+			_, supported, err := client.Assign(context.Background(), "tenant-a")
+			if err != nil {
+				assignmentErrs <- err
+			} else if !supported {
+				assignmentErrs <- fmt.Errorf("assignment unexpectedly unsupported")
+			} else {
+				assignmentErrs <- nil
+			}
+		}()
+	}
+	for wave := 0; wave < requestCount/workerRequestCredits; wave++ {
+		ids := make([]string, 0, workerRequestCredits)
+		for len(ids) < workerRequestCredits {
+			select {
+			case request := <-service.assignments:
+				ids = append(ids, request.RequestId)
+			case <-time.After(2 * time.Second):
+				t.Fatalf("assignment wave %d received %d requests, want %d", wave, len(ids), workerRequestCredits)
+			}
+		}
+		select {
+		case extra := <-service.assignments:
+			t.Fatalf("assignment exceeded node credit window: extra request %s", extra.RequestId)
+		case <-time.After(50 * time.Millisecond):
+		}
+		service.assignmentAcks <- &grpcv1.AssignmentBatch{EmptyRequestIds: ids}
+	}
+	for i := 0; i < requestCount; i++ {
+		select {
+		case err := <-assignmentErrs:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("assignments did not finish after acknowledgement")
+		}
+	}
+
+	completionErrs := make(chan error, requestCount)
+	for i := 0; i < requestCount; i++ {
+		taskID := fmt.Sprintf("task-%d", i)
+		go func() {
+			completionErrs <- client.Complete(taskID, "tenant-a", "ok", "", false)
+		}()
+	}
+	for wave := 0; wave < requestCount/workerRequestCredits; wave++ {
+		ids := make([]string, 0, workerRequestCredits)
+		for len(ids) < workerRequestCredits {
+			select {
+			case request := <-service.results:
+				ids = append(ids, request.TaskId)
+			case <-time.After(2 * time.Second):
+				t.Fatalf("completion wave %d received %d requests, want %d", wave, len(ids), workerRequestCredits)
+			}
+		}
+		select {
+		case extra := <-service.results:
+			t.Fatalf("completion exceeded node credit window: extra request %s", extra.TaskId)
+		case <-time.After(50 * time.Millisecond):
+		}
+		service.resultAcks <- &grpcv1.ResultBatch{CommittedIds: ids}
+	}
+	for i := 0; i < requestCount; i++ {
+		select {
+		case err := <-completionErrs:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("completions did not finish after acknowledgement")
+		}
+	}
+	if got := service.assignStreams.Load(); got != 1 {
+		t.Fatalf("assignment streams = %d, want one stable stream", got)
+	}
+	if got := service.resultStreams.Load(); got != 1 {
+		t.Fatalf("result streams = %d, want one stable stream", got)
+	}
+}
+
+func TestInternalServiceBoundsGlobalRaftBatchSize(t *testing.T) {
+	service := NewInternalService("leader", raftpkg.NewFSM(zap.NewNop()), &internalTestRaft{}, zap.NewNop())
+	if service.assignmentMax != claimBatchMaxSize {
+		t.Fatalf("assignment batch max = %d, want %d", service.assignmentMax, claimBatchMaxSize)
+	}
+	if service.completionMax != claimBatchMaxSize {
+		t.Fatalf("completion batch max = %d, want %d", service.completionMax, claimBatchMaxSize)
+	}
 }
 
 func TestClaimBatchPreservesArrivalOrder(t *testing.T) {
@@ -213,7 +420,7 @@ func TestAssignmentStreamBatchesDistinctLeaderCommittedTasks(t *testing.T) {
 		go func(nodeID string, client *ClaimClient) {
 			defer wg.Done()
 			<-start
-			task, supported, err := client.Assign("tenant-a")
+			task, supported, err := client.Assign(context.Background(), "tenant-a")
 			if err != nil {
 				errs <- err
 				return
@@ -253,7 +460,7 @@ func TestAssignmentStreamBatchesDistinctLeaderCommittedTasks(t *testing.T) {
 	applyInternalTestCommand(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
 		TaskID: "leader-must-not-run", TenantID: "tenant-a", Payload: `{}`,
 	})
-	if task, supported, err := leaderClient.Assign("tenant-a"); err != nil || !supported || task != nil {
+	if task, supported, err := leaderClient.Assign(context.Background(), "tenant-a"); err != nil || !supported || task != nil {
 		t.Fatalf("leader assignment = task=%+v supported=%v err=%v, want empty supported response", task, supported, err)
 	}
 	if task := fsm.GetTask("leader-must-not-run"); task == nil || task.Status != types.TaskStatusPending {
@@ -399,7 +606,7 @@ func TestClaimClientFallsBackOnlyForLegacyLeader(t *testing.T) {
 	client := NewClaimClient("worker-node", zap.NewNop())
 	client.SetLeader(listener.Addr().String())
 	t.Cleanup(client.Close)
-	if task, supported, err := client.Assign("tenant-a"); err != nil || supported || task != nil {
+	if task, supported, err := client.Assign(context.Background(), "tenant-a"); err != nil || supported || task != nil {
 		t.Fatalf("legacy assignment = task=%+v supported=%v err=%v, want unsupported without error", task, supported, err)
 	}
 	claimed, err := client.Claim("legacy-task", "tenant-a", `{}`)

@@ -18,11 +18,20 @@ import (
 	"github.com/day253/sluice/pkg/types"
 )
 
-// A global assignment/result batch may include every execution node and one
-// Raft round trip. Keep this above the normal 5s apply budget so a healthy,
-// large voter set does not abandon already committed work and wait for lease
-// recovery merely because the response arrives just after Apply completes.
-const workerStreamTimeout = 15 * time.Second
+const (
+	// Legacy ClaimStream is retained only for rolling compatibility. The
+	// leader-owned assignment and result paths deliberately have no fixed
+	// request timeout: once sent, either the Raft acknowledgement or a stream /
+	// leadership failure decides the request's outcome.
+	legacyClaimTimeout = 15 * time.Second
+
+	// Thousands of business workers may execute concurrently on one node, but
+	// only this many idle-slot and completion requests may wait for Raft at the
+	// same time. The credits are released after acknowledgement, not after
+	// business execution, so they bound control-plane pressure without capping
+	// worker throughput.
+	workerRequestCredits = 8
+)
 
 // ClaimClient owns the worker-to-leader claim and result streams. Both
 // streams are replaced together whenever leadership or connectivity changes.
@@ -42,10 +51,12 @@ type ClaimClient struct {
 	closed       bool
 	assignLegacy bool // current leader does not implement AssignmentStream
 
-	claimSendMu  sync.Mutex
-	assignSendMu sync.Mutex
-	resultSendMu sync.Mutex
-	assignSeq    atomic.Uint64
+	claimSendMu   sync.Mutex
+	assignSendMu  sync.Mutex
+	resultSendMu  sync.Mutex
+	assignSeq     atomic.Uint64
+	assignCredits chan struct{}
+	resultCredits chan struct{}
 
 	pendingClaims    map[string]chan claimResult
 	pendingClaimsMu  sync.Mutex
@@ -69,13 +80,15 @@ func NewClaimClient(nodeID string, logger *zap.Logger) *ClaimClient {
 		pendingClaims:  make(map[string]chan claimResult),
 		pendingAssign:  make(map[string]chan assignmentResult),
 		pendingResults: make(map[string]chan struct{}),
+		assignCredits:  make(chan struct{}, workerRequestCredits),
+		resultCredits:  make(chan struct{}, workerRequestCredits),
 	}
 }
 
 // Assign reports one idle execution slot to the leader. supported=false is
 // returned only while rolling against an older leader that does not implement
 // AssignmentStream; callers may use the legacy claim path in that case.
-func (c *ClaimClient) Assign(preferredTenantID string) (*types.TaskRecord, bool, error) {
+func (c *ClaimClient) Assign(ctx context.Context, preferredTenantID string) (*types.TaskRecord, bool, error) {
 	c.mu.Lock()
 	stream, streamCtx, generation := c.assignStream, c.streamCtx, c.generation
 	legacy := c.assignLegacy
@@ -85,6 +98,14 @@ func (c *ClaimClient) Assign(preferredTenantID string) (*types.TaskRecord, bool,
 	}
 	if stream == nil || streamCtx == nil {
 		return nil, true, fmt.Errorf("assignment client: not connected")
+	}
+	select {
+	case c.assignCredits <- struct{}{}:
+		defer func() { <-c.assignCredits }()
+	case <-ctx.Done():
+		return nil, true, ctx.Err()
+	case <-streamCtx.Done():
+		return nil, true, streamCtx.Err()
 	}
 
 	requestID := fmt.Sprintf("%s-%d", c.nodeID, c.assignSeq.Add(1))
@@ -112,15 +133,9 @@ func (c *ClaimClient) Assign(preferredTenantID string) (*types.TaskRecord, bool,
 		return nil, true, err
 	}
 
-	timer := time.NewTimer(workerStreamTimeout)
-	defer timer.Stop()
 	select {
 	case result := <-ch:
 		return result.task, result.supported, nil
-	case <-timer.C:
-		err := fmt.Errorf("assignment timeout")
-		c.invalidate(generation, err)
-		return nil, true, err
 	case <-streamCtx.Done():
 		return nil, true, streamCtx.Err()
 	}
@@ -188,7 +203,7 @@ func (c *ClaimClient) claim(taskID, tenantID, payload string, steal bool) (bool,
 		return false, err
 	}
 
-	timer := time.NewTimer(workerStreamTimeout)
+	timer := time.NewTimer(legacyClaimTimeout)
 	defer timer.Stop()
 	select {
 	case result := <-ch:
@@ -205,6 +220,19 @@ func (c *ClaimClient) claim(taskID, tenantID, payload string, steal bool) (bool,
 // Complete commits a processed task through the leader's batched result
 // stream and waits for the Raft acknowledgement.
 func (c *ClaimClient) Complete(taskID, tenantID, result, errStr string, failed bool) error {
+	c.mu.Lock()
+	stream, streamCtx, generation := c.resultStream, c.streamCtx, c.generation
+	c.mu.Unlock()
+	if stream == nil || streamCtx == nil {
+		return fmt.Errorf("result client: not connected")
+	}
+	select {
+	case c.resultCredits <- struct{}{}:
+		defer func() { <-c.resultCredits }()
+	case <-streamCtx.Done():
+		return streamCtx.Err()
+	}
+
 	ch := make(chan struct{}, 1)
 	c.pendingResultsMu.Lock()
 	if _, exists := c.pendingResults[taskID]; exists {
@@ -218,13 +246,6 @@ func (c *ClaimClient) Complete(taskID, tenantID, result, errStr string, failed b
 		delete(c.pendingResults, taskID)
 		c.pendingResultsMu.Unlock()
 	}()
-
-	c.mu.Lock()
-	stream, streamCtx, generation := c.resultStream, c.streamCtx, c.generation
-	c.mu.Unlock()
-	if stream == nil || streamCtx == nil {
-		return fmt.Errorf("result client: not connected")
-	}
 
 	status := "done"
 	if failed {
@@ -241,15 +262,9 @@ func (c *ClaimClient) Complete(taskID, tenantID, result, errStr string, failed b
 		return err
 	}
 
-	timer := time.NewTimer(workerStreamTimeout)
-	defer timer.Stop()
 	select {
 	case <-ch:
 		return nil
-	case <-timer.C:
-		err := fmt.Errorf("completion timeout")
-		c.invalidate(generation, err)
-		return err
 	case <-streamCtx.Done():
 		return streamCtx.Err()
 	}

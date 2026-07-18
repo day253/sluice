@@ -20,7 +20,7 @@
          b. preferred tenant 的任意节点队列
          c. 本节点其他 tenant
          d. 已等待超过 5s 的任意 tenant（work steal）
-4. 批量: Leader 跨所有节点流全局聚批(5ms/最多2048条) → raft.Apply(OpClaimBatch)
+4. 批量: Leader 跨所有节点流全局聚批(5ms/最多128条) → raft.Apply(OpClaimBatch)
          原子提交 task: pending→inflight、NodeID=执行节点
 5. 返回: Leader → AssignmentStream → 已提交的 task_id/tenant/payload
 6. 执行: Follower Worker 只处理 Leader 返回的已提交任务
@@ -79,7 +79,7 @@ Allocator (Leader, 每 3s):
 Follower workers                         Leader
      │                                     │
      │──Assignment(node, preferred)───────►│  每个请求代表一个空闲槽位
-     │──Assignment(node, preferred)───────►│  跨全部节点流全局聚批 5ms / 2048
+     │──Assignment(node, preferred)───────►│  跨全部节点流全局聚批 5ms / 128
      │                                     │  从全局 FIFO pending 中选不同 task
      │                                     │  raft.Apply(OpClaimBatch)
      │                                     │  pending→inflight + execution NodeID
@@ -89,19 +89,28 @@ Follower workers                         Leader
 ```
 
 Leader 只有一个 Assignment dispatcher：来自所有节点流的空闲槽位先进入同一 5ms
-窗口，最多 2048 条请求只读一次 pending/allocation 并提交一条 `OpClaimBatch`。提交结果
+窗口，最多 128 条请求只读一次 pending/allocation 并提交一条 `OpClaimBatch`。提交结果
 再路由回原节点流，每条流按 5ms/128 条合并响应。这样 Raft 往返次数随总吞吐增长，而不
 随节点流数量线性增长；也保证“读 pending、选不同 task、提交 ClaimBatch”不会被另一个
 节点流交叉重复选择。ResultStream 同样使用跨所有节点流的全局 dispatcher，把完成状态
 合并为 `OpCompleteBatch`，避免大量节点分别提交完成日志。
 
+每个 Follower 的 `ClaimClient` 对 Assignment 和 Result 各维护 8 个独立 credit。业务
+Worker 可以按 allocation 全量并发执行，但一个节点同时等待 Raft 确认的拉取和完成请求
+分别最多 8 个；确认后立即释放 credit 给下一个空闲 Worker，因此这个窗口只限制控制面
+排队，不限制 Processor 并发。N 个执行节点的 Leader 未决请求上界分别为 `8N`，并继续
+按全局 128 条切分 Raft 日志，避免 4900 Worker 同时启动形成请求尖峰。
+
 Raft FSM 仍保留最终防线：若状态已变化，未成功 claim 的任务不会返回给 Worker。响应
-丢失时任务保持 inflight，30 秒 lease 到期后由 Leader 重新放回 pending。Worker 流等待
-上限为 15 秒，高于正常 5 秒 Raft Apply 预算；超时仍只触发重连，不允许回退自发 Claim。
+丢失时任务保持 inflight，30 秒 lease 到期后由 Leader 重新放回 pending。Assignment 和
+Result 请求一旦写入共享流，就等待 Raft 确认或流/Leader 明确失效，不设置会把整个节点
+共享流关闭的单请求固定超时；失去 quorum 时，credit 窗口会提供背压，流错误或 Leader
+切换负责解除等待。服务端 Raft Apply 的未知提交结果仍由 30 秒 lease 兜底。
 
 `ClaimStream` 保留为滚动升级兼容路径：新 Worker 连接不支持 AssignmentStream 的旧
 Leader 时才退回旧 Claim 协议；连接支持新协议的 Leader 后，不允许因超时回退到自发
-Claim，避免“Leader 已提交但响应未知”时产生重复执行。
+Claim，避免“Leader 已提交但响应未知”时产生重复执行。旧 Claim 协议仍保留 15 秒等待
+上限，仅作为滚动兼容，不是当前 Leader 调度路径。
 
 
 ## API
@@ -174,6 +183,8 @@ HTTP REST:
    在 30 秒 Claim lease 到期后回到 pending，最终状态只提交一次。
 7. **有界活性**：Leader 优先同 tenant/同节点队列，再使用本节点其他 tenant 的任务；
    跨节点 steal 只兜底等待超过 5 秒的任务，且选择过程不产生 Worker Claim 风暴。
+8. **控制面背压**：单节点 Assignment/Result 未决请求各不超过 8；每条 Claim/Complete
+   Raft 日志不超过 128 个任务。单请求等待不能关闭同节点其他健康请求共用的流。
 
 当前需求范围：系统负责 durable queue、Leader 单一调度、并发配额、空闲容量借用、
 节点内优先和跨节点兜底的 work-steal，以及失败后的至少一次执行尝试/单次最终状态提交。系统当前不提供
@@ -224,13 +235,33 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   缓慢下降；线上一次出现 44、49 条 claim 到期回收。
 - **根因**：调度权虽然集中到 Leader，但日志批次仍按连接划分，Raft 往返次数与节点数
   线性增长；锁只消除了重复选择，没有合并共识成本。
-- **修复**：所有节点的空闲槽位进入 Leader 全局 dispatcher，一次选择、一次
-  `OpClaimBatch`；Worker 等待上限调整为 15 秒，但不能依靠放大超时替代全局聚批。
+- **当时修复**：所有节点的空闲槽位进入 Leader 全局 dispatcher，一次选择、一次
+  `OpClaimBatch`；Worker 等待上限当时调整为 15 秒，但不能依靠放大超时替代全局聚批。
 - **边界**：单 shard dispatcher 仍是一个 Leader 内存组件；Leader 切换后旧流取消，未
   确认 assignment 仍按 30 秒 lease 恢复。Multi-Raft 按 shard 各自拥有 dispatcher。
 - **回归覆盖**：`TestAssignmentStreamBatchesDistinctLeaderCommittedTasks` 使用两个独立
   节点流并断言仅一条 Raft Apply；真实 7 节点 Case
   `TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery` 要求在 lease 前完成且零流超时/回收。
+
+### SCHED-004：4900 Worker 请求尖峰反复关闭共享流
+
+- **现象**：50 Pod 集群中 Leader 排除后共有 49 个执行节点、4900 个 Worker。四个租户
+  约 18818 个 unfinished 连续多个历史点完全不下降；30 分钟内出现 674 次 assignment
+  timeout。Follower 每约 16 秒重连一次，Leader 每 30 秒按 1676～2048 条回收过期 claim。
+- **根因**：每个 Worker 同时发送一个 Assignment，Leader 可把 2048 个请求放进一条
+  Raft 日志；后续请求超过固定 15 秒。任意一个请求超时会调用全局 `invalidate`，同时关闭
+  该节点共享的 Claim/Assignment/Result 三条流。Leader 已提交但响应接收者消失的任务只
+  能等待 lease，重连后的 4900 个请求又形成下一轮尖峰。
+- **修复**：每节点 Assignment/Result 各使用 8-credit 未决窗口；已发送请求不再用固定
+  客户端 deadline 破坏共享流；Leader 将 Claim/Complete Raft 日志统一限制为 128 条。
+- **不变量**：Leader 仍唯一选择并提交 task→node，credit 只限制等待共识的控制请求，
+  不降低 allocation 或 Processor 并发；连接/Leader 失败仍取消整条流，未知提交仍走
+  30 秒 lease。没有新增任务转移、取消执行或 Processor exactly-once 语义。
+- **回归覆盖**：`TestClaimClientBoundsPerNodeRaftRequests` 在服务端故意不确认时验证每类
+  只有 8 个请求且流不重建；`TestInternalServiceBoundsGlobalRaftBatchSize` 固定 128 上限；
+  真实 8 节点 `TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery` 启动 4900 个
+  执行 Worker、处理 4096 个任务，断言所有 Raft 批次不超过 128、lease 前排空、每任务
+  只执行一次且没有超时重连或 lease 回收。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 

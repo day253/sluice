@@ -94,10 +94,10 @@ func NewInternalService(
 		logger:           logger,
 		assignmentJobs:   make(chan assignmentJob, 16384),
 		assignmentWindow: claimBatchWindow,
-		assignmentMax:    2048,
+		assignmentMax:    claimBatchMaxSize,
 		completionJobs:   make(chan completionJob, 16384),
 		completionWindow: claimBatchWindow,
-		completionMax:    2048,
+		completionMax:    claimBatchMaxSize,
 		subs:             make(map[string]chan<- *grpcv1.AllocationPlan),
 	}
 }
@@ -478,6 +478,7 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 			s.deliverAssignmentOutcomes(batch, outcomes)
 			return
 		}
+		s.logger.Debug("assignment raft batch committed", zap.Int("tasks", len(claims)))
 		response, ok := result.Response().(*raftpkg.ClaimBatchResult)
 		if !ok {
 			err := status.Error(codes.Internal, "assignment batch returned an invalid response")
@@ -762,6 +763,8 @@ func (s *InternalService) dispatchCompletions(batch []completionJob) {
 			for _, index := range activeIndexes {
 				outcomes[index].err = rpcErr
 			}
+		} else {
+			s.logger.Debug("completion raft batch committed", zap.Int("tasks", len(active)))
 		}
 	}
 	s.deliverCompletionOutcomes(batch, outcomes)

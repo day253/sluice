@@ -50,7 +50,7 @@ const workStealThreshold = 5 * time.Second
 // slot; the leader chooses and durably claims the concrete task. supported is
 // false only during a rolling upgrade against a legacy leader.
 type TaskAssigner interface {
-	Assign(preferredTenantID string) (task *types.TaskRecord, supported bool, err error)
+	Assign(ctx context.Context, preferredTenantID string) (task *types.TaskRecord, supported bool, err error)
 }
 
 // Completer publishes task results through the current Raft leader.
@@ -276,7 +276,7 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 		// Production path: the worker reports one idle slot, and only the Raft
 		// leader chooses and claims the concrete task.
 		if assigner, ok := p.claimer.(TaskAssigner); ok {
-			assigned, supported, err := assigner.Assign(tenantID)
+			assigned, supported, err := assigner.Assign(ctx, tenantID)
 			if supported {
 				legacyScheduling = false
 				if err != nil {
