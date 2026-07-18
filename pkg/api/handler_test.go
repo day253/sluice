@@ -103,6 +103,28 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestRaftStatusEndpointReportsBoundedMembership(t *testing.T) {
+	h, _, _ := setupHandler(t)
+	h.SetRaftStatusFunc(func() (raftpkg.MembershipStatus, error) {
+		return raftpkg.MembershipStatus{
+			LeaderID: "node-0", Voters: []string{"node-0", "node-1", "node-2"},
+			Nonvoters: []string{"node-3", "node-4"},
+		}, nil
+	})
+	rec := httptest.NewRecorder()
+	newRouter(h).ServeHTTP(rec, httptest.NewRequest("GET", "/api/v1/admin/raft", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("raft status code = %d, want 200", rec.Code)
+	}
+	var status raftpkg.MembershipStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.LeaderID != "node-0" || len(status.Voters) != 3 || len(status.Nonvoters) != 2 {
+		t.Fatalf("raft status = %+v", status)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Task submission
 // ---------------------------------------------------------------------------

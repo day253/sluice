@@ -28,7 +28,7 @@ type TaskEnvelope struct {
 // Queue is the local per-tenant durable FIFO queue.
 //
 // Implementations must be safe for concurrent use.  The canonical
-// production implementation uses PebbleDB; an in-memory variant is
+// production implementation uses BoltDB; an in-memory variant is
 // provided for testing.
 type Queue interface {
 	// Enqueue appends a task to the given tenant's queue and returns once

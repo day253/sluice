@@ -21,6 +21,20 @@ type deadlineSluiceService struct {
 	grpcv1.UnimplementedSluiceServer
 }
 
+type batchSpyQueue struct {
+	*queue.MemoryQueue
+	enqueueCalls int
+}
+
+func newBatchSpyQueue() *batchSpyQueue {
+	return &batchSpyQueue{MemoryQueue: queue.NewMemoryQueue()}
+}
+
+func (q *batchSpyQueue) Enqueue(tenantID string, task *queue.TaskEnvelope) error {
+	q.enqueueCalls++
+	return q.MemoryQueue.Enqueue(tenantID, task)
+}
+
 func (deadlineSluiceService) SubmitBatch(ctx context.Context, _ *grpcv1.SubmitBatchRequest) (*grpcv1.SubmitBatchResponse, error) {
 	<-ctx.Done()
 	return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
@@ -169,6 +183,29 @@ func TestSubmitBatchUsesOneRaftApply(t *testing.T) {
 	}
 }
 
+func TestSubmitBatchDoesNotDuplicateRaftPendingIntoLocalQueue(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{ID: "tenant-a", MaxWorkers: 10})
+	testRaft := &internalTestRaft{fsm: fsm}
+	testRaft.leader.Store(true)
+	q := newBatchSpyQueue()
+	svc := NewService("leader", q, fsm, testRaft, nil, zap.NewNop())
+	tasks := make([]*grpcv1.SubmitRequest, maxSubmitBatchTasks)
+	for i := range tasks {
+		tasks[i] = &grpcv1.SubmitRequest{TenantId: "tenant-a", Payload: []byte(`{"batch":true}`)}
+	}
+
+	if _, err := svc.SubmitBatch(context.Background(), &grpcv1.SubmitBatchRequest{Tasks: tasks}); err != nil {
+		t.Fatal(err)
+	}
+	if q.enqueueCalls != 0 {
+		t.Fatalf("local queue writes = %d, want 0", q.enqueueCalls)
+	}
+	if got, err := q.Len("tenant-a"); err != nil || got != 0 {
+		t.Fatalf("local queue records = %d, err=%v, want 0", got, err)
+	}
+}
+
 func TestSubmitBatchIdempotencyKeysReuseTaskIDs(t *testing.T) {
 	fsm := raft.NewFSM(zap.NewNop())
 	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{ID: "tenant-a", MaxWorkers: 10})
@@ -197,8 +234,8 @@ func TestSubmitBatchIdempotencyKeysReuseTaskIDs(t *testing.T) {
 	if got := len(fsm.FindAllPendingTasks()); got != len(request.Tasks) {
 		t.Fatalf("pending tasks after retry = %d, want %d unique tasks", got, len(request.Tasks))
 	}
-	if got, err := q.Len("tenant-a"); err != nil || got != len(request.Tasks) {
-		t.Fatalf("queue hints after retry = %d, err=%v, want %d unique hints", got, err, len(request.Tasks))
+	if got, err := q.Len("tenant-a"); err != nil || got != 0 {
+		t.Fatalf("local queue records after retry = %d, err=%v, want 0", got, err)
 	}
 }
 

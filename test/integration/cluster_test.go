@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	hashicorpraft "github.com/hashicorp/raft"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -38,13 +39,15 @@ import (
 
 // testCluster holds all the state needed for a multi-node integration test.
 type testCluster struct {
-	tb        testing.TB
-	nodes     []*node.Node
-	dirs      []string
-	raftAddrs []string
-	httpAddrs []string
-	proc      *recordingProcessor
-	workers   int
+	tb                         testing.TB
+	nodes                      []*node.Node
+	dirs                       []string
+	raftAddrs                  []string
+	httpAddrs                  []string
+	proc                       *recordingProcessor
+	workers                    int
+	maxVoters                  int
+	disableVoterReconciliation bool
 
 	mu      sync.Mutex
 	results map[string]*types.TaskResult // taskID → final result (polled from FSM)
@@ -81,6 +84,35 @@ func newClaimRejectCountingLogger(rejectedClaims *atomic.Int64) *zap.Logger {
 }
 
 func newTestClusterWithLogger(tb testing.TB, n int, totalWorkersPerNode int, logger *zap.Logger) *testCluster {
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, raftpkg.DefaultMaxVoters, false, logger,
+		func(cluster *raftpkg.Cluster, nodeID, address string) error {
+			return cluster.AddVoter(nodeID, address)
+		})
+}
+
+func newTestClusterWithVoterLimit(tb testing.TB, n int, totalWorkersPerNode, maxVoters int, logger *zap.Logger) *testCluster {
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, maxVoters, false, logger,
+		func(cluster *raftpkg.Cluster, nodeID, address string) error {
+			return cluster.AddServer(nodeID, address, maxVoters)
+		})
+}
+
+func newAllVoterTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster {
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, n, true, zap.NewNop(),
+		func(cluster *raftpkg.Cluster, nodeID, address string) error {
+			return cluster.AddVoter(nodeID, address)
+		})
+}
+
+func newTestClusterWithMemberAdder(
+	tb testing.TB,
+	n int,
+	totalWorkersPerNode int,
+	maxVoters int,
+	disableVoterReconciliation bool,
+	logger *zap.Logger,
+	addMember func(*raftpkg.Cluster, string, string) error,
+) *testCluster {
 	tb.Helper()
 
 	if n < 1 {
@@ -88,14 +120,16 @@ func newTestClusterWithLogger(tb testing.TB, n int, totalWorkersPerNode int, log
 	}
 
 	tc := &testCluster{
-		tb:        tb,
-		nodes:     make([]*node.Node, n),
-		dirs:      make([]string, n),
-		raftAddrs: make([]string, n),
-		httpAddrs: make([]string, n),
-		proc:      newRecordingProcessor(),
-		results:   make(map[string]*types.TaskResult),
-		workers:   totalWorkersPerNode,
+		tb:                         tb,
+		nodes:                      make([]*node.Node, n),
+		dirs:                       make([]string, n),
+		raftAddrs:                  make([]string, n),
+		httpAddrs:                  make([]string, n),
+		proc:                       newRecordingProcessor(),
+		results:                    make(map[string]*types.TaskResult),
+		workers:                    totalWorkersPerNode,
+		maxVoters:                  maxVoters,
+		disableVoterReconciliation: disableVoterReconciliation,
 	}
 
 	// ---- Allocate random loopback ports ----
@@ -123,12 +157,14 @@ func newTestClusterWithLogger(tb testing.TB, n int, totalWorkersPerNode int, log
 
 	// ---- Create node 0 (bootstrap) ----
 	node0, err := node.New(node.Config{
-		NodeID:       "node-0",
-		APIAddress:   tc.httpAddrs[0],
-		RaftAddress:  tc.raftAddrs[0],
-		DataDir:      tc.dirs[0],
-		Bootstrap:    true,
-		TotalWorkers: totalWorkersPerNode,
+		NodeID:                     "node-0",
+		APIAddress:                 tc.httpAddrs[0],
+		RaftAddress:                tc.raftAddrs[0],
+		DataDir:                    tc.dirs[0],
+		Bootstrap:                  true,
+		TotalWorkers:               totalWorkersPerNode,
+		MaxRaftVoters:              maxVoters,
+		DisableVoterReconciliation: disableVoterReconciliation,
 	}, tc.proc, logger)
 	if err != nil {
 		tb.Fatalf("create node-0: %v", err)
@@ -148,12 +184,14 @@ func newTestClusterWithLogger(tb testing.TB, n int, totalWorkersPerNode int, log
 	for i := 1; i < n; i++ {
 		nodeID := fmt.Sprintf("node-%d", i)
 		nd, err := node.New(node.Config{
-			NodeID:       nodeID,
-			APIAddress:   tc.httpAddrs[i],
-			RaftAddress:  tc.raftAddrs[i],
-			DataDir:      tc.dirs[i],
-			Bootstrap:    false,
-			TotalWorkers: totalWorkersPerNode,
+			NodeID:                     nodeID,
+			APIAddress:                 tc.httpAddrs[i],
+			RaftAddress:                tc.raftAddrs[i],
+			DataDir:                    tc.dirs[i],
+			Bootstrap:                  false,
+			TotalWorkers:               totalWorkersPerNode,
+			MaxRaftVoters:              maxVoters,
+			DisableVoterReconciliation: disableVoterReconciliation,
 		}, tc.proc, logger)
 		if err != nil {
 			tb.Fatalf("create node-%d: %v", i, err)
@@ -162,7 +200,7 @@ func newTestClusterWithLogger(tb testing.TB, n int, totalWorkersPerNode int, log
 
 		// Add as voter through the leader.
 		tc.waitLeader(0, 5*time.Second)
-		if err := node0.RaftCluster().AddVoter(nodeID, tc.raftAddrs[i]); err != nil {
+		if err := addMember(node0.RaftCluster(), nodeID, tc.raftAddrs[i]); err != nil {
 			tb.Fatalf("add voter %s: %v", nodeID, err)
 		}
 
@@ -379,12 +417,14 @@ func (tc *testCluster) restartAll() {
 	}
 	for i := range tc.nodes {
 		nd, err := node.New(node.Config{
-			NodeID:       fmt.Sprintf("node-%d", i),
-			APIAddress:   tc.httpAddrs[i],
-			RaftAddress:  tc.raftAddrs[i],
-			DataDir:      tc.dirs[i],
-			Bootstrap:    i == 0,
-			TotalWorkers: tc.workers,
+			NodeID:                     fmt.Sprintf("node-%d", i),
+			APIAddress:                 tc.httpAddrs[i],
+			RaftAddress:                tc.raftAddrs[i],
+			DataDir:                    tc.dirs[i],
+			Bootstrap:                  i == 0,
+			TotalWorkers:               tc.workers,
+			MaxRaftVoters:              tc.maxVoters,
+			DisableVoterReconciliation: tc.disableVoterReconciliation,
 		}, tc.proc, logger)
 		if err != nil {
 			tc.tb.Fatalf("recreate node-%d: %v", i, err)
@@ -1007,6 +1047,232 @@ func TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery(t *testing.T
 	if assignmentBatches == 0 || completionBatches == 0 {
 		t.Fatalf("observed assignment batches=%d completion batches=%d, want both", assignmentBatches, completionBatches)
 	}
+}
+
+// TestNewMembersBeyondVoterLimitAreNonvoters preserves PERF-001's steady-state
+// join policy. All seven processes run the real FSM/API/worker stack, while
+// only three participate in elections and commit acknowledgement.
+func TestNewMembersBeyondVoterLimitAreNonvoters(t *testing.T) {
+	tc := newTestClusterWithVoterLimit(t, 7, 80, 3, zap.NewNop())
+	defer tc.shutdown()
+
+	status, err := tc.nodes[tc.leaderIdx()].RaftCluster().MembershipStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Voters) != 3 || len(status.Nonvoters) != 4 {
+		t.Fatalf("membership = voters %v nonvoters %v, want 3/4", status.Voters, status.Nonvoters)
+	}
+	tc.addTenant("bounded-voters", 480)
+	tc.waitAllocation(10 * time.Second)
+	leader := tc.leaderIdx()
+	const taskCount = 600
+	tasks := make([]raftpkg.CreateTaskData, taskCount)
+	for i := range tasks {
+		tasks[i] = raftpkg.CreateTaskData{
+			TaskID: fmt.Sprintf("bounded-voters-%d", i), TenantID: "bounded-voters", Payload: `{"voters":3}`,
+		}
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: tasks}),
+		10*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("create bounded-voter backlog: %v", err)
+	}
+	tc.waitFor(func() bool {
+		for _, task := range tasks {
+			if result := tc.fsms().GetResult(task.TaskID); result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 15*time.Second, "bounded-voter cluster drains backlog")
+	processed := tc.proc.processedTaskCounts()
+	for _, task := range tasks {
+		if got := processed[task.TaskID]; got != 1 {
+			t.Fatalf("task %s processed %d times, want once", task.TaskID, got)
+		}
+	}
+}
+
+// TestBoundedVotersDrainTwentyThousandHTTPTasks preserves PERF-001's observed
+// production shape: four tenants submit 20,000 tasks through a follower's real
+// HTTP batch endpoint, then the real assignment/result streams drain them on a
+// seven-replica cluster whose consensus quorum is bounded to three voters.
+func TestBoundedVotersDrainTwentyThousandHTTPTasks(t *testing.T) {
+	tc := newTestClusterWithVoterLimit(t, 7, 80, 3, zap.NewNop())
+	defer tc.shutdown()
+
+	tenants := []string{"perf-a", "perf-b", "perf-c", "perf-d"}
+	for _, tenantID := range tenants {
+		tc.addTenant(tenantID, 120)
+	}
+	tc.waitAllocation(10 * time.Second)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+
+	const (
+		taskCount = 20000
+		batchSize = 1000
+	)
+	taskIDs := make([]string, 0, taskCount)
+	client := &http.Client{Timeout: 15 * time.Second}
+	submitStarted := time.Now()
+	for batchStart := 0; batchStart < taskCount; batchStart += batchSize {
+		request := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, batchSize)}
+		for i := range request.Tasks {
+			index := batchStart + i
+			request.Tasks[i] = types.TaskSubmitRequest{
+				TenantID:       tenants[index%len(tenants)],
+				Payload:        json.RawMessage(fmt.Sprintf(`{"index":%d}`, index)),
+				IdempotencyKey: fmt.Sprintf("perf-001-%d", index),
+			}
+		}
+		body, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Post(
+			"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch", "application/json", bytes.NewReader(body),
+		)
+		if err != nil {
+			t.Fatalf("batch %d POST through follower: %v", batchStart/batchSize, err)
+		}
+		if resp.StatusCode != http.StatusAccepted {
+			data, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			t.Fatalf("batch %d POST status = %d, want 202; body=%s", batchStart/batchSize, resp.StatusCode, data)
+		}
+		var result types.BatchTaskResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			_ = resp.Body.Close()
+			t.Fatalf("decode batch %d response: %v", batchStart/batchSize, err)
+		}
+		_ = resp.Body.Close()
+		if len(result.Tasks) != batchSize {
+			t.Fatalf("batch %d response tasks = %d, want %d", batchStart/batchSize, len(result.Tasks), batchSize)
+		}
+		for _, task := range result.Tasks {
+			taskIDs = append(taskIDs, task.TaskID)
+		}
+	}
+	submitElapsed := time.Since(submitStarted)
+	drainStarted := time.Now()
+
+	tc.waitFor(func() bool {
+		unfinished := tc.fsms().CountUnfinishedPerTenant()
+		for _, tenantID := range tenants {
+			if unfinished[tenantID] != 0 {
+				return false
+			}
+		}
+		return tc.proc.totalProcessed() >= taskCount
+	}, 90*time.Second, "20,000 HTTP tasks drain through bounded voter quorum")
+	t.Logf("PERF-001: submitted 20,000 tasks in %s and drained in %s", submitElapsed, time.Since(drainStarted))
+	processed := tc.proc.processedTaskCounts()
+	for _, taskID := range taskIDs {
+		if got := processed[taskID]; got != 1 {
+			t.Fatalf("task %s processed %d times, want once", taskID, got)
+		}
+	}
+}
+
+// TestOversizedVoterSetTransfersLeaderAndMigrates preserves PERF-001's upgrade
+// path. It starts with the historical all-voter topology and deliberately
+// places leadership outside the stable five-node target before reconciliation.
+func TestOversizedVoterSetTransfersLeaderAndMigrates(t *testing.T) {
+	tc := newAllVoterTestCluster(t, 7, 60)
+	defer tc.shutdown()
+	tc.addTenant("voter-migration", 300)
+	tc.waitAllocation(10 * time.Second)
+
+	before, err := tc.nodes[0].RaftCluster().MembershipStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before.Voters) != 7 {
+		t.Fatalf("pre-migration voters = %v, want all 7", before.Voters)
+	}
+	configuration, err := tc.nodes[0].RaftCluster().Configuration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var transferTarget hashicorpraft.Server
+	for _, server := range configuration.Servers {
+		if server.ID == "node-6" {
+			transferTarget = server
+			break
+		}
+	}
+	if transferTarget.ID == "" {
+		t.Fatal("node-6 missing from Raft configuration")
+	}
+	if err := tc.nodes[0].RaftCluster().GetRaft().LeadershipTransferToServer(
+		transferTarget.ID, transferTarget.Address,
+	).Error(); err != nil {
+		t.Fatalf("transfer leadership outside target set: %v", err)
+	}
+	tc.waitLeader(6, 10*time.Second)
+	transfer, err := tc.nodes[6].RaftCluster().ReconcileVoters(raftpkg.DefaultMaxVoters)
+	if err != nil {
+		t.Fatalf("reconcile leadership transfer: %v", err)
+	}
+	if !transfer.LeadershipTransferred {
+		t.Fatalf("reconcile result = %+v, want leadership transfer", transfer)
+	}
+	tc.waitLeader(0, 10*time.Second)
+	leader := 0
+	result, err := tc.nodes[leader].RaftCluster().ReconcileVoters(raftpkg.DefaultMaxVoters)
+	if err != nil {
+		t.Fatalf("reconcile voter demotions: %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("oversized voter set was not changed")
+	}
+	status, err := tc.nodes[leader].RaftCluster().MembershipStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Voters) != raftpkg.DefaultMaxVoters || len(status.Nonvoters) != 2 {
+		t.Fatalf("post-migration membership = voters %v nonvoters %v", status.Voters, status.Nonvoters)
+	}
+	if !containsString(status.Voters, fmt.Sprintf("node-%d", leader)) {
+		t.Fatalf("leader node-%d is outside voter set %v", leader, status.Voters)
+	}
+
+	const taskCount = 300
+	tasks := make([]raftpkg.CreateTaskData, taskCount)
+	for i := range tasks {
+		tasks[i] = raftpkg.CreateTaskData{
+			TaskID: fmt.Sprintf("voter-migration-%d", i), TenantID: "voter-migration", Payload: `{"migration":true}`,
+		}
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: tasks}),
+		10*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("create post-migration backlog: %v", err)
+	}
+	tc.waitFor(func() bool {
+		for _, task := range tasks {
+			if result := tc.fsms().GetResult(task.TaskID); result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 15*time.Second, "post-migration backlog drains")
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // TestFailover kills the leader and verifies a new leader is elected and

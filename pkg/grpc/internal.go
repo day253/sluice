@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	grpcv1 "github.com/day253/sluice/pkg/grpc/v1"
-	"github.com/day253/sluice/pkg/queue"
 	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/types"
 )
@@ -30,7 +29,6 @@ type InternalService struct {
 	raft   raftpkg.RaftApplier
 	fsm    *raftpkg.FSM
 	logger *zap.Logger
-	queue  queue.Queue
 
 	// claimMu serializes the new leader-owned assignment path with the legacy
 	// ClaimStream path during a rolling upgrade.
@@ -75,10 +73,6 @@ type completionOutcome struct {
 	taskID string
 	err    error
 }
-
-// SetQueue lets the leader remove obsolete local queue hints after a durable
-// assignment. Raft pending state remains the source of truth.
-func (s *InternalService) SetQueue(q queue.Queue) { s.queue = q }
 
 // NewInternalService creates the internal gRPC service.
 func NewInternalService(
@@ -435,9 +429,8 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 	s.claimMu.Lock()
 	allocations := s.fsm.GetAllAllocations()
 	pending := s.fsm.FindAllPendingTasks()
-	selectedIDs := make(map[string]struct{}, len(batch))
+	selector := newPendingSelector(pending, time.Now().UTC(), nil)
 	selected := make([]selectedAssignment, 0, len(batch))
-	now := time.Now().UTC()
 	for i, job := range batch {
 		request := job.request
 		if job.ctx.Err() != nil || request == nil || request.RequestId == "" ||
@@ -448,11 +441,10 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 		if !ok || allocation.Tenants[request.PreferredTenantId] <= 0 {
 			continue
 		}
-		task := selectPendingForSlot(pending, selectedIDs, request.NodeId, request.PreferredTenantId, now)
+		task := selector.selectForSlot(request.NodeId, request.PreferredTenantId)
 		if task == nil {
 			continue
 		}
-		selectedIDs[task.TaskID] = struct{}{}
 		selected = append(selected, selectedAssignment{index: i, request: request, task: task})
 	}
 
@@ -504,12 +496,6 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 			TaskId:    assignment.task.TaskID, TenantId: assignment.task.TenantID,
 			Payload: []byte(assignment.task.Payload), QueueNodeId: assignment.task.QueueNodeID,
 		}
-		if s.queue != nil && assignment.task.QueueNodeID == s.nodeID {
-			if err := s.queue.Remove(assignment.task.TenantID, assignment.task.TaskID); err != nil {
-				s.logger.Warn("assignment: remove local queue hint failed",
-					zap.String("task_id", assignment.task.TaskID), zap.Error(err))
-			}
-		}
 	}
 	s.deliverAssignmentOutcomes(batch, outcomes)
 }
@@ -523,45 +509,111 @@ func (s *InternalService) deliverAssignmentOutcomes(batch []assignmentJob, outco
 	}
 }
 
-// selectPendingForSlot applies the leader's scheduling policy to one idle
-// execution slot. The global pending slice is already FIFO, while priority
-// classes preserve tenant allocation and node-local queue affinity.
+type pendingQueue struct {
+	tasks []*types.TaskRecord
+	next  int
+}
+
+type nodeTenantKey struct {
+	nodeID   string
+	tenantID string
+}
+
+// pendingSelector builds FIFO indexes once per dispatcher batch. A task is
+// present in at most four indexes, and lazy selected-ID skipping advances each
+// queue monotonically. This preserves the scheduling policy while replacing
+// O(slots*pending) repeated scans with O(pending+slots) normal-path work.
+type pendingSelector struct {
+	byNodeTenant map[nodeTenantKey]*pendingQueue
+	byTenant     map[string]*pendingQueue
+	byNode       map[string]*pendingQueue
+	aged         pendingQueue
+	selected     map[string]struct{}
+	inspected    int
+}
+
+func newPendingSelector(pending []*types.TaskRecord, now time.Time, selected map[string]struct{}) *pendingSelector {
+	if selected == nil {
+		selected = make(map[string]struct{})
+	}
+	selector := &pendingSelector{
+		byNodeTenant: make(map[nodeTenantKey]*pendingQueue),
+		byTenant:     make(map[string]*pendingQueue),
+		byNode:       make(map[string]*pendingQueue),
+		selected:     selected,
+	}
+	stealBefore := now.Add(-workStealThreshold)
+	for _, task := range pending {
+		if task == nil {
+			continue
+		}
+		tenantQueue := selector.byTenant[task.TenantID]
+		if tenantQueue == nil {
+			tenantQueue = &pendingQueue{}
+			selector.byTenant[task.TenantID] = tenantQueue
+		}
+		tenantQueue.tasks = append(tenantQueue.tasks, task)
+		if task.QueueNodeID != "" {
+			key := nodeTenantKey{nodeID: task.QueueNodeID, tenantID: task.TenantID}
+			nodeTenantQueue := selector.byNodeTenant[key]
+			if nodeTenantQueue == nil {
+				nodeTenantQueue = &pendingQueue{}
+				selector.byNodeTenant[key] = nodeTenantQueue
+			}
+			nodeTenantQueue.tasks = append(nodeTenantQueue.tasks, task)
+			nodeQueue := selector.byNode[task.QueueNodeID]
+			if nodeQueue == nil {
+				nodeQueue = &pendingQueue{}
+				selector.byNode[task.QueueNodeID] = nodeQueue
+			}
+			nodeQueue.tasks = append(nodeQueue.tasks, task)
+		}
+		if !task.CreatedAt.IsZero() && task.CreatedAt.Before(stealBefore) {
+			selector.aged.tasks = append(selector.aged.tasks, task)
+		}
+	}
+	return selector
+}
+
+func (s *pendingSelector) take(queue *pendingQueue) *types.TaskRecord {
+	if queue == nil {
+		return nil
+	}
+	for queue.next < len(queue.tasks) {
+		task := queue.tasks[queue.next]
+		queue.next++
+		s.inspected++
+		if _, exists := s.selected[task.TaskID]; exists {
+			continue
+		}
+		s.selected[task.TaskID] = struct{}{}
+		return task
+	}
+	return nil
+}
+
+func (s *pendingSelector) selectForSlot(nodeID, preferredTenantID string) *types.TaskRecord {
+	if task := s.take(s.byNodeTenant[nodeTenantKey{nodeID: nodeID, tenantID: preferredTenantID}]); task != nil {
+		return task
+	}
+	if task := s.take(s.byTenant[preferredTenantID]); task != nil {
+		return task
+	}
+	if task := s.take(s.byNode[nodeID]); task != nil {
+		return task
+	}
+	return s.take(&s.aged)
+}
+
+// selectPendingForSlot keeps the focused policy boundary available to tests
+// and the rolling-compatibility path. Production batches reuse one selector.
 func selectPendingForSlot(
 	pending []*types.TaskRecord,
 	selected map[string]struct{},
 	nodeID, preferredTenantID string,
 	now time.Time,
 ) *types.TaskRecord {
-	bestClass := 4
-	var best *types.TaskRecord
-	stealBefore := now.Add(-workStealThreshold)
-	for _, task := range pending {
-		if task == nil {
-			continue
-		}
-		if _, ok := selected[task.TaskID]; ok {
-			continue
-		}
-		class := 4
-		switch {
-		case task.TenantID == preferredTenantID && task.QueueNodeID == nodeID:
-			class = 0
-		case task.TenantID == preferredTenantID:
-			class = 1
-		case task.QueueNodeID != "" && task.QueueNodeID == nodeID:
-			class = 2
-		case !task.CreatedAt.IsZero() && task.CreatedAt.Before(stealBefore):
-			class = 3
-		}
-		if class < bestClass {
-			bestClass = class
-			best = task
-			if class == 0 {
-				return best
-			}
-		}
-	}
-	return best
+	return newPendingSelector(pending, now, selected).selectForSlot(nodeID, preferredTenantID)
 }
 
 // workStealThreshold is intentionally shared with the worker-side age check.

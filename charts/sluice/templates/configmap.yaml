@@ -47,6 +47,7 @@ data:
       exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
         --raft-advertise="${RAFT_ADVERTISE}" \
         --data="${DATA}" --bootstrap --workers={{ .Values.workersPerNode }} \
+        --raft-voters={{ .Values.raftVoters }} \
         --log-level={{ .Values.logLevel }}
     else
       # Existing members must start immediately after a full-cluster restart.
@@ -56,6 +57,7 @@ data:
         exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
           --raft-advertise="${RAFT_ADVERTISE}" \
           --data="${DATA}" --workers={{ .Values.workersPerNode }} \
+          --raft-voters={{ .Values.raftVoters }} \
           --log-level={{ .Values.logLevel }}
       fi
 
@@ -86,5 +88,6 @@ data:
       exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
         --raft-advertise="${RAFT_ADVERTISE}" \
         --data="${DATA}" --workers={{ .Values.workersPerNode }} \
+        --raft-voters={{ .Values.raftVoters }} \
         --log-level={{ .Values.logLevel }}
     fi

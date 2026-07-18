@@ -29,11 +29,12 @@ Case、单元回归测试和真实集成回归测试；修复后仍保留这些 
 |---|---|---|---|
 | SUBMIT-001 | Follower 的租户镜像可能落后；请求必须先转发 Leader，不能瞬时 404 | `pkg/grpc.TestSubmitForwardsBeforeFollowerTenantValidation` | `test/integration.TestHTTPSubmitThroughFollower` |
 | SUBMIT-002 | 批量提交必须用单条 CreateTaskBatch Raft 日志，同时保留 Follower 转发和全部任务完成 | `pkg/grpc.TestSubmitBatchUsesOneRaftApply` | `test/integration.TestHTTPBatchSubmitThroughFollower` |
-| SUBMIT-003 | 1000 条批次经 Follower 不得被固定 10 秒窗口误判；未知结果使用幂等键重试必须返回相同 ID、只处理一次且不追加重复 Queue hint | `pkg/grpc.TestSubmitBatchFollowerUsesConfiguredForwardTimeout`、`TestSubmitBatchIdempotencyKeysReuseTaskIDs` | `test/integration.TestHTTPBatchSubmitThroughFollower`（1000 条、真实 Follower HTTP、重复提交） |
+| SUBMIT-003 | 1000 条批次经 Follower 不得被固定 10 秒窗口误判；未知结果使用幂等键重试必须返回相同 ID、只处理一次且不创建本地 Queue 副本 | `pkg/grpc.TestSubmitBatchFollowerUsesConfiguredForwardTimeout`、`TestSubmitBatchIdempotencyKeysReuseTaskIDs` | `test/integration.TestHTTPBatchSubmitThroughFollower`（1000 条、真实 Follower HTTP、重复提交） |
 | SCHED-001 | Worker 只能执行 Leader 已提交的具体 assignment，不能从复制的 fresh pending 自发 Claim；任务最终只处理一次 | `pkg/worker.TestPoolWorker_ExecutesLeaderAssignmentWithoutWorkerClaim`、`pkg/grpc.TestAssignmentStreamBatchesDistinctLeaderCommittedTasks` | `test/integration.TestFreshRecoveryDoesNotCauseCrossNodeClaimStorm` |
 | SCHED-002 | aged pending 也必须由 Leader 唯一选择并批量 Claim；多节点不能因同时扫描产生 rejected-claim 风暴 | `pkg/grpc.TestSelectPendingForSlot_PreservesLocalityAndAgeBoundary`、`TestAssignmentStreamBatchesDistinctLeaderCommittedTasks` | `test/integration.TestLeaderAssignmentDrainsAgedBacklogWithoutClaimCompetition` |
 | SCHED-003 | Assignment 必须跨所有节点流全局聚批；节点数增加不能把健康请求拖过流超时并让已 claim 任务等待 30 秒 lease | `pkg/grpc.TestAssignmentStreamBatchesDistinctLeaderCommittedTasks`（两个独立节点流仅一条 Apply） | `test/integration.TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery`（7 节点、lease 前排空、零 assignment/completion timeout 与 lease 回收） |
 | SCHED-004 | 4900 Worker 同时拉取/完成不能形成无界请求尖峰；单节点每类未决请求≤8、Raft Claim/Complete 批次≤128，单请求等待不能关闭共享流；Leader 仍唯一分配且业务 Worker 并发不受 credit 限制 | `pkg/grpc.TestClaimClientBoundsPerNodeRaftRequests`、`TestInternalServiceBoundsGlobalRaftBatchSize` | `test/integration.TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery`（真实 8 节点/4900 执行 Worker/4096 任务、批次边界、lease 前排空、exactly-once final state） |
+| PERF-001 | 50 个执行实例不能等于 50 voter；新成员超过奇数上限后必须是 non-voter，旧超大 voter 集合必须先转移 Leader 再安全 demote；2 万 pending 每批只能建一次索引；durable Raft pending 不能再逐条复制到 Leader 本地 Queue | `pkg/raft.TestDesiredVoterIDsUseStableOrdinalOrder`、`TestValidateMaxVotersRejectsUnsafeEvenQuorum`；`pkg/grpc.TestPendingSelectorIndexesLargeBacklogOncePerBatch`、`TestSubmitBatchDoesNotDuplicateRaftPendingIntoLocalQueue`；`pkg/api.TestRaftStatusEndpointReportsBoundedMembership` | `test/integration.TestNewMembersBeyondVoterLimitAreNonvoters`、`TestOversizedVoterSetTransfersLeaderAndMigrates`、`TestBoundedVotersDrainTwentyThousandHTTPTasks`（真实 7 节点 Raft + Follower HTTP/gRPC + Worker + Bolt 持久化，4 tenant/20000 条、全部排空且每条只执行一次） |
 | RESULT-001 | Completion 必须跨所有节点流全局聚批；只有 Raft 已提交结果可 ACK，取消流不能确认未提交结果 | `pkg/grpc.TestResultStreamBatchesCompletionsAcrossNodeStreams`、`TestDispatchCompletionsDoesNotAcknowledgeCanceledJob` | `test/integration.TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery` |
 | STEAL-001 | work steal 是 Leader 对既有空闲槽位的调度：同 tenant/同节点优先，本节点其他 tenant 可立即分配，跨节点 fresh 必须等待 5 秒 | `pkg/grpc.TestSelectPendingForSlot_PreservesLocalityAndAgeBoundary`、旧协议边界 `TestCanStealRequiresAgedPendingTask` | `test/integration.TestWorkStealUsesAgedPendingWork`（跨节点 5 秒边界） |
 | LEADER-001 | Leader 只调度与提交，不接收 allocation、不运行或获取业务任务；选主后立即清空 Worker，Follower 继续完成任务 | `pkg/allocator.TestReconcile_LeaderHasNoAllocation`、`TestReconcile_OnlyLeaderClearsStaleAllocation`、`pkg/worker.TestPoolWorker_GuardPreventsLeaderExecution`、`pkg/grpc.TestAssignmentStreamBatchesDistinctLeaderCommittedTasks` | `test/integration.TestLeaderIsControlPlaneOnly`、`TestFailover` |
@@ -58,4 +59,8 @@ Case、单元回归测试和真实集成回归测试；修复后仍保留这些 
   `Unimplemented` 才允许滚动升级兼容路径；
 - 单节点 Assignment/Result 未决请求各不超过 8，Leader 的 Claim/Complete Raft 批次
   不超过 128；credit 不能降低已分配的业务 Worker 并发；
+- 执行副本扩容不扩大 voter 多数派；迁移后的 Leader 位于目标 voter 集合，non-voter
+  仍能复制 FSM、运行 Worker 并把任务提交为单次最终状态；
+- API 批量提交只创建 Raft pending，不写重复本地 Queue；大 backlog 的选择索引每批只
+  构建一次，同时保持原四级 FIFO/tenant/node/age 优先级；
 - 测试在 race detector 下没有数据竞争，且没有无界等待。

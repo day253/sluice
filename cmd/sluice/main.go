@@ -31,6 +31,7 @@ var (
 	bootstrap     = flag.Bool("bootstrap", false, "Bootstrap a new single-node cluster")
 	joinAddr      = flag.String("join", "", "Address of an existing node to join")
 	totalWorkers  = flag.Int("workers", 100, "Total worker capacity on this node")
+	maxRaftVoters = flag.Int("raft-voters", 5, "Maximum odd number of voting Raft members")
 	logLevel      = flag.String("log-level", "info", "Log level: debug, info, warn, error")
 )
 
@@ -67,6 +68,7 @@ func main() {
 		Bootstrap:       *bootstrap,
 		JoinAddress:     *joinAddr,
 		TotalWorkers:    *totalWorkers,
+		MaxRaftVoters:   *maxRaftVoters,
 	}
 
 	// ---- Use the demo processor (replace with your own) ----

@@ -335,15 +335,7 @@ func (p *Pool) workerLoop(ctx context.Context, cancel context.CancelFunc, tenant
 		if !reserved && !p.reserveTask(task.TaskID) {
 			continue
 		}
-		if leaderAssigned {
-			// The leader has already committed pending→inflight. Remove a stale
-			// local queue hint if this task originated on this node.
-			if task.QueueNodeID == p.nodeID {
-				if err := p.queue.Remove(task.TenantID, task.TaskID); err != nil {
-					logger.Warn("remove assigned local queue hint failed", zap.Error(err))
-				}
-			}
-		} else {
+		if !leaderAssigned {
 			// Legacy clients still claim a worker-selected task during rollout.
 			if err := p.claimTask(task, steal); err != nil {
 				p.releaseTask(task.TaskID)

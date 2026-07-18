@@ -15,16 +15,18 @@ import (
 
 	grpcpkg "github.com/day253/sluice/pkg/grpc"
 	grpcv1 "github.com/day253/sluice/pkg/grpc/v1"
+	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/types"
 )
 
 // Handler adapts the gRPC Sluice service to HTTP REST.  Every endpoint
 // converts the HTTP request to a gRPC call and the response back to JSON.
 type Handler struct {
-	nodeID    string
-	svc       *grpcpkg.Service
-	joinFunc  func(nodeID, raftAddr, httpAddr string, workers int) error
-	collector interface {
+	nodeID         string
+	svc            *grpcpkg.Service
+	joinFunc       func(nodeID, raftAddr, httpAddr string, workers int) error
+	raftStatusFunc func() (raftpkg.MembershipStatus, error)
+	collector      interface {
 		Query(name string) ([]MetricsData, int)
 	}
 	logger *zap.Logger
@@ -56,6 +58,11 @@ func (h *Handler) SetJoinFunc(fn func(nodeID, raftAddr, httpAddr string, workers
 	h.joinFunc = fn
 }
 
+// SetRaftStatusFunc configures the read-only consensus membership endpoint.
+func (h *Handler) SetRaftStatusFunc(fn func() (raftpkg.MembershipStatus, error)) {
+	h.raftStatusFunc = fn
+}
+
 // RegisterRoutes attaches all endpoints to the given router.
 func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/tasks", h.submitTask).Methods("POST")
@@ -69,11 +76,25 @@ func (h *Handler) RegisterRoutes(r *mux.Router) {
 
 	r.HandleFunc("/api/v1/admin/nodes", h.listNodes).Methods("GET")
 	r.HandleFunc("/api/v1/admin/allocations", h.getAllocations).Methods("GET")
+	r.HandleFunc("/api/v1/admin/raft", h.raftStatus).Methods("GET")
 
 	r.HandleFunc("/api/v1/cluster/join", h.joinCluster).Methods("POST")
 	r.HandleFunc("/api/v1/metrics", h.metrics).Methods("GET")
 	r.HandleFunc("/api/v1/metrics/{name}", h.metrics).Methods("GET")
 	r.HandleFunc("/api/v1/health", h.health).Methods("GET")
+}
+
+func (h *Handler) raftStatus(w http.ResponseWriter, _ *http.Request) {
+	if h.raftStatusFunc == nil {
+		h.writeError(w, http.StatusInternalServerError, "raft status not configured")
+		return
+	}
+	status, err := h.raftStatusFunc()
+	if err != nil {
+		h.writeError(w, http.StatusServiceUnavailable, "raft status unavailable: "+err.Error())
+		return
+	}
+	h.writeJSON(w, http.StatusOK, status)
 }
 
 // ---------------------------------------------------------------------------

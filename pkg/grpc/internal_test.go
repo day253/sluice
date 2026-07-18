@@ -369,6 +369,34 @@ func TestSelectPendingForSlot_PreservesLocalityAndAgeBoundary(t *testing.T) {
 	}
 }
 
+func TestPendingSelectorIndexesLargeBacklogOncePerBatch(t *testing.T) {
+	now := time.Now().UTC()
+	const backlog = 20000
+	pending := make([]*types.TaskRecord, backlog)
+	for i := range pending {
+		pending[i] = &types.TaskRecord{
+			TaskID: fmt.Sprintf("indexed-%05d", i), TenantID: "tenant-a",
+			QueueNodeID: "submit-node", CreatedAt: now.Add(time.Duration(i-backlog) * time.Millisecond),
+		}
+	}
+	selector := newPendingSelector(pending, now, nil)
+	seen := make(map[string]struct{}, claimBatchMaxSize)
+	for i := 0; i < claimBatchMaxSize; i++ {
+		task := selector.selectForSlot(fmt.Sprintf("worker-%d", i%16), "tenant-a")
+		if task == nil {
+			t.Fatalf("slot %d did not receive a task", i)
+		}
+		if _, duplicate := seen[task.TaskID]; duplicate {
+			t.Fatalf("task %s selected twice", task.TaskID)
+		}
+		seen[task.TaskID] = struct{}{}
+	}
+	if selector.inspected > claimBatchMaxSize*2 {
+		t.Fatalf("indexed selector inspected %d entries for %d slots; repeated full scans would inspect %d",
+			selector.inspected, claimBatchMaxSize, backlog*claimBatchMaxSize)
+	}
+}
+
 func TestAssignmentStreamBatchesDistinctLeaderCommittedTasks(t *testing.T) {
 	fsm := raftpkg.NewFSM(zap.NewNop())
 	applyInternalTestCommand(fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{

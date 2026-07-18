@@ -122,7 +122,7 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 			TaskID:      taskID,
 			TenantID:    item.TenantId,
 			Payload:     string(item.Payload),
-			QueueNodeID: s.nodeID,
+			QueueNodeID: "",
 		}
 		resp.Tasks[i] = &grpcv1.SubmitResponse{TaskId: taskID, TenantId: item.TenantId, Status: types.TaskStatusPending}
 	}
@@ -133,27 +133,13 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 		s.logger.Error("submit batch raft apply failed", zap.Error(err), zap.Int("tasks", len(create)))
 		return nil, status.Error(codes.Internal, "failed to create task batch")
 	}
-	createdResult, ok := result.Response().(*raftpkg.CreateTaskBatchResult)
-	if !ok {
+	if _, ok := result.Response().(*raftpkg.CreateTaskBatchResult); !ok {
 		return nil, status.Error(codes.Internal, "create task batch returned an invalid response")
 	}
-	created := make(map[string]struct{}, len(createdResult.Created))
-	for _, taskID := range createdResult.Created {
-		created[taskID] = struct{}{}
-	}
-	for i, item := range req.Tasks {
-		if _, ok := created[create[i].TaskID]; !ok {
-			continue
-		}
-		// Also enqueue locally so local workers pick tasks up quickly
-		// (best-effort); the batch Raft entry remains the durable source.
-		_ = s.queue.Enqueue(item.TenantId, &queue.TaskEnvelope{
-			TaskID:    create[i].TaskID,
-			TenantID:  item.TenantId,
-			Payload:   item.Payload,
-			CreatedAt: time.Now().UTC(),
-		})
-	}
+	// The replicated pending record is the only durable queue. Duplicating this
+	// batch into the Leader's local Bolt queue adds one fsync and later one
+	// delete scan per task, while providing no locality because Leaders execute
+	// no business work. Legacy workers recover pending tasks from the FSM.
 	return resp, nil
 }
 

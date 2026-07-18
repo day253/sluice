@@ -1,6 +1,10 @@
-# Number of Raft nodes (odd is recommended for production; 50 is useful for
-# scale testing and intentionally exercises the large-voter path).
+# Number of replicated API/FSM/worker processes. Consensus voters are bounded
+# separately so execution capacity can scale without extending the quorum.
 replicas: 50
+
+# Consensus quorum size. Remaining replicas still receive the FSM log and run
+# workers, but do not participate in elections or commit acknowledgement.
+raftVoters: 5
 
 image:
   repository: ghcr.io/day253/sluice

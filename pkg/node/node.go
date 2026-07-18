@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,6 +40,10 @@ type Config struct {
 	Bootstrap       bool
 	JoinAddress     string
 	TotalWorkers    int
+	MaxRaftVoters   int // odd voter cap; remaining members replicate as non-voters
+	// DisableVoterReconciliation is reserved for externally managed embedded
+	// clusters and protocol tests. Production leaves it false.
+	DisableVoterReconciliation bool
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +69,9 @@ type Node struct {
 
 	shutdownOnce sync.Once
 	shutdownErr  error
+
+	voterReconcileRunning atomic.Bool
+	voterReconcileDone    atomic.Bool
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +79,12 @@ type Node struct {
 // ---------------------------------------------------------------------------
 
 func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, error) {
+	if cfg.MaxRaftVoters == 0 {
+		cfg.MaxRaftVoters = raftpkg.DefaultMaxVoters
+	}
+	if cfg.MaxRaftVoters < 1 || cfg.MaxRaftVoters%2 == 0 {
+		return nil, fmt.Errorf("max Raft voters must be a positive odd number, got %d", cfg.MaxRaftVoters)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	n := &Node{
@@ -134,7 +148,6 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	// ---- gRPC services (shared by HTTP adapter + gRPC server) ----
 	grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(), bridge, n.pool, logger)
 	internalSvc := grpcpkg.NewInternalService(cfg.NodeID, cluster.FSM(), bridge, logger)
-	internalSvc.SetQueue(q)
 
 	// ---- Metrics collector (server-side history) ----
 	n.collector = metrics.NewCollector(cluster.FSM(), logger)
@@ -142,8 +155,9 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	// ---- HTTP handler (adapts gRPC service) ----
 	httpHandler := api.NewHandler(cfg.NodeID, grpcSvc, logger)
 	httpHandler.SetCollector(metricsAdapter{n.collector})
+	httpHandler.SetRaftStatusFunc(cluster.MembershipStatus)
 	httpHandler.SetJoinFunc(func(nodeID, raftAddr, httpAddr string, workers int) error {
-		if err := cluster.AddVoter(nodeID, raftAddr); err != nil {
+		if err := cluster.AddServer(nodeID, raftAddr, cfg.MaxRaftVoters); err != nil {
 			return err
 		}
 		// Also register in FSM (AddVoter only updates Raft config).
@@ -316,6 +330,7 @@ func (n *Node) watchLeadership() {
 		n.pool.Reconcile(map[string]int{})
 		n.allocEngine.SetLeader(true)
 		_ = n.allocEngine.ReconcileNow()
+		n.reconcileVotersAsync()
 	}
 
 	ch := n.raftCluster.LeaderCh()
@@ -327,19 +342,54 @@ func (n *Node) watchLeadership() {
 			// LeaderCh only reports this node's boolean leadership transitions.
 			// Polling the address also catches follower A -> follower B changes.
 			updateClaim()
+			if n.raftCluster.IsLeader() {
+				n.reconcileVotersAsync()
+			}
 		case isLeader, ok := <-ch:
 			if !ok {
 				return
 			}
 			n.allocEngine.SetLeader(isLeader)
 			if isLeader {
+				n.voterReconcileDone.Store(false)
 				// Stop the data plane before publishing the follower-only plan.
 				n.pool.Reconcile(map[string]int{})
 				_ = n.allocEngine.ReconcileNow()
+				n.reconcileVotersAsync()
+			} else {
+				n.voterReconcileDone.Store(false)
 			}
 			updateClaim()
 		}
 	}
+}
+
+func (n *Node) reconcileVotersAsync() {
+	if n.cfg.DisableVoterReconciliation || n.voterReconcileDone.Load() || !n.raftCluster.IsLeader() ||
+		!n.voterReconcileRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer n.voterReconcileRunning.Store(false)
+		result, err := n.raftCluster.ReconcileVoters(n.cfg.MaxRaftVoters)
+		if err != nil {
+			if err != hashicorpraft.ErrNotLeader {
+				n.logger.Warn("raft voter reconciliation failed", zap.Error(err))
+			}
+			return
+		}
+		if result.LeadershipTransferred {
+			n.logger.Info("raft leadership transferred into bounded voter set",
+				zap.String("leader", result.Status.LeaderID))
+			return
+		}
+		n.voterReconcileDone.Store(true)
+		if result.Changed {
+			n.logger.Info("raft voter set reconciled",
+				zap.Int("voters", len(result.Status.Voters)),
+				zap.Int("nonvoters", len(result.Status.Nonvoters)))
+		}
+	}()
 }
 
 func (n *Node) watchAllocations() {
