@@ -896,6 +896,9 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		`href="/api/v1/admin/performance"`,
 		`getJSON('/api/v1/metrics?performance=0')`,
 		`getJSON('/api/v1/admin/performance')`,
+		`.chart-tooltip{`,
+		`canvas.addEventListener('pointermove',event=>moveChartHover(canvas,event))`,
+		`Number.isFinite(selected.item.limit)`,
 	} {
 		if !strings.Contains(string(dashboardBody), fragment) {
 			t.Errorf("production dashboard is missing performance fragment %q", fragment)

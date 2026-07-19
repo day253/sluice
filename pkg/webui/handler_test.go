@@ -32,6 +32,31 @@ func TestDashboardIncludesPerformanceVisualizationAndJSONLink(t *testing.T) {
 	}
 }
 
+func TestDashboardChartsExposeNearestPointTooltip(t *testing.T) {
+	handler := Handler(http.NotFoundHandler())
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	body := recorder.Body.String()
+	for _, fragment := range []string{
+		`.chart-tooltip{`,
+		`const chartTimeLabel=index=>`,
+		`tooltip.setAttribute('role','tooltip')`,
+		`canvas.addEventListener('pointermove',event=>moveChartHover(canvas,event))`,
+		`Number.isFinite(selected.item.limit)`,
+		`' workers'`,
+		`' tasks'`,
+		`' ms'`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Errorf("dashboard is missing chart tooltip fragment %q", fragment)
+		}
+	}
+}
+
 func TestPerformanceJSONRouteStillDelegatesToAPI(t *testing.T) {
 	const diagnostics = `{"node_id":"leader-1","current":{"raft":{}},"history":{}}`
 	apiCalled := false

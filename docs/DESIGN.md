@@ -374,6 +374,22 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   最终 unfinished=0；同一路径还验证 `history=0` 经 Follower 传到 Leader 后保留当前值、
   不复制历史，默认请求仍返回完整 JSON。
 
+### UI-004：174 点曲线的点值读取
+
+- **需求**：Worker 分配、租户未完成任务、Raft Apply 和调度器四张时序图都必须能用鼠标
+  读取某个采样点。提示包含该点所属的时间桶、离鼠标纵坐标最近的系列和原始值；Worker
+  系列同时显示实例 Limit，避免只看纵轴估算。
+- **时间语义**：174 点保持 `30 days + 24 hours + 60 minutes + 60 seconds` 的现有顺序。
+  日/时/分提示的是最近已经完成的采样桶，最右秒点标为 `Latest`。悬浮层只是已有历史
+  快照的只读投影，不新增服务端字段、历史副本或网络请求，也不改变每秒刷新周期。
+- **密集曲线边界**：50 实例场景不在提示框中枚举全部系列，而是根据鼠标纵坐标选择最近
+  的实际点；竖向参考线保留当前时间位置。相同坐标的系列按图例的稳定顺序选择。当前只
+  覆盖鼠标/Pointer 悬浮，不把键盘逐点浏览或缩放拖拽扩进本次范围。
+- **回归覆盖**：`pkg/webui.TestDashboardChartsExposeNearestPointTooltip` 固定组件结构、四类
+  单位和 Worker Limit；真实 3 节点 `TestPerformanceDiagnosticsProxyFromFollower` 从 Follower
+  的生产 HTTP 页面验证脚本随 Leader 诊断一起交付；远程浏览器实际移动鼠标后断言 tooltip
+  可见、包含时间/系列/数值且页面没有 console error。
+
 ### RESULT-001：每节点完成流放大 Raft 日志
 
 - **风险**：Assignment 修复后，大量节点可能同时完成任务；若 ResultStream 各自提交
