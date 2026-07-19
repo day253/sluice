@@ -408,7 +408,10 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   仍为 174 点；`pkg/api.TestMetricsEndpointCanFilterHistoriesByPrefix` 验证 HTTP 参数传递；
   `pkg/webui.TestDashboardChartsExposeRawJSONLinks` 固定四张图的新页链接。真实 3 节点
   `TestPerformanceDiagnosticsProxyFromFollower` 验证 Follower HTTP 返回的 prefix 数据只含目标
-  系列、保留 174 点且 Dashboard 交付四个链接；远程浏览器逐个打开并校验 JSON 和零 console error。
+  系列、保留 174 点且 Dashboard 交付四个链接；远程浏览器验证四个 href、`_blank`、
+  `noopener` 和零 console error，同一 Mac 隧道实际 GET 并解析三类 JSON。Browser Use 运行时会以
+  `ERR_BLOCKED_BY_CLIENT` 拦截裸 JSON 顶层导航，因此不把“自动浏览器新页渲染”描述为已覆盖；
+  该限制不影响生产 HTTP 端点或 Dashboard 自身的同源 JSON 请求。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 
