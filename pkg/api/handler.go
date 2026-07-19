@@ -24,12 +24,13 @@ import (
 // Handler adapts the gRPC Sluice service to HTTP REST.  Every endpoint
 // converts the HTTP request to a gRPC call and the response back to JSON.
 type Handler struct {
-	nodeID          string
-	svc             *grpcpkg.Service
-	joinFunc        func(nodeID, raftAddr, httpAddr string, workers int) error
-	raftStatusFunc  func() (raftpkg.MembershipStatus, error)
-	performanceFunc func(context.Context, bool, bool) (metrics.PerformanceDiagnostics, error)
-	collector       interface {
+	nodeID             string
+	svc                *grpcpkg.Service
+	joinFunc           func(nodeID, raftAddr, httpAddr string, workers int) error
+	workerRegisterFunc func(types.NodeInfo) error
+	raftStatusFunc     func() (raftpkg.MembershipStatus, error)
+	performanceFunc    func(context.Context, bool, bool) (metrics.PerformanceDiagnostics, error)
+	collector          interface {
 		Query(name, includePrefix, excludePrefix string) ([]MetricsData, int)
 	}
 	logger *zap.Logger
@@ -59,6 +60,12 @@ func (h *Handler) SetCollector(c interface {
 // SetJoinFunc configures the handler to handle cluster-join requests.
 func (h *Handler) SetJoinFunc(fn func(nodeID, raftAddr, httpAddr string, workers int) error) {
 	h.joinFunc = fn
+}
+
+// SetWorkerRegisterFunc configures stateless execution-node registration.
+// Unlike cluster join, this never changes Raft membership.
+func (h *Handler) SetWorkerRegisterFunc(fn func(types.NodeInfo) error) {
+	h.workerRegisterFunc = fn
 }
 
 // SetRaftStatusFunc configures the read-only consensus membership endpoint.
@@ -91,6 +98,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/admin/performance", h.performance).Methods("GET")
 
 	r.HandleFunc("/api/v1/cluster/join", h.joinCluster).Methods("POST")
+	r.HandleFunc("/api/v1/cluster/workers/register", h.registerWorker).Methods("POST")
 	r.HandleFunc("/api/v1/metrics", h.metrics).Methods("GET")
 	r.HandleFunc("/api/v1/metrics/{name}", h.metrics).Methods("GET")
 	r.HandleFunc("/api/v1/health", h.health).Methods("GET")
@@ -272,12 +280,26 @@ func (h *Handler) listTenants(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func (h *Handler) listNodes(w http.ResponseWriter, r *http.Request) {
-	resp, err := h.svc.ClusterStatus(r.Context(), &grpcv1.ClusterStatusRequest{})
-	if err != nil {
-		h.writeGRPCError(w, err)
-		return
+	nodes, leader := h.svc.NodeSnapshot()
+	type nodeView struct {
+		NodeID       string `json:"node_id"`
+		Role         string `json:"role,omitempty"`
+		Address      string `json:"address"`
+		RaftAddress  string `json:"raft_address,omitempty"`
+		Status       string `json:"status"`
+		TotalWorkers int    `json:"total_workers"`
 	}
-	h.writeJSON(w, http.StatusOK, resp)
+	views := make([]nodeView, 0, len(nodes))
+	for _, node := range nodes {
+		views = append(views, nodeView{
+			NodeID: node.ID, Role: node.Role, Address: node.Address,
+			RaftAddress: node.RaftAddress, Status: node.Status, TotalWorkers: node.TotalWorkers,
+		})
+	}
+	h.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"leader_address": leader,
+		"nodes":          views,
+	})
 }
 
 func (h *Handler) getAllocations(w http.ResponseWriter, r *http.Request) {
@@ -314,6 +336,35 @@ func (h *Handler) joinCluster(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.joinFunc(req.NodeID, req.RaftAddress, req.HTTPAddress, req.TotalWorkers); err != nil {
 		h.writeError(w, http.StatusInternalServerError, "join failed: "+err.Error())
+		return
+	}
+	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+func (h *Handler) registerWorker(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		NodeID       string `json:"node_id"`
+		SessionID    string `json:"session_id"`
+		HTTPAddress  string `json:"http_address"`
+		TotalWorkers int    `json:"total_workers"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.NodeID == "" || req.SessionID == "" || req.TotalWorkers < 1 {
+		h.writeError(w, http.StatusBadRequest, "node_id, session_id and positive total_workers required")
+		return
+	}
+	if h.workerRegisterFunc == nil {
+		h.writeError(w, http.StatusInternalServerError, "worker registration not configured")
+		return
+	}
+	if err := h.workerRegisterFunc(types.NodeInfo{
+		ID: req.NodeID, Role: types.NodeRoleWorker, SessionID: req.SessionID,
+		Address: req.HTTPAddress, Status: types.NodeStatusUp, TotalWorkers: req.TotalWorkers,
+	}); err != nil {
+		h.writeError(w, http.StatusServiceUnavailable, "worker registration failed: "+err.Error())
 		return
 	}
 	h.writeJSON(w, http.StatusOK, map[string]bool{"success": true})

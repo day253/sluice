@@ -261,6 +261,135 @@ func TestFindPendingTasksUsesCreatedAtFIFO(t *testing.T) {
 	}
 }
 
+func TestPendingIndexSelectsWithoutRescanningBacklog(t *testing.T) {
+	fsm := newTestFSM(t)
+	tasks := make([]CreateTaskData, 20_000)
+	for i := range tasks {
+		tasks[i] = CreateTaskData{
+			TaskID: fmt.Sprintf("task-%05d", i), TenantID: "tenant-a", Payload: `{}`,
+		}
+	}
+	applyCmd(t, fsm, OpCreateTaskBatch, CreateTaskBatchData{Tasks: tasks})
+	slots := make([]PendingSlot, 128)
+	for i := range slots {
+		slots[i] = PendingSlot{NodeID: "worker-1", TenantID: "tenant-a"}
+	}
+
+	first, inspected := fsm.SelectPendingForSlots(slots, time.Now().UTC())
+	if inspected != len(slots) {
+		t.Fatalf("first indexed selection inspected %d records, want %d", inspected, len(slots))
+	}
+	claims := make([]ClaimTaskData, 0, len(first))
+	for i, task := range first {
+		if task == nil || task.TaskID != fmt.Sprintf("task-%05d", i) {
+			t.Fatalf("first selection[%d] = %+v", i, task)
+		}
+		claims = append(claims, ClaimTaskData{
+			TaskID: task.TaskID, TenantID: task.TenantID, NodeID: "worker-1", Payload: task.Payload,
+		})
+	}
+	applyCmd(t, fsm, OpClaimBatch, ClaimBatchData{Tasks: claims})
+
+	second, inspected := fsm.SelectPendingForSlots(slots, time.Now().UTC())
+	if inspected != len(slots) {
+		t.Fatalf("second indexed selection inspected %d records, want %d", inspected, len(slots))
+	}
+	for i, task := range second {
+		want := fmt.Sprintf("task-%05d", i+len(slots))
+		if task == nil || task.TaskID != want {
+			t.Fatalf("second selection[%d] = %+v, want %s", i, task, want)
+		}
+	}
+}
+
+func TestWorkerOfflineRemovesCapacityWithoutRequeueingInflight(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpNodeUp, types.NodeInfo{
+		ID: "worker-1", Role: types.NodeRoleWorker, SessionID: "session-1",
+		TotalWorkers: 10,
+	})
+	applyCmd(t, fsm, OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"worker-1": {NodeID: "worker-1", Tenants: map[string]int{"tenant-a": 10}},
+	})
+	applyCmd(t, fsm, OpCreateTask, CreateTaskData{TaskID: "task-1", TenantID: "tenant-a"})
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "task-1", TenantID: "tenant-a", NodeID: "worker-1",
+	})
+	applyCmd(t, fsm, OpWorkerOffline, WorkerOfflineData{ID: "worker-1", SessionID: "session-1"})
+
+	node := fsm.GetAllNodes()["worker-1"]
+	if node == nil || node.Status != types.NodeStatusDown {
+		t.Fatalf("offline worker state = %+v", node)
+	}
+	if _, ok := fsm.GetAllocation("worker-1"); ok {
+		t.Fatal("offline worker allocation was retained")
+	}
+	if task := fsm.GetTask("task-1"); task == nil || task.Status != types.TaskStatusInflight {
+		t.Fatalf("offline worker task = %+v, want inflight until normal lease", task)
+	}
+
+	applyCmd(t, fsm, OpNodeUp, types.NodeInfo{
+		ID: "worker-1", Role: types.NodeRoleWorker, SessionID: "session-2", TotalWorkers: 10,
+	})
+	applyCmd(t, fsm, OpWorkerOffline, WorkerOfflineData{ID: "worker-1", SessionID: "session-1"})
+	if node := fsm.GetAllNodes()["worker-1"]; node.Status != types.NodeStatusUp || node.SessionID != "session-2" {
+		t.Fatalf("stale session took replacement offline: %+v", node)
+	}
+}
+
+func TestRetireNodeDeletesLegacyIdentityWithoutRequeueingInflight(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpNodeUp, types.NodeInfo{ID: "legacy-49", TotalWorkers: 100})
+	applyCmd(t, fsm, OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"legacy-49": {NodeID: "legacy-49", Tenants: map[string]int{"tenant-a": 100}},
+	})
+	applyCmd(t, fsm, OpCreateTask, CreateTaskData{TaskID: "task-1", TenantID: "tenant-a"})
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "task-1", TenantID: "tenant-a", NodeID: "legacy-49",
+	})
+
+	applyCmd(t, fsm, OpRetireNode, RetireNodeData{ID: "legacy-49"})
+
+	if node := fsm.GetAllNodes()["legacy-49"]; node != nil {
+		t.Fatalf("retired node remains visible: %+v", node)
+	}
+	if _, ok := fsm.GetAllocation("legacy-49"); ok {
+		t.Fatal("retired node allocation was retained")
+	}
+	if task := fsm.GetTask("task-1"); task == nil || task.Status != types.TaskStatusInflight || task.NodeID != "legacy-49" {
+		t.Fatalf("retired node task = %+v, want original owner until lease expiry", task)
+	}
+}
+
+func TestSetControlNodesRemovesLegacyCapacityWithoutChangingLivenessOrInflight(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpNodeUp, types.NodeInfo{
+		ID: "control-1", SessionID: "legacy", Address: "control:9090",
+		RaftAddress: "control:7000", TotalWorkers: 100,
+	})
+	applyCmd(t, fsm, OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"control-1": {NodeID: "control-1", Tenants: map[string]int{"tenant-a": 100}},
+	})
+	applyCmd(t, fsm, OpCreateTask, CreateTaskData{TaskID: "task-1", TenantID: "tenant-a"})
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "task-1", TenantID: "tenant-a", NodeID: "control-1",
+	})
+
+	applyCmd(t, fsm, OpSetControlNodes, SetControlNodesData{NodeIDs: []string{"control-1", "missing"}})
+
+	node := fsm.GetAllNodes()["control-1"]
+	if node.Role != types.NodeRoleControl || node.TotalWorkers != 0 || node.SessionID != "" ||
+		node.Status != types.NodeStatusUp || node.Address != "control:9090" || node.RaftAddress != "control:7000" {
+		t.Fatalf("migrated control mirror = %+v", node)
+	}
+	if _, ok := fsm.GetAllocation("control-1"); ok {
+		t.Fatal("legacy control allocation was retained")
+	}
+	if task := fsm.GetTask("task-1"); task == nil || task.Status != types.TaskStatusInflight || task.NodeID != "control-1" {
+		t.Fatalf("control migration changed task state: %+v", task)
+	}
+}
+
 func TestFindStealablePendingTasksFiltersTenantAndAge(t *testing.T) {
 	fsm := newTestFSM(t)
 	applyCmd(t, fsm, OpCreateTaskBatch, CreateTaskBatchData{Tasks: []CreateTaskData{

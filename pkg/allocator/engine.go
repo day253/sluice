@@ -619,14 +619,15 @@ func (e *Engine) activeNodes(nodes map[string]*types.NodeInfo) []*types.NodeInfo
 	return active
 }
 
-// executionNodes returns active followers in stable order. The current Raft
-// leader owns scheduling and Raft commits, so its worker capacity is
-// deliberately excluded from the data plane.
+// executionNodes returns active execution capacity in stable order. Explicit
+// control nodes never run Processor work; legacy combined followers remain
+// eligible during a rolling upgrade when they still advertise workers.
 func (e *Engine) executionNodes(nodes map[string]*types.NodeInfo) []*types.NodeInfo {
 	active := e.activeNodes(nodes)
 	execution := make([]*types.NodeInfo, 0, len(active))
 	for _, node := range active {
-		if node.ID != e.nodeID {
+		if node.ID != e.nodeID && node.Role != types.NodeRoleControl &&
+			(node.Role == "" || node.TotalWorkers > 0) {
 			execution = append(execution, node)
 		}
 	}

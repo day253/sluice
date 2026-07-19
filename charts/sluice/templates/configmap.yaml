@@ -46,8 +46,9 @@ data:
       echo "==> Bootstrapping as ${POD_NAME} on ${RAFT}"
       exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
         --raft-advertise="${RAFT_ADVERTISE}" \
-        --data="${DATA}" --bootstrap --workers={{ .Values.workersPerNode }} \
+        --role=control --data="${DATA}" --bootstrap --workers=0 \
         --raft-voters={{ .Values.raftVoters }} \
+        --raft-members={{ .Values.control.replicas }} \
         --log-level={{ .Values.logLevel }}
     else
       # Existing members must start immediately after a full-cluster restart.
@@ -56,8 +57,9 @@ data:
         echo "==> Restarting existing Raft member ${POD_NAME}"
         exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
           --raft-advertise="${RAFT_ADVERTISE}" \
-          --data="${DATA}" --workers={{ .Values.workersPerNode }} \
+          --role=control --data="${DATA}" --workers=0 \
           --raft-voters={{ .Values.raftVoters }} \
+          --raft-members={{ .Values.control.replicas }} \
           --log-level={{ .Values.logLevel }}
       fi
 
@@ -69,7 +71,7 @@ data:
       done
 
       JOIN_PAYLOAD=$(printf '{"node_id":"%s","raft_address":"%s","http_address":"%s","total_workers":%s}' \
-        "${POD_NAME}" "${RAFT_ADVERTISE}" "${API}" "{{ .Values.workersPerNode }}")
+        "${POD_NAME}" "${RAFT_ADVERTISE}" "${API}" "0")
       echo "==> Joining the current Raft leader (discovered via sluice-0)"
       for i in $(seq 1 30); do
         LEADER_IP=$(resolve_leader_ip "${BOOTSTRAP_IP}" || true)
@@ -87,7 +89,39 @@ data:
       # reject the duplicate while the member is already being replicated.
       exec sluice --id="${POD_NAME}" --api="${API}" --raft="${RAFT}" \
         --raft-advertise="${RAFT_ADVERTISE}" \
-        --data="${DATA}" --workers={{ .Values.workersPerNode }} \
+        --role=control --data="${DATA}" --workers=0 \
         --raft-voters={{ .Values.raftVoters }} \
+        --raft-members={{ .Values.control.replicas }} \
         --log-level={{ .Values.logLevel }}
     fi
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sluice.fullname" . }}-worker-entrypoint
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+data:
+  entrypoint.sh: |
+    #!/bin/sh
+    set -e
+    NAMESPACE="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+    TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+    SVC="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+    resolve_service_ip() {
+      wget -qO- --header="Authorization: Bearer ${TOKEN}" --no-check-certificate \
+        "${SVC}/api/v1/namespaces/${NAMESPACE}/services/$1" 2>/dev/null \
+        | sed -n 's/.*"clusterIP"\s*:\s*"\([0-9.]*\)".*/\1/p'
+    }
+    CONTROLLER_IP=$(resolve_service_ip "{{ include "sluice.fullname" . }}")
+    while [ -z "${CONTROLLER_IP}" ]; do
+      echo "   waiting for stable controller service IP..."
+      sleep 2
+      CONTROLLER_IP=$(resolve_service_ip "{{ include "sluice.fullname" . }}")
+    done
+    exec sluice --role=worker --id="${POD_NAME}" \
+      --api="0.0.0.0:{{ .Values.apiPort }}" \
+      --controller="${CONTROLLER_IP}:{{ .Values.apiPort }}" \
+      --workers={{ .Values.workersPerNode }} \
+      --log-level={{ .Values.logLevel }}

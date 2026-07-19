@@ -3,6 +3,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -21,6 +23,7 @@ import (
 	"github.com/day253/sluice/pkg/allocator"
 	"github.com/day253/sluice/pkg/api"
 	grpcpkg "github.com/day253/sluice/pkg/grpc"
+	grpcv1 "github.com/day253/sluice/pkg/grpc/v1"
 	"github.com/day253/sluice/pkg/metrics"
 	"github.com/day253/sluice/pkg/queue"
 	raftpkg "github.com/day253/sluice/pkg/raft"
@@ -34,6 +37,7 @@ import (
 // ---------------------------------------------------------------------------
 
 type Config struct {
+	Role            string // empty = legacy combined node; "control" = Raft/controller only
 	NodeID          string
 	APIAddress      string // cmux: HTTP+gRPC on single port (e.g. :9090)
 	RaftAddress     string // stable address advertised to peers
@@ -43,6 +47,7 @@ type Config struct {
 	JoinAddress     string
 	TotalWorkers    int
 	MaxRaftVoters   int // odd voter cap; remaining members replicate as non-voters
+	MaxRaftMembers  int // zero keeps legacy membership; production control plane sets a fixed bound
 	// DisableVoterReconciliation is reserved for externally managed embedded
 	// clusters and protocol tests. Production leaves it false.
 	DisableVoterReconciliation bool
@@ -66,6 +71,7 @@ type Node struct {
 	claimClient *grpcpkg.ClaimClient
 	collector   *metrics.Collector
 	performance *metrics.Performance
+	internalSvc *grpcpkg.InternalService
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -141,7 +147,11 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	n.claimClient = grpcpkg.NewClaimClient(cfg.NodeID, logger)
 	n.pool.SetClaimer(n.claimClient)
 	n.pool.SetCompleter(n.claimClient)
-	n.pool.SetWorkerGuard(func() bool { return !cluster.IsLeader() })
+	if cfg.Role == types.NodeRoleControl {
+		n.pool.SetWorkerGuard(func() bool { return false })
+	} else {
+		n.pool.SetWorkerGuard(func() bool { return !cluster.IsLeader() })
+	}
 
 	// ---- Allocator engine ----
 	n.allocEngine = allocator.NewEngine(cfg.NodeID, cluster.FSM(), bridge, logger)
@@ -153,6 +163,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(), bridge, n.pool, logger)
 	internalSvc := grpcpkg.NewInternalService(cfg.NodeID, cluster.FSM(), bridge, logger)
 	internalSvc.SetPerformanceObserver(n.performance)
+	n.internalSvc = internalSvc
 
 	// ---- Metrics collector (server-side history) ----
 	n.collector = metrics.NewCollector(cluster.FSM(), logger)
@@ -168,12 +179,17 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 			return err
 		}
 		// Also register in FSM (AddVoter only updates Raft config).
+		role := ""
+		if workers == 0 {
+			role = types.NodeRoleControl
+		}
 		cmd := raftpkg.MustMarshalCommand(raftpkg.OpNodeUp, types.NodeInfo{
 			ID: nodeID, Address: httpAddr, RaftAddress: raftAddr,
-			Status: types.NodeStatusUp, TotalWorkers: workers,
+			Role: role, Status: types.NodeStatusUp, TotalWorkers: workers,
 		})
 		return cluster.GetRaft().Apply(cmd, 5*time.Second).Error()
 	})
+	httpHandler.SetWorkerRegisterFunc(n.registerWorker)
 
 	// ---- API server (cmux or legacy HTTP) ----
 	if cfg.APIAddress != "" {
@@ -206,8 +222,8 @@ func (n *Node) Start() error {
 		return fmt.Errorf("timed out waiting for raft leader")
 	}
 
-	if err := n.raftCluster.RegisterNode(
-		n.cfg.APIAddress, n.cfg.TotalWorkers,
+	if err := n.raftCluster.RegisterNodeWithRole(
+		n.cfg.APIAddress, n.cfg.TotalWorkers, n.cfg.Role,
 	); err != nil {
 		n.logger.Warn("register node (non-fatal)", zap.Error(err))
 	}
@@ -336,6 +352,7 @@ func (n *Node) watchLeadership() {
 	if n.raftCluster.IsLeader() {
 		n.pool.Reconcile(map[string]int{})
 		n.allocEngine.SetLeader(true)
+		n.internalSvc.SetLeader(true)
 		_ = n.allocEngine.ReconcileNow()
 		n.reconcileVotersAsync()
 	}
@@ -357,6 +374,7 @@ func (n *Node) watchLeadership() {
 				return
 			}
 			n.allocEngine.SetLeader(isLeader)
+			n.internalSvc.SetLeader(isLeader)
 			if isLeader {
 				n.voterReconcileDone.Store(false)
 				// Stop the data plane before publishing the follower-only plan.
@@ -372,23 +390,75 @@ func (n *Node) watchLeadership() {
 }
 
 func (n *Node) reconcileVotersAsync() {
-	if n.cfg.DisableVoterReconciliation || n.voterReconcileDone.Load() || !n.raftCluster.IsLeader() ||
+	if n.voterReconcileDone.Load() || !n.raftCluster.IsLeader() ||
 		!n.voterReconcileRunning.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
 		defer n.voterReconcileRunning.Store(false)
-		result, err := n.raftCluster.ReconcileVoters(n.cfg.MaxRaftVoters)
-		if err != nil {
-			if err != hashicorpraft.ErrNotLeader {
-				n.logger.Warn("raft voter reconciliation failed", zap.Error(err))
+		var result raftpkg.VoterReconcileResult
+		if !n.cfg.DisableVoterReconciliation {
+			var err error
+			result, err = n.raftCluster.ReconcileVoters(n.cfg.MaxRaftVoters)
+			if err != nil {
+				if err != hashicorpraft.ErrNotLeader {
+					n.logger.Warn("raft voter reconciliation failed", zap.Error(err))
+				}
+				return
 			}
-			return
+			if result.LeadershipTransferred {
+				n.logger.Info("raft leadership transferred into bounded voter set",
+					zap.String("leader", result.Status.LeaderID))
+				return
+			}
 		}
-		if result.LeadershipTransferred {
-			n.logger.Info("raft leadership transferred into bounded voter set",
-				zap.String("leader", result.Status.LeaderID))
-			return
+		if !n.cfg.DisableVoterReconciliation && n.cfg.MaxRaftMembers > 0 {
+			pruned, pruneErr := n.raftCluster.PruneMembers(n.cfg.MaxRaftMembers)
+			if pruneErr != nil {
+				if pruneErr != hashicorpraft.ErrNotLeader {
+					n.logger.Warn("raft member pruning failed", zap.Error(pruneErr))
+				}
+				return
+			}
+			for _, nodeID := range pruned.Removed {
+				if n.raftCluster.FSM().GetAllNodes()[nodeID] == nil {
+					continue
+				}
+				future := n.raftCluster.GetRaft().Apply(raftpkg.MustMarshalCommand(
+					raftpkg.OpRetireNode,
+					raftpkg.RetireNodeData{ID: nodeID},
+				), 5*time.Second)
+				if err := future.Error(); err != nil {
+					n.logger.Warn("retired replica capacity cleanup failed",
+						zap.String("node", nodeID), zap.Error(err))
+					return
+				}
+			}
+			if pruned.Changed {
+				n.logger.Info("raft replication set pruned",
+					zap.Int("members", n.cfg.MaxRaftMembers), zap.Strings("removed", pruned.Removed))
+			}
+		}
+		if n.cfg.Role == types.NodeRoleControl {
+			status, statusErr := n.raftCluster.MembershipStatus()
+			if statusErr != nil {
+				n.logger.Warn("control mirror membership read failed", zap.Error(statusErr))
+				return
+			}
+			migrations := controlNodesNeedingMigration(status, n.raftCluster.FSM().GetAllNodes())
+			if len(migrations) > 0 {
+				future := n.raftCluster.GetRaft().Apply(raftpkg.MustMarshalCommand(
+					raftpkg.OpSetControlNodes,
+					raftpkg.SetControlNodesData{NodeIDs: migrations},
+				), 5*time.Second)
+				if err := future.Error(); err != nil {
+					n.logger.Warn("control mirror migration failed", zap.Error(err))
+					return
+				}
+				if err := n.allocEngine.ReconcileNow(); err != nil {
+					n.logger.Warn("allocation reconcile after control migration failed", zap.Error(err))
+				}
+			}
 		}
 		n.voterReconcileDone.Store(true)
 		if result.Changed {
@@ -397,6 +467,19 @@ func (n *Node) reconcileVotersAsync() {
 				zap.Int("nonvoters", len(result.Status.Nonvoters)))
 		}
 	}()
+}
+
+func controlNodesNeedingMigration(status raftpkg.MembershipStatus, nodes map[string]*types.NodeInfo) []string {
+	members := append(append([]string(nil), status.Voters...), status.Nonvoters...)
+	sort.Strings(members)
+	result := make([]string, 0, len(members))
+	for _, nodeID := range members {
+		node := nodes[nodeID]
+		if node != nil && (node.Role != types.NodeRoleControl || node.TotalWorkers != 0 || node.SessionID != "") {
+			result = append(result, nodeID)
+		}
+	}
+	return result
 }
 
 func (n *Node) watchAllocations() {
@@ -413,6 +496,21 @@ func (n *Node) watchAllocations() {
 				continue
 			}
 			lastVersion = state.Version
+			if n.raftCluster.IsLeader() {
+				for _, allocation := range state.Allocations {
+					plan := &grpcv1.AllocationPlan{NodeId: allocation.NodeID}
+					for tenantID, count := range allocation.Tenants {
+						plan.Tenants = append(plan.Tenants, &grpcv1.TenantWorkerCount{
+							TenantId: tenantID, Workers: int32(count),
+						})
+					}
+					n.internalSvc.PushAllocation(plan)
+				}
+			}
+			if n.cfg.Role == types.NodeRoleControl {
+				n.pool.Reconcile(map[string]int{})
+				continue
+			}
 			alloc, ok := n.raftCluster.FSM().GetAllocation(n.cfg.NodeID)
 			if !ok || n.raftCluster.IsLeader() {
 				n.pool.Reconcile(map[string]int{})
@@ -495,6 +593,65 @@ func resolveLeaderAPIAddress(leaderRaft string, nodes map[string]*types.NodeInfo
 		return "", fmt.Errorf("invalid local API address %q", localAPI)
 	}
 	return net.JoinHostPort(leaderHost, apiPort), nil
+}
+
+func (n *Node) registerWorker(info types.NodeInfo) error {
+	info.Role = types.NodeRoleWorker
+	info.Status = types.NodeStatusUp
+	info.RaftAddress = ""
+	if !n.raftCluster.IsLeader() {
+		leaderAPI, err := resolveLeaderAPIAddress(
+			n.raftCluster.LeaderAddr(), n.raftCluster.FSM().GetAllNodes(), n.cfg.APIAddress,
+		)
+		if err != nil {
+			return err
+		}
+		body, err := json.Marshal(map[string]interface{}{
+			"node_id": info.ID, "session_id": info.SessionID,
+			"http_address": info.Address, "total_workers": info.TotalWorkers,
+		})
+		if err != nil {
+			return err
+		}
+		request, err := http.NewRequest(http.MethodPost,
+			"http://"+leaderAPI+"/api/v1/cluster/workers/register", bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := (&http.Client{Timeout: 5 * time.Second}).Do(request)
+		if err != nil {
+			return fmt.Errorf("forward worker registration to %s: %w", leaderAPI, err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return fmt.Errorf("leader worker registration returned %s", response.Status)
+		}
+		return nil
+	}
+
+	existing := n.raftCluster.FSM().GetAllNodes()[info.ID]
+	if !workerRegistrationChanged(existing, &info) {
+		return nil
+	}
+	result := n.raftCluster.GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpNodeUp, info), 5*time.Second,
+	)
+	if err := result.Error(); err != nil {
+		return err
+	}
+	go func() {
+		if err := n.allocEngine.ReconcileNow(); err != nil {
+			n.logger.Warn("reconcile after worker registration failed", zap.Error(err))
+		}
+	}()
+	return nil
+}
+
+func workerRegistrationChanged(existing, next *types.NodeInfo) bool {
+	return existing == nil || next == nil || existing.Role != next.Role ||
+		existing.SessionID != next.SessionID || existing.Status != next.Status ||
+		existing.TotalWorkers != next.TotalWorkers || existing.Address != next.Address
 }
 
 // ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ build-operator:
 	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/sluice-operator $(OP_DIR)
 
 # ---- Test ----
-UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/...
+UNIT_PACKAGES := ./api/... ./charts/... ./cmd/... ./internal/... ./pkg/...
 
 unit-test:
 	go test -v -race -count=1 $(UNIT_PACKAGES)

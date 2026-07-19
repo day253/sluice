@@ -65,14 +65,15 @@ type Pool struct {
 	mu     sync.Mutex
 	groups map[string]*tenantGroup // tenantID → group
 
-	queue       queue.Queue
-	fsm         *raftpkg.FSM
-	raft        raftpkg.RaftApplier
-	claimer     Claimer     // nil = use raft.Apply directly
-	completer   Completer   // nil = use raft.Apply directly
-	workerGuard func() bool // nil = always run
-	processor   Processor
-	logger      *zap.Logger
+	queue            queue.Queue
+	fsm              *raftpkg.FSM
+	raft             raftpkg.RaftApplier
+	claimer          Claimer     // nil = use raft.Apply directly
+	completer        Completer   // nil = use raft.Apply directly
+	workerGuard      func() bool // nil = always run
+	legacyScheduling bool        // rolling compatibility for replicated combined nodes
+	processor        Processor
+	logger           *zap.Logger
 
 	activeMu sync.Mutex
 	active   map[string]struct{} // task IDs currently being claimed or processed locally
@@ -106,16 +107,17 @@ func NewPool(
 ) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Pool{
-		nodeID:    nodeID,
-		groups:    make(map[string]*tenantGroup),
-		active:    make(map[string]struct{}),
-		queue:     q,
-		fsm:       fsm,
-		raft:      raft,
-		processor: proc,
-		logger:    logger,
-		ctx:       ctx,
-		cancel:    cancel,
+		nodeID:           nodeID,
+		groups:           make(map[string]*tenantGroup),
+		active:           make(map[string]struct{}),
+		queue:            q,
+		fsm:              fsm,
+		raft:             raft,
+		processor:        proc,
+		legacyScheduling: true,
+		logger:           logger,
+		ctx:              ctx,
+		cancel:           cancel,
 	}
 }
 
@@ -129,6 +131,10 @@ func (p *Pool) SetCompleter(c Completer) { p.completer = c }
 // SetWorkerGuard gates worker processing. Nodes use it to ensure the Raft
 // leader remains control-plane only and never requests or executes work.
 func (p *Pool) SetWorkerGuard(fn func() bool) { p.workerGuard = fn }
+
+// DisableLegacyScheduling makes this a strictly stateless Worker pool. It
+// never reads a local Queue/FSM and waits for Leader-owned assignments.
+func (p *Pool) DisableLegacyScheduling() { p.legacyScheduling = false }
 
 // ---------------------------------------------------------------------------
 // Reconcile
@@ -215,6 +221,26 @@ func (p *Pool) Shutdown(timeout time.Duration) error {
 	}
 }
 
+// Drain retires every worker without canceling an already-started Processor.
+// It is used by stateless Worker shutdown so normal rollouts commit results
+// instead of leaving them for claim-lease recovery.
+func (p *Pool) Drain(timeout time.Duration) error {
+	p.Reconcile(map[string]int{})
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		p.cancel()
+		return nil
+	case <-time.After(timeout):
+		p.cancel()
+		return fmt.Errorf("worker pool drain timed out after %s", timeout)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
@@ -295,6 +321,8 @@ func (p *Pool) workerLoop(ctx context.Context, retire <-chan struct{}, tenantID 
 				}
 				task = assigned
 				leaderAssigned = task != nil
+			} else if !p.legacyScheduling {
+				legacyScheduling = false
 			}
 		}
 
@@ -397,6 +425,9 @@ func (p *Pool) workerLoop(ctx context.Context, retire <-chan struct{}, tenantID 
 
 // dequeueLocal tries to dequeue a task from the local queue.
 func (p *Pool) dequeueLocal(tenantID string) *types.TaskRecord {
+	if p.queue == nil {
+		return nil
+	}
 	env, err := p.queue.Dequeue(tenantID)
 	if err != nil {
 		p.logger.Error("dequeue error", zap.String("tenant", tenantID), zap.Error(err))
@@ -417,6 +448,9 @@ func (p *Pool) dequeueLocal(tenantID string) *types.TaskRecord {
 // order. A worker first gets a chance to consume its assigned tenant, then
 // reuses the same node's idle capacity for another tenant's local backlog.
 func (p *Pool) dequeueLocalOtherTenant(tenantID string) *types.TaskRecord {
+	if p.fsm == nil {
+		return nil
+	}
 	tenants := p.fsm.GetAllTenants()
 	ids := make([]string, 0, len(tenants))
 	for id := range tenants {

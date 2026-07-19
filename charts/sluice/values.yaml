@@ -1,9 +1,14 @@
-# Number of replicated API/FSM/worker processes. Consensus voters are bounded
-# separately so execution capacity can scale without extending the quorum.
-replicas: 50
+# Fixed replicated control plane. These Pods own Raft/FSM/API/controller state
+# and never execute business Processor work.
+control:
+  replicas: 5
 
-# Consensus quorum size. Remaining replicas still receive the FSM log and run
-# workers, but do not participate in elections or commit acknowledgement.
+# Stateless execution plane. These Pods have stable identities for allocation
+# and session fencing, but no PVC and no Raft membership.
+worker:
+  replicas: 50
+
+# Consensus quorum size within the fixed control plane.
 raftVoters: 5
 
 image:
@@ -22,7 +27,7 @@ workersPerNode: 100
 # Log level: debug, info, warn, error.
 logLevel: info
 
-# Persistent storage for Raft logs and task queues.
+# Persistent storage for control-plane Raft logs. Workers never mount it.
 persistence:
   enabled: true
   size: 1Gi

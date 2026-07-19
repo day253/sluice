@@ -331,6 +331,11 @@ func (s *Service) AllocationSnapshot() (map[string]*types.NodeAllocation, map[st
 	return s.fsm.GetAllAllocations(), s.fsm.GetAllTenants()
 }
 
+// NodeSnapshot exposes the replicated role-aware node mirror to the REST UI.
+func (s *Service) NodeSnapshot() (map[string]*types.NodeInfo, string) {
+	return s.fsm.GetAllNodes(), s.raft.LeaderAddr()
+}
+
 func (s *Service) Health(ctx context.Context, req *grpcv1.HealthRequest) (*grpcv1.HealthResponse, error) {
 	return &grpcv1.HealthResponse{
 		Status: "ok", NodeId: s.nodeID, Leader: s.raft.LeaderAddr(),

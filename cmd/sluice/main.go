@@ -23,16 +23,20 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	nodeID        = flag.String("id", "node-1", "Unique node identifier")
-	apiAddr       = flag.String("api", "127.0.0.1:9090", "API listen address (cmux: HTTP+gRPC single port)")
-	raftAddr      = flag.String("raft", "127.0.0.1:7000", "Raft transport address")
-	raftAdvertise = flag.String("raft-advertise", "", "Stable Raft address advertised to peers (defaults to --raft)")
-	dataDir       = flag.String("data", "./data", "Data directory")
-	bootstrap     = flag.Bool("bootstrap", false, "Bootstrap a new single-node cluster")
-	joinAddr      = flag.String("join", "", "Address of an existing node to join")
-	totalWorkers  = flag.Int("workers", 100, "Total worker capacity on this node")
-	maxRaftVoters = flag.Int("raft-voters", 5, "Maximum odd number of voting Raft members")
-	logLevel      = flag.String("log-level", "info", "Log level: debug, info, warn, error")
+	role           = flag.String("role", "combined", "Process role: combined, control, or worker")
+	nodeID         = flag.String("id", "node-1", "Unique node identifier")
+	apiAddr        = flag.String("api", "127.0.0.1:9090", "API listen address (cmux: HTTP+gRPC single port)")
+	raftAddr       = flag.String("raft", "127.0.0.1:7000", "Raft transport address")
+	raftAdvertise  = flag.String("raft-advertise", "", "Stable Raft address advertised to peers (defaults to --raft)")
+	dataDir        = flag.String("data", "./data", "Data directory")
+	bootstrap      = flag.Bool("bootstrap", false, "Bootstrap a new single-node cluster")
+	joinAddr       = flag.String("join", "", "Address of an existing node to join")
+	totalWorkers   = flag.Int("workers", 100, "Total worker capacity on this node")
+	maxRaftVoters  = flag.Int("raft-voters", 5, "Maximum odd number of voting Raft members")
+	maxRaftMembers = flag.Int("raft-members", 0, "Maximum replicated Raft members; 0 keeps legacy membership")
+	controllerAddr = flag.String("controller", "", "Stable control-plane API address used by stateless workers")
+	workerSession  = flag.String("session", "", "Worker process session ID; generated when empty")
+	logLevel       = flag.String("log-level", "info", "Log level: debug, info, warn, error")
 )
 
 // ---------------------------------------------------------------------------
@@ -47,6 +51,7 @@ func main() {
 
 	// Print startup banner.
 	logger.Info("distributed-rate-limiting starting",
+		zap.String("role", *role),
 		zap.String("id", *nodeID),
 		zap.String("api", *apiAddr),
 		zap.String("raft", *raftAddr),
@@ -54,12 +59,38 @@ func main() {
 		zap.Int("workers", *totalWorkers),
 	)
 
+	// ---- Use the demo processor (replace with your own) ----
+	processor := &DemoProcessor{logger: logger}
+
+	if *role == "worker" {
+		w, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+			NodeID: *nodeID, SessionID: *workerSession, APIAddress: *apiAddr,
+			ControllerAddress: *controllerAddr, TotalWorkers: *totalWorkers,
+		}, processor, logger)
+		if err != nil {
+			logger.Fatal("failed to create stateless worker", zap.Error(err))
+		}
+		if err := w.Start(); err != nil {
+			logger.Fatal("stateless worker exited with error", zap.Error(err))
+		}
+		logger.Info("goodbye")
+		return
+	}
+	if *role != "combined" && *role != "control" {
+		logger.Fatal("invalid role", zap.String("role", *role))
+	}
+
 	// ---- Build node config ----
 	advertisedRaftAddr := *raftAdvertise
 	if advertisedRaftAddr == "" {
 		advertisedRaftAddr = *raftAddr
 	}
+	controlRole := ""
+	if *role == "control" {
+		controlRole = "control"
+	}
 	cfg := node.Config{
+		Role:            controlRole,
 		NodeID:          *nodeID,
 		APIAddress:      *apiAddr,
 		RaftAddress:     advertisedRaftAddr,
@@ -69,10 +100,8 @@ func main() {
 		JoinAddress:     *joinAddr,
 		TotalWorkers:    *totalWorkers,
 		MaxRaftVoters:   *maxRaftVoters,
+		MaxRaftMembers:  *maxRaftMembers,
 	}
-
-	// ---- Use the demo processor (replace with your own) ----
-	processor := &DemoProcessor{logger: logger}
 
 	// ---- Create node ----
 	n, err := node.New(cfg, processor, logger)

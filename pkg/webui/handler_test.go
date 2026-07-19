@@ -82,6 +82,19 @@ func TestDashboardChartsExposeRawJSONLinks(t *testing.T) {
 	}
 }
 
+func TestWorkerChartExcludesControlOnlyNodes(t *testing.T) {
+	handler := Handler(http.NotFoundHandler())
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if fragment := `executionNodes=S.nodes.filter(node=>Number(node.total_workers||0)>0)`;
+		!strings.Contains(recorder.Body.String(), fragment) {
+		t.Fatalf("dashboard is missing execution-role chart filter %q", fragment)
+	}
+}
+
 func TestPerformanceJSONRouteStillDelegatesToAPI(t *testing.T) {
 	const diagnostics = `{"node_id":"leader-1","current":{"raft":{}},"history":{}}`
 	apiCalled := false

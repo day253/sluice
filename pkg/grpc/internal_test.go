@@ -526,7 +526,7 @@ func TestAssignmentStreamBatchesDistinctLeaderCommittedTasks(t *testing.T) {
 	}
 }
 
-func TestDispatchAssignmentsObservesPendingScanBeforeRaftApply(t *testing.T) {
+func TestDispatchAssignmentsReadsOnlyIndexedCandidatesBeforeRaftApply(t *testing.T) {
 	fsm := raftpkg.NewFSM(zap.NewNop())
 	raft := &internalTestRaft{fsm: fsm}
 	raft.leader.Store(true)
@@ -562,11 +562,78 @@ func TestDispatchAssignmentsObservesPendingScanBeforeRaftApply(t *testing.T) {
 		t.Fatalf("assignment outcome = %+v", outcome)
 	}
 	selections, scanned, selected := observer.snapshot()
-	if selections != 1 || scanned != 2 || selected != 1 {
+	if selections != 1 || scanned != 1 || selected != 1 {
 		t.Fatalf("performance observation = calls:%d scanned:%d selected:%d", selections, scanned, selected)
 	}
 	if got := raft.applyCount.Load(); got != 1 {
 		t.Fatalf("Raft applies = %d, want one ClaimBatch", got)
+	}
+}
+
+func TestWorkerSessionReconnectCancelsOfflineAndDisconnectPreservesInflightLease(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raftpkg.OpNodeUp, types.NodeInfo{
+		ID: "worker-1", Role: types.NodeRoleWorker, SessionID: "session-1",
+		Status: types.NodeStatusUp, TotalWorkers: 2,
+	})
+	applyInternalTestCommand(fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"worker-1": {NodeID: "worker-1", Tenants: map[string]int{"tenant-a": 2}},
+	})
+	applyInternalTestCommand(fsm, raftpkg.OpCreateTask,
+		raftpkg.CreateTaskData{TaskID: "task-1", TenantID: "tenant-a"})
+	applyInternalTestCommand(fsm, raftpkg.OpClaimTask, raftpkg.ClaimTaskData{
+		TaskID: "task-1", TenantID: "tenant-a", NodeID: "worker-1",
+	})
+	raft := &internalTestRaft{fsm: fsm}
+	raft.leader.Store(true)
+	service := NewInternalService("leader", fsm, raft, zap.NewNop())
+	service.SetWorkerSessionGrace(20 * time.Millisecond)
+
+	firstGeneration := service.openWorkerSession("worker-1", "session-1")
+	service.closeWorkerSession("worker-1", firstGeneration)
+	secondGeneration := service.openWorkerSession("worker-1", "session-1")
+	time.Sleep(50 * time.Millisecond)
+	if got := raft.applyCount.Load(); got != 0 {
+		t.Fatalf("reconnect before grace wrote %d Raft entries, want 0", got)
+	}
+	if node := fsm.GetAllNodes()["worker-1"]; node.Status != types.NodeStatusUp {
+		t.Fatalf("reconnected worker = %+v, want up", node)
+	}
+
+	service.closeWorkerSession("worker-1", secondGeneration)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && fsm.GetAllNodes()["worker-1"].Status != types.NodeStatusDown {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if node := fsm.GetAllNodes()["worker-1"]; node.Status != types.NodeStatusDown {
+		t.Fatalf("disconnected worker = %+v, want down", node)
+	}
+	if got := raft.applyCount.Load(); got != 1 {
+		t.Fatalf("offline transition wrote %d Raft entries, want 1", got)
+	}
+	if task := fsm.GetTask("task-1"); task == nil || task.Status != types.TaskStatusInflight {
+		t.Fatalf("disconnect requeued in-flight task immediately: %+v", task)
+	}
+}
+
+func TestOldAllocationStreamCannotUnregisterReplacementSession(t *testing.T) {
+	service := NewInternalService("leader", raftpkg.NewFSM(zap.NewNop()),
+		&internalTestRaft{fsm: raftpkg.NewFSM(zap.NewNop())}, zap.NewNop())
+	oldSubscriber := make(chan *grpcv1.AllocationPlan, 1)
+	replacement := make(chan *grpcv1.AllocationPlan, 1)
+	service.subs["worker-1"] = oldSubscriber
+	service.subs["worker-1"] = replacement
+
+	service.removeAllocationSubscriber("worker-1", oldSubscriber)
+	service.PushAllocation(&grpcv1.AllocationPlan{NodeId: "worker-1"})
+
+	select {
+	case plan := <-replacement:
+		if plan.NodeId != "worker-1" {
+			t.Fatalf("replacement received %+v", plan)
+		}
+	default:
+		t.Fatal("old stream removed the replacement allocation subscription")
 	}
 }
 

@@ -8,6 +8,9 @@ const (
 	OpDeleteTenant     = "delete_tenant"
 	OpNodeUp           = "node_up"
 	OpNodeDown         = "node_down"
+	OpWorkerOffline    = "worker_offline"
+	OpRetireNode       = "retire_node"
+	OpSetControlNodes  = "set_control_nodes"
 	OpCreateTask       = "create_task"
 	OpCreateTaskBatch  = "create_task_batch"
 	OpClaimTask        = "claim_task"
@@ -105,6 +108,28 @@ type ClaimBatchResult struct {
 // NodeDownData is the payload for OpNodeDown.
 type NodeDownData struct {
 	ID string `json:"id"`
+}
+
+// WorkerOfflineData removes stateless worker capacity without immediately
+// re-queuing in-flight work. Existing claims retain the normal lease so a
+// transient controller disconnect cannot cause instant duplicate execution.
+type WorkerOfflineData struct {
+	ID        string `json:"id"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
+// RetireNodeData permanently removes a process identity which no longer
+// belongs to the configured topology. In-flight claims keep their normal
+// lease; retirement must not create a second owner while the old process may
+// still be finishing work.
+type RetireNodeData struct {
+	ID string `json:"id"`
+}
+
+// SetControlNodesData migrates retained Raft members out of the legacy
+// combined execution role without changing their liveness or addresses.
+type SetControlNodesData struct {
+	NodeIDs []string `json:"node_ids"`
 }
 
 // RaftApplier is an interface for applying commands to the Raft cluster.

@@ -117,6 +117,40 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestStatelessWorkerRegistrationHasDedicatedNonRaftBoundary(t *testing.T) {
+	h, _, _ := setupHandler(t)
+	var registered types.NodeInfo
+	calls := 0
+	h.SetWorkerRegisterFunc(func(info types.NodeInfo) error {
+		calls++
+		registered = info
+		return nil
+	})
+	router := newRouter(h)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cluster/workers/register", bytes.NewReader(mustMarshal(map[string]interface{}{
+		"node_id": "worker-1", "session_id": "session-1",
+		"http_address": "127.0.0.1:9001", "total_workers": 100,
+	})))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("worker registration status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if calls != 1 || registered.ID != "worker-1" || registered.Role != types.NodeRoleWorker ||
+		registered.SessionID != "session-1" || registered.TotalWorkers != 100 || registered.RaftAddress != "" {
+		t.Fatalf("worker registration = calls:%d info:%+v", calls, registered)
+	}
+
+	bad := httptest.NewRequest(http.MethodPost, "/api/v1/cluster/workers/register",
+		bytes.NewReader([]byte(`{"node_id":"worker-2","total_workers":0}`)))
+	badRec := httptest.NewRecorder()
+	router.ServeHTTP(badRec, bad)
+	if badRec.Code != http.StatusBadRequest || calls != 1 {
+		t.Fatalf("invalid registration status=%d calls=%d", badRec.Code, calls)
+	}
+}
+
 func TestRaftStatusEndpointReportsBoundedMembership(t *testing.T) {
 	h, _, _ := setupHandler(t)
 	h.SetRaftStatusFunc(func() (raftpkg.MembershipStatus, error) {

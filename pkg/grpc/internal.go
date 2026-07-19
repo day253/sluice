@@ -50,6 +50,20 @@ type InternalService struct {
 	// allocation subscribers
 	subMu sync.RWMutex
 	subs  map[string]chan<- *grpcv1.AllocationPlan // nodeID → push channel
+
+	// Stateless worker sessions are leader-local connection state. Opening or
+	// replacing a session does not write Raft; only a transition to offline
+	// after the grace window changes the replicated capacity mirror.
+	sessionMu      sync.Mutex
+	workerSessions map[string]*workerSession
+	sessionGrace   time.Duration
+}
+
+type workerSession struct {
+	generation uint64
+	sessionID  string
+	connected  bool
+	timer      *time.Timer
 }
 
 // PerformanceObserver receives read-only, process-local scheduling timings.
@@ -101,11 +115,108 @@ func NewInternalService(
 		completionWindow: claimBatchWindow,
 		completionMax:    claimBatchMaxSize,
 		subs:             make(map[string]chan<- *grpcv1.AllocationPlan),
+		workerSessions:   make(map[string]*workerSession),
+		sessionGrace:     5 * time.Second,
 	}
 }
 
 func (s *InternalService) SetPerformanceObserver(observer PerformanceObserver) {
 	s.performance = observer
+}
+
+// SetWorkerSessionGrace overrides the disconnect grace in deterministic
+// tests. Production keeps five seconds to absorb stream reconnects.
+func (s *InternalService) SetWorkerSessionGrace(grace time.Duration) {
+	s.sessionMu.Lock()
+	s.sessionGrace = grace
+	s.sessionMu.Unlock()
+}
+
+// SetLeader arms recovery for stateless workers when this control node becomes
+// leader. Workers that reconnect before the grace expires keep their capacity.
+func (s *InternalService) SetLeader(leader bool) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	if !leader {
+		for _, session := range s.workerSessions {
+			if session.timer != nil {
+				session.timer.Stop()
+				session.timer = nil
+			}
+		}
+		return
+	}
+	for _, node := range s.fsm.GetAllNodes() {
+		if node.Role != types.NodeRoleWorker || node.Status != types.NodeStatusUp {
+			continue
+		}
+		s.armWorkerOfflineLocked(node.ID, node.SessionID, false)
+	}
+}
+
+func (s *InternalService) openWorkerSession(nodeID, sessionID string) uint64 {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	session := s.workerSessions[nodeID]
+	if session == nil {
+		session = &workerSession{}
+		s.workerSessions[nodeID] = session
+	}
+	session.generation++
+	if session.timer != nil {
+		session.timer.Stop()
+		session.timer = nil
+	}
+	session.sessionID = sessionID
+	session.connected = true
+	return session.generation
+}
+
+func (s *InternalService) closeWorkerSession(nodeID string, generation uint64) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	session := s.workerSessions[nodeID]
+	if session == nil || session.generation != generation {
+		return
+	}
+	session.connected = false
+	s.armWorkerOfflineLocked(nodeID, session.sessionID, true)
+}
+
+func (s *InternalService) armWorkerOfflineLocked(nodeID, sessionID string, increment bool) {
+	session := s.workerSessions[nodeID]
+	if session == nil {
+		session = &workerSession{}
+		s.workerSessions[nodeID] = session
+	}
+	if increment {
+		session.generation++
+	}
+	generation := session.generation
+	session.sessionID = sessionID
+	session.connected = false
+	if session.timer != nil {
+		session.timer.Stop()
+	}
+	grace := s.sessionGrace
+	session.timer = time.AfterFunc(grace, func() {
+		s.sessionMu.Lock()
+		current := s.workerSessions[nodeID]
+		eligible := current != nil && current.generation == generation && !current.connected
+		if eligible {
+			current.timer = nil
+		}
+		s.sessionMu.Unlock()
+		if !eligible || !s.raft.IsLeader() {
+			return
+		}
+		result := s.raft.Apply(raftpkg.MustMarshalCommand(raftpkg.OpWorkerOffline,
+			raftpkg.WorkerOfflineData{ID: nodeID, SessionID: sessionID}), 5000)
+		if err := result.Error(); err != nil {
+			s.logger.Warn("stateless worker offline apply failed",
+				zap.String("node", nodeID), zap.Error(err))
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -450,9 +561,9 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 	s.claimMu.Lock()
 	selectionStarted := time.Now()
 	allocations := s.fsm.GetAllAllocations()
-	pending := s.fsm.FindAllPendingTasks()
-	selector := newPendingSelector(pending, time.Now().UTC(), nil)
 	selected := make([]selectedAssignment, 0, len(batch))
+	eligibleIndexes := make([]int, 0, len(batch))
+	slots := make([]raftpkg.PendingSlot, 0, len(batch))
 	for i, job := range batch {
 		request := job.request
 		if job.ctx.Err() != nil || request == nil || request.RequestId == "" ||
@@ -463,14 +574,22 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 		if !ok || allocation.Tenants[request.PreferredTenantId] <= 0 {
 			continue
 		}
-		task := selector.selectForSlot(request.NodeId, request.PreferredTenantId)
+		eligibleIndexes = append(eligibleIndexes, i)
+		slots = append(slots, raftpkg.PendingSlot{
+			NodeID: request.NodeId, TenantID: request.PreferredTenantId,
+		})
+	}
+	tasks, inspected := s.fsm.SelectPendingForSlots(slots, time.Now().UTC())
+	for slotIndex, task := range tasks {
 		if task == nil {
 			continue
 		}
+		i := eligibleIndexes[slotIndex]
+		request := batch[i].request
 		selected = append(selected, selectedAssignment{index: i, request: request, task: task})
 	}
 	if s.performance != nil {
-		s.performance.ObservePendingSelection(len(pending), len(selected), time.Since(selectionStarted))
+		s.performance.ObservePendingSelection(inspected, len(selected), time.Since(selectionStarted))
 	}
 
 	claimed := make(map[string]struct{}, len(selected))
@@ -873,6 +992,16 @@ func (s *InternalService) AllocationPush(
 	req *grpcv1.AllocationSubscribe,
 	stream grpcv1.SluiceInternal_AllocationPushServer,
 ) error {
+	if !s.raft.IsLeader() {
+		return status.Error(codes.FailedPrecondition, "allocation stream is only available on the leader")
+	}
+	node := s.fsm.GetAllNodes()[req.NodeId]
+	if node == nil || node.Role != types.NodeRoleWorker || node.Status != types.NodeStatusUp {
+		return status.Error(codes.FailedPrecondition, "worker must register before allocation subscribe")
+	}
+	generation := s.openWorkerSession(req.NodeId, node.SessionID)
+	defer s.closeWorkerSession(req.NodeId, generation)
+
 	ch := make(chan *grpcv1.AllocationPlan, 8)
 
 	s.subMu.Lock()
@@ -880,9 +1009,7 @@ func (s *InternalService) AllocationPush(
 	s.subMu.Unlock()
 
 	defer func() {
-		s.subMu.Lock()
-		delete(s.subs, req.NodeId)
-		s.subMu.Unlock()
+		s.removeAllocationSubscriber(req.NodeId, ch)
 		close(ch)
 	}()
 
@@ -897,10 +1024,16 @@ func (s *InternalService) AllocationPush(
 		_ = stream.Send(plan)
 	}
 
+	leaderTicker := time.NewTicker(time.Second)
+	defer leaderTicker.Stop()
 	for {
 		select {
 		case <-stream.Context().Done():
 			return stream.Context().Err()
+		case <-leaderTicker.C:
+			if !s.raft.IsLeader() {
+				return status.Error(codes.FailedPrecondition, "leadership changed")
+			}
 		case plan, ok := <-ch:
 			if !ok {
 				return nil
@@ -909,6 +1042,16 @@ func (s *InternalService) AllocationPush(
 				return err
 			}
 		}
+	}
+}
+
+func (s *InternalService) removeAllocationSubscriber(nodeID string, subscriber chan<- *grpcv1.AllocationPlan) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	// A replacement process may subscribe before the old stream notices its
+	// disconnect. The old stream must not unregister the new one.
+	if current, ok := s.subs[nodeID]; ok && current == subscriber {
+		delete(s.subs, nodeID)
 	}
 }
 

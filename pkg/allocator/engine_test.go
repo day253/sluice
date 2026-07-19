@@ -396,6 +396,24 @@ func TestExecutionNodes_ExcludesLeaderAndPreservesStableOrder(t *testing.T) {
 	}
 }
 
+func TestExecutionNodesExcludeEveryExplicitControlReplica(t *testing.T) {
+	e := newTestEngine(nil)
+	e.nodeID = "control-0"
+	execution := e.executionNodes(map[string]*types.NodeInfo{
+		"control-0": {ID: "control-0", Role: types.NodeRoleControl, Status: types.NodeStatusUp},
+		"control-1": {ID: "control-1", Role: types.NodeRoleControl, Status: types.NodeStatusUp},
+		"worker-0": {
+			ID: "worker-0", Role: types.NodeRoleWorker, Status: types.NodeStatusUp, TotalWorkers: 100,
+		},
+		"worker-zero": {
+			ID: "worker-zero", Role: types.NodeRoleWorker, Status: types.NodeStatusUp, TotalWorkers: 0,
+		},
+	})
+	if len(execution) != 1 || execution[0].ID != "worker-0" {
+		t.Fatalf("execution nodes = %+v, want only worker-0", execution)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Integration: full reconcile pipeline
 // ---------------------------------------------------------------------------

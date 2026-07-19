@@ -8,8 +8,8 @@ DEPLOY_DIR="${DEPLOY_DIR:-/home/tiger/Documents/distributed-rate-limiting}"
 RELEASE="${RELEASE:-sluice}"
 NAMESPACE="${NAMESPACE:-default}"
 REGISTRY="${REGISTRY:-localhost:32000}"
-# A 50-replica StatefulSet rolls in ordinal order and routinely needs more
-# than five minutes even when every Pod becomes Ready normally.
+# The five control replicas roll in order; 50 stateless Workers start in
+# parallel. Keep enough time for the one-time 50-member Raft migration.
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-15m}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,6 +39,7 @@ NAMESPACE="$5"
 ROLLOUT_TIMEOUT="$6"
 IMAGE="${REGISTRY}/sluice:${TAG}"
 STATEFULSET="${RELEASE}-sluice"
+WORKER_STATEFULSET="${RELEASE}-sluice-worker"
 
 cd "${DEPLOY_DIR}"
 
@@ -52,8 +53,35 @@ done
 printf '\n==> Running tests\n'
 go test ./...
 
+printf '\n==> Validating Helm role split\n'
+microk8s helm3 lint ./charts/sluice
+microk8s helm3 template "${RELEASE}" ./charts/sluice \
+  --namespace "${NAMESPACE}" \
+  --set control.replicas=5 \
+  --set worker.replicas=50 >/tmp/sluice-rendered.yaml
+
 printf '\n==> Building container on remote host\n'
-docker build -t "${IMAGE}" .
+if ! docker build -t "${IMAGE}" .; then
+  # Docker Hub is not required for subsequent deploys. Reuse the currently
+  # running Alpine image and replace only the statically compiled binary when
+  # base-image metadata lookup is temporarily unavailable.
+  BASE_IMAGE="$(microk8s kubectl get statefulset "${STATEFULSET}" \
+    --namespace "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[0].image}')"
+  if [ -z "${BASE_IMAGE}" ]; then
+    printf 'No deployed image is available for offline build fallback\n' >&2
+    exit 1
+  fi
+  printf 'Docker Hub unavailable; compiling locally and reusing %s\n' "${BASE_IMAGE}"
+  mkdir -p bin
+  CGO_ENABLED=0 go build -trimpath -o bin/sluice ./cmd/sluice
+  offline_container="$(docker create "${BASE_IMAGE}")"
+  if ! docker cp bin/sluice "${offline_container}:/usr/local/bin/sluice"; then
+    docker rm "${offline_container}" >/dev/null
+    exit 1
+  fi
+  docker commit "${offline_container}" "${IMAGE}" >/dev/null
+  docker rm "${offline_container}" >/dev/null
+fi
 
 printf '\n==> Publishing to the local MicroK8s registry\n'
 docker push "${IMAGE}"
@@ -140,6 +168,9 @@ microk8s helm3 upgrade --install "${RELEASE}" ./charts/sluice \
   --set image.repository="${REGISTRY}/sluice" \
   --set-string image.tag="${TAG}" \
   --set image.pullPolicy=Always \
+  --set control.replicas=5 \
+  --set worker.replicas=50 \
+  --set raftVoters=5 \
   --set affinity.enabled=false \
   --wait \
   --timeout "${ROLLOUT_TIMEOUT}"
@@ -148,11 +179,14 @@ printf '\n==> Waiting for StatefulSet rollout\n'
 microk8s kubectl rollout status "statefulset/${STATEFULSET}" \
   --namespace "${NAMESPACE}" \
   --timeout "${ROLLOUT_TIMEOUT}"
+microk8s kubectl rollout status "statefulset/${WORKER_STATEFULSET}" \
+  --namespace "${NAMESPACE}" \
+  --timeout "${ROLLOUT_TIMEOUT}"
 
-printf '\n==> Verifying every Sluice pod\n'
+printf '\n==> Verifying control and Worker topology\n'
 pods="$(microk8s kubectl get pods \
   --namespace "${NAMESPACE}" \
-  -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE}" \
+  -l "app.kubernetes.io/instance=${RELEASE}" \
   -o name)"
 
 if [ -z "${pods}" ]; then
@@ -168,9 +202,70 @@ for pod in ${pods}; do
   printf '\n'
 done
 
+control_count="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
+  -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control" \
+  --field-selector=status.phase=Running --no-headers | wc -l | tr -d ' ')"
+worker_count="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
+  -l "app.kubernetes.io/name=sluice-worker,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=worker" \
+  --field-selector=status.phase=Running --no-headers | wc -l | tr -d ' ')"
+if [ "${control_count}" != "5" ] || [ "${worker_count}" != "50" ]; then
+  printf 'Unexpected topology: controls=%s workers=%s\n' "${control_count}" "${worker_count}" >&2
+  exit 1
+fi
+
+probe_control="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
+  -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control" \
+  -o jsonpath='{.items[0].metadata.name}')"
+topology_ready=false
+for _ in $(seq 1 60); do
+  nodes_json="$(microk8s kubectl exec --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
+    wget -qO- 'http://127.0.0.1:9090/api/v1/admin/nodes')"
+  allocations_json="$(microk8s kubectl exec --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
+    wget -qO- 'http://127.0.0.1:9090/api/v1/admin/allocations')"
+  if NODES_JSON="${nodes_json}" ALLOCATIONS_JSON="${allocations_json}" python3 -c '
+import json, os, sys
+nodes = json.loads(os.environ["NODES_JSON"])["nodes"]
+allocations = json.loads(os.environ["ALLOCATIONS_JSON"])["nodes"]
+controls = [node for node in nodes if node.get("role") == "control"]
+workers = [node for node in nodes if node.get("role") == "worker" and node.get("status") == "up"]
+roles = {node["node_id"]: node.get("role") for node in nodes}
+valid = (len(nodes) == 55 and len(controls) == 5 and len(workers) == 50 and
+         all(node.get("total_workers") == 0 for node in controls) and
+         sum(node.get("total_workers", 0) for node in workers) == 5000 and
+         all(roles.get(allocation["node_id"]) == "worker" for allocation in allocations))
+sys.exit(0 if valid else 1)
+'; then
+    topology_ready=true
+    break
+  fi
+  sleep 1
+done
+if [ "${topology_ready}" != "true" ]; then
+  printf 'FSM role/allocation topology did not converge: nodes=%s allocations=%s\n' \
+    "${nodes_json}" "${allocations_json}" >&2
+  exit 1
+fi
+
+raft_status="$(microk8s kubectl exec --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
+  wget -qO- 'http://127.0.0.1:9090/api/v1/admin/raft')"
+voter_count="$(printf '%s' "${raft_status}" | sed -n 's/.*"voters":\[\([^]]*\)\].*/\1/p' | \
+  awk -F, '{ if (length($0) == 0) print 0; else print NF }')"
+if printf '%s' "${raft_status}" | grep -q '"nonvoters":null'; then
+  nonvoter_count=0
+else
+  nonvoter_count="$(printf '%s' "${raft_status}" | sed -n 's/.*"nonvoters":\[\([^]]*\)\].*/\1/p' | \
+    awk -F, '{ if (length($0) == 0) print 0; else print NF }')"
+fi
+if [ "${voter_count}" != "5" ] || [ "${nonvoter_count}" != "0" ]; then
+  printf 'Unexpected Raft membership: %s\n' "${raft_status}" >&2
+  exit 1
+fi
+printf 'Topology verified: controls=%s workers=%s, Raft=%s voter/%s nonvoter\n' \
+  "${control_count}" "${worker_count}" "${voter_count}" "${nonvoter_count}"
+
 printf '\nDeployed %s\n' "${IMAGE}"
 microk8s kubectl get pods \
   --namespace "${NAMESPACE}" \
-  -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE}" \
+  -l "app.kubernetes.io/instance=${RELEASE}" \
   -o wide
 REMOTE

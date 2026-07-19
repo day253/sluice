@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -628,6 +629,323 @@ func TestLeaderIsControlPlaneOnly(t *testing.T) {
 	}, 30*time.Second, "follower executes leader-submitted task")
 	if count := tc.proc.processedTaskCount(taskID); count != 1 {
 		t.Fatalf("task processed %d times, want once", count)
+	}
+}
+
+// TestStatelessWorkerRoleSplit exercises the production role boundary with a
+// real three-voter Raft control plane and Workers that own no Raft/FSM/Queue.
+func TestStatelessWorkerRoleSplit(t *testing.T) {
+	const controlCount = 3
+	logger := zap.NewNop()
+	processor := newRecordingProcessor()
+	controls := make([]*node.Node, controlCount)
+	dirs := make([]string, controlCount)
+	raftAddrs := make([]string, controlCount)
+	httpAddrs := make([]string, controlCount)
+	allocateAddress := func() string {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		address := listener.Addr().String()
+		listener.Close()
+		return address
+	}
+	for index := 0; index < controlCount; index++ {
+		raftAddrs[index] = allocateAddress()
+		httpAddrs[index] = allocateAddress()
+		dir, err := os.MkdirTemp("", "sluice-control-role-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dirs[index] = dir
+	}
+	for index := 0; index < controlCount; index++ {
+		control, err := node.New(node.Config{
+			Role: types.NodeRoleControl, NodeID: fmt.Sprintf("control-%d", index),
+			APIAddress: httpAddrs[index], RaftAddress: raftAddrs[index], DataDir: dirs[index],
+			Bootstrap: index == 0, TotalWorkers: 0, MaxRaftVoters: controlCount,
+			DisableVoterReconciliation: true,
+		}, processor, logger)
+		if err != nil {
+			t.Fatalf("create control-%d: %v", index, err)
+		}
+		controls[index] = control
+		if index == 0 {
+			go func() { _ = control.Start() }()
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) && !control.RaftCluster().IsLeader() {
+				time.Sleep(20 * time.Millisecond)
+			}
+			if !control.RaftCluster().IsLeader() {
+				t.Fatal("control-0 did not become leader")
+			}
+			continue
+		}
+		if err := controls[0].RaftCluster().AddVoter(fmt.Sprintf("control-%d", index), raftAddrs[index]); err != nil {
+			t.Fatalf("add control-%d: %v", index, err)
+		}
+		registration := types.NodeInfo{
+			ID: fmt.Sprintf("control-%d", index), Role: types.NodeRoleControl,
+			Address: httpAddrs[index], RaftAddress: raftAddrs[index], Status: types.NodeStatusUp,
+		}
+		if err := controls[0].RaftCluster().GetRaft().Apply(
+			raftpkg.MustMarshalCommand(raftpkg.OpNodeUp, registration), 5*time.Second,
+		).Error(); err != nil {
+			t.Fatalf("register control-%d: %v", index, err)
+		}
+		go func(control *node.Node) { _ = control.Start() }(control)
+	}
+
+	workers := make([]*node.StatelessWorker, 2)
+	cleanup := func() {
+		for _, execution := range workers {
+			if execution != nil {
+				_ = execution.Shutdown(5 * time.Second)
+			}
+		}
+		for index, control := range controls {
+			if control != nil {
+				_ = control.Shutdown(5 * time.Second)
+			}
+			_ = os.RemoveAll(dirs[index])
+		}
+	}
+	defer cleanup()
+
+	// Use control-2 as the stable discovery endpoint so killing the initial
+	// control-0 Leader later exercises Worker reconnection through a follower.
+	for index := range workers {
+		execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+			NodeID: fmt.Sprintf("worker-%d", index), APIAddress: "127.0.0.1:0",
+			ControllerAddress: httpAddrs[2], TotalWorkers: 8,
+		}, processor, logger)
+		if err != nil {
+			t.Fatalf("create worker-%d: %v", index, err)
+		}
+		workers[index] = execution
+		go func(workerNode *node.StatelessWorker) { _ = workerNode.Start() }(execution)
+	}
+
+	apply := func(op string, data interface{}) {
+		leader := -1
+		for index, control := range controls {
+			if control != nil && control.RaftCluster().IsLeader() {
+				leader = index
+				break
+			}
+		}
+		if leader < 0 {
+			t.Fatal("no control leader")
+		}
+		if err := controls[leader].RaftCluster().GetRaft().Apply(
+			raftpkg.MustMarshalCommand(op, data), 5*time.Second,
+		).Error(); err != nil {
+			t.Fatalf("apply %s: %v", op, err)
+		}
+	}
+	apply(raftpkg.OpUpsertTenant, types.TenantConfig{ID: "role-split", Name: "Role Split", MaxWorkers: 16})
+
+	waitFor := func(timeout time.Duration, description string, condition func() bool) {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if condition() {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", description)
+	}
+	waitFor(15*time.Second, "stateless workers registered and allocated", func() bool {
+		nodes := controls[1].RaftCluster().FSM().GetAllNodes()
+		allocations := controls[1].RaftCluster().FSM().GetAllAllocations()
+		for index := range workers {
+			id := fmt.Sprintf("worker-%d", index)
+			if nodes[id] == nil || nodes[id].Role != types.NodeRoleWorker ||
+				nodes[id].Status != types.NodeStatusUp || allocations[id] == nil ||
+				allocations[id].Tenants["role-split"] == 0 {
+				return false
+			}
+		}
+		return true
+	})
+
+	assertMembership := func() {
+		status, err := controls[1].RaftCluster().MembershipStatus()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(status.Voters) != controlCount || len(status.Nonvoters) != 0 {
+			t.Fatalf("role-split membership = voters:%v nonvoters:%v", status.Voters, status.Nonvoters)
+		}
+		for _, id := range append(status.Voters, status.Nonvoters...) {
+			if strings.HasPrefix(id, "worker-") {
+				t.Fatalf("stateless Worker %s joined Raft", id)
+			}
+		}
+	}
+	assertMembership()
+
+	submit := func(address, prefix string, count int) []string {
+		tasks := make([]types.TaskSubmitRequest, count)
+		for index := range tasks {
+			tasks[index] = types.TaskSubmitRequest{
+				TenantID: "role-split", Payload: json.RawMessage(fmt.Sprintf(`{"run":%q,"n":%d}`, prefix, index)),
+			}
+		}
+		body, _ := json.Marshal(types.BatchTaskSubmitRequest{Tasks: tasks})
+		response, err := http.Post("http://"+address+"/api/v1/tasks/batch", "application/json", bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("submit %s: %v", prefix, err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusAccepted {
+			payload, _ := io.ReadAll(response.Body)
+			t.Fatalf("submit %s status=%s body=%s", prefix, response.Status, payload)
+		}
+		var result types.BatchTaskResponse
+		if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+			t.Fatal(err)
+		}
+		ids := make([]string, len(result.Tasks))
+		for index, task := range result.Tasks {
+			ids[index] = task.TaskID
+		}
+		return ids
+	}
+	waitDone := func(ids []string) {
+		waitFor(30*time.Second, "stateless worker task completion", func() bool {
+			fsm := controls[1].RaftCluster().FSM()
+			for _, taskID := range ids {
+				if result := fsm.GetResult(taskID); result == nil || result.Status != types.TaskStatusDone {
+					return false
+				}
+			}
+			return true
+		})
+	}
+	first := submit(httpAddrs[2], "initial", 80)
+	waitDone(first)
+
+	oldSession := controls[1].RaftCluster().FSM().GetAllNodes()["worker-0"].SessionID
+	oldWorker := workers[0]
+	replacement, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+		NodeID: "worker-0", APIAddress: "127.0.0.1:0",
+		ControllerAddress: httpAddrs[2], TotalWorkers: 8,
+	}, processor, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = replacement.Start() }()
+	waitFor(10*time.Second, "replacement Worker session", func() bool {
+		nodeInfo := controls[1].RaftCluster().FSM().GetAllNodes()["worker-0"]
+		return nodeInfo != nil && nodeInfo.Status == types.NodeStatusUp && nodeInfo.SessionID != oldSession
+	})
+	// Overlap the two process sessions, then close the old stream. A delayed
+	// teardown from the old process must not delete the replacement's
+	// AllocationPush subscription.
+	if err := oldWorker.Shutdown(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	workers[0] = replacement
+	if err := workers[1].Shutdown(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	workers[1] = nil
+	apply(raftpkg.OpUpsertTenant, types.TenantConfig{
+		ID: "replacement-only", Name: "Replacement Only", MaxWorkers: 8,
+	})
+	waitFor(10*time.Second, "replacement receives a later allocation push", func() bool {
+		allocation, ok := controls[1].RaftCluster().FSM().GetAllocation("worker-0")
+		return ok && allocation.Tenants["replacement-only"] > 0
+	})
+	replacementTasks := func() []string {
+		tasks := make([]types.TaskSubmitRequest, 32)
+		for index := range tasks {
+			tasks[index] = types.TaskSubmitRequest{
+				TenantID: "replacement-only",
+				Payload:  json.RawMessage(fmt.Sprintf(`{"replacement":%d}`, index)),
+			}
+		}
+		body, _ := json.Marshal(types.BatchTaskSubmitRequest{Tasks: tasks})
+		response, postErr := http.Post("http://"+httpAddrs[2]+"/api/v1/tasks/batch",
+			"application/json", bytes.NewReader(body))
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusAccepted {
+			payload, _ := io.ReadAll(response.Body)
+			t.Fatalf("replacement submit status=%s body=%s", response.Status, payload)
+		}
+		var result types.BatchTaskResponse
+		if decodeErr := json.NewDecoder(response.Body).Decode(&result); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		ids := make([]string, len(result.Tasks))
+		for index, task := range result.Tasks {
+			ids[index] = task.TaskID
+		}
+		return ids
+	}()
+	waitDone(replacementTasks)
+
+	// Reproduce a rolling upgrade from the legacy combined-role snapshot: the
+	// surviving Raft members still advertise execution capacity and even have
+	// stale allocations. The next role-aware Leader must atomically turn every
+	// retained member into a zero-capacity control mirror.
+	for _, index := range []int{1, 2} {
+		apply(raftpkg.OpNodeUp, types.NodeInfo{
+			ID: fmt.Sprintf("control-%d", index), Address: httpAddrs[index],
+			RaftAddress: raftAddrs[index], Status: types.NodeStatusUp, TotalWorkers: 100,
+		})
+	}
+	legacyAllocations := controls[1].RaftCluster().FSM().GetAllAllocations()
+	for _, index := range []int{1, 2} {
+		id := fmt.Sprintf("control-%d", index)
+		legacyAllocations[id] = &types.NodeAllocation{
+			NodeID: id, Tenants: map[string]int{"role-split": 50},
+		}
+	}
+	apply(raftpkg.OpUpdateAllocation, legacyAllocations)
+
+	// The bootstrap Leader is intentionally stopped. Workers must discover the
+	// new Leader through control-2 and continue without any Raft catch-up.
+	if !controls[0].RaftCluster().IsLeader() {
+		t.Fatal("control-0 unexpectedly lost leadership before failover case")
+	}
+	if err := controls[0].Shutdown(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	controls[0] = nil
+	waitFor(15*time.Second, "new control Leader", func() bool {
+		return (controls[1] != nil && controls[1].RaftCluster().IsLeader()) ||
+			(controls[2] != nil && controls[2].RaftCluster().IsLeader())
+	})
+	waitFor(10*time.Second, "legacy control mirrors lose execution capacity", func() bool {
+		fsm := controls[1].RaftCluster().FSM()
+		for _, index := range []int{1, 2} {
+			id := fmt.Sprintf("control-%d", index)
+			nodeInfo := fsm.GetAllNodes()[id]
+			if nodeInfo == nil || nodeInfo.Role != types.NodeRoleControl || nodeInfo.TotalWorkers != 0 {
+				return false
+			}
+			if _, allocated := fsm.GetAllocation(id); allocated {
+				return false
+			}
+		}
+		return true
+	})
+	second := submit(httpAddrs[2], "after-failover", 80)
+	waitDone(second)
+	assertMembership()
+
+	counts := processor.processedTaskCounts()
+	allTasks := append(append(first, replacementTasks...), second...)
+	for _, taskID := range allTasks {
+		if counts[taskID] != 1 {
+			t.Fatalf("task %s executed %d times, want once", taskID, counts[taskID])
+		}
 	}
 }
 
@@ -1376,6 +1694,26 @@ func TestNewMembersBeyondVoterLimitAreNonvoters(t *testing.T) {
 		if got := processed[task.TaskID]; got != 1 {
 			t.Fatalf("task %s processed %d times, want once", task.TaskID, got)
 		}
+	}
+
+	// The role-split migration bounds the entire replicated set, not only the
+	// election quorum. Removed processes remain alive here to prove that an old
+	// execution replica cannot silently rejoin consensus.
+	leaderCluster := tc.nodes[tc.leaderIdx()].RaftCluster()
+	pruned, err := leaderCluster.PruneMembers(3)
+	if err != nil {
+		t.Fatalf("prune legacy Raft replicas: %v", err)
+	}
+	wantRemoved := []string{"node-3", "node-4", "node-5", "node-6"}
+	if !slices.Equal(pruned.Removed, wantRemoved) {
+		t.Fatalf("pruned members = %v, want %v", pruned.Removed, wantRemoved)
+	}
+	status, err = leaderCluster.MembershipStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Voters) != 3 || len(status.Nonvoters) != 0 {
+		t.Fatalf("pruned membership = voters %v nonvoters %v, want 3/0", status.Voters, status.Nonvoters)
 	}
 }
 

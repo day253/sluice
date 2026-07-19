@@ -17,6 +17,7 @@ spec:
       targetPort: {{ .Values.raftPort }}
   selector:
     {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
 
 ---
 # ClusterIP service for client access (load-balanced).
@@ -34,8 +35,9 @@ spec:
       targetPort: {{ .Values.apiPort }}
   selector:
     {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control
 
-{{- range $ordinal := until (int .Values.replicas) }}
+{{- range $ordinal := until (int .Values.control.replicas) }}
 ---
 # Stable per-Pod address for Raft. ClusterIP is used directly because some
 # environments intercept cluster DNS with fake-IP responses.
@@ -57,5 +59,25 @@ spec:
       targetPort: {{ $.Values.raftPort }}
   selector:
     {{- include "sluice.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: control
     statefulset.kubernetes.io/pod-name: {{ include "sluice.fullname" $ }}-{{ $ordinal }}
 {{- end }}
+
+---
+# Stable discovery identities for stateless Workers. The StatefulSet has no
+# volumeClaimTemplates; this service provides identity, not storage.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sluice.fullname" . }}-worker-headless
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: health
+      port: {{ .Values.apiPort }}
+      targetPort: {{ .Values.apiPort }}
+  selector:
+    {{- include "sluice.worker-labels" . | nindent 4 }}

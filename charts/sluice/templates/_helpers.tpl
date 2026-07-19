@@ -11,6 +11,12 @@ app.kubernetes.io/name: {{ include "sluice.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
+{{- define "sluice.worker-labels" -}}
+app.kubernetes.io/name: {{ include "sluice.name" . }}-worker
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: worker
+{{- end }}
+
 {{- define "sluice.headless-svc" -}}
 {{- include "sluice.fullname" . }}-headless
 {{- end }}

@@ -20,6 +20,14 @@ const (
 	NodeStatusDown = "down"
 )
 
+// Node role constants separate replicated control-plane members from
+// stateless execution capacity. Empty is retained for rolling compatibility
+// with snapshots written before roles were introduced.
+const (
+	NodeRoleControl = "control"
+	NodeRoleWorker  = "worker"
+)
+
 // ---------------------------------------------------------------------------
 // Cluster & node
 // ---------------------------------------------------------------------------
@@ -27,10 +35,12 @@ const (
 // NodeInfo represents a cluster node registered in the Raft FSM.
 type NodeInfo struct {
 	ID            string    `json:"id"`
-	Address       string    `json:"address"`       // HTTP API address
-	RaftAddress   string    `json:"raft_address"`  // Raft transport address
-	Status        string    `json:"status"`        // "up" | "down"
-	TotalWorkers  int       `json:"total_workers"` // worker capacity of this node
+	Role          string    `json:"role,omitempty"`       // "control" | "worker"
+	SessionID     string    `json:"session_id,omitempty"` // worker process incarnation
+	Address       string    `json:"address"`              // HTTP API address
+	RaftAddress   string    `json:"raft_address"`         // Raft transport address
+	Status        string    `json:"status"`               // "up" | "down"
+	TotalWorkers  int       `json:"total_workers"`        // worker capacity of this node
 	LastHeartbeat time.Time `json:"last_heartbeat"`
 }
 

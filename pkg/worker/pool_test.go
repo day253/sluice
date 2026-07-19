@@ -389,6 +389,48 @@ func TestPoolReconcileScaleDownRetiresAfterInflightCompletion(t *testing.T) {
 	t.Fatal("retiring worker did not commit the final result")
 }
 
+func TestStatelessPoolDrainCommitsInflightBeforeShutdown(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "drain-task", TenantID: "a", Payload: `{}`,
+	})
+	applyOp(fsm, raftpkg.OpClaimTask, raftpkg.ClaimTaskData{
+		TaskID: "drain-task", TenantID: "a", NodeID: "worker-node", Payload: `{}`,
+	})
+	client := &leaderAssignmentClient{fsm: fsm, task: &types.TaskRecord{
+		TaskID: "drain-task", TenantID: "a", Status: types.TaskStatusInflight,
+		NodeID: "worker-node", Payload: `{}`,
+	}}
+	processor := newGatedProcessor()
+	pool := NewPool("worker-node", nil, nil, nil, processor, zap.NewNop())
+	pool.DisableLegacyScheduling()
+	pool.SetClaimer(client)
+	pool.SetCompleter(client)
+	pool.Reconcile(map[string]int{"a": 1})
+	select {
+	case <-processor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processor did not start")
+	}
+
+	drained := make(chan error, 1)
+	go func() { drained <- pool.Drain(2 * time.Second) }()
+	select {
+	case <-processor.canceled:
+		t.Fatal("drain canceled an in-flight stateless Processor")
+	case err := <-drained:
+		t.Fatalf("drain returned before Processor completion: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(processor.release)
+	if err := <-drained; err != nil {
+		t.Fatal(err)
+	}
+	if result := fsm.GetResult("drain-task"); result == nil || result.Status != types.TaskStatusDone {
+		t.Fatalf("drained result = %+v, want done", result)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Task lifecycles through worker pool
 // ---------------------------------------------------------------------------

@@ -24,16 +24,18 @@ const maxRetainedTaskResults = 10000
 //
 // Reads from other goroutines must acquire the read lock via exported accessors.
 type FSM struct {
-	mu     sync.RWMutex
-	state  *types.FSMState
-	logger *zap.Logger
+	mu      sync.RWMutex
+	state   *types.FSMState
+	pending *pendingIndex
+	logger  *zap.Logger
 }
 
 // NewFSM creates a ready-to-use FSM with an empty state.
 func NewFSM(logger *zap.Logger) *FSM {
 	return &FSM{
-		state:  types.NewFSMState(),
-		logger: logger,
+		state:   types.NewFSMState(),
+		pending: newPendingIndex(),
+		logger:  logger,
 	}
 }
 
@@ -64,6 +66,12 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		return f.applyNodeUp(cmd.Data)
 	case OpNodeDown:
 		return f.applyNodeDown(cmd.Data)
+	case OpWorkerOffline:
+		return f.applyWorkerOffline(cmd.Data)
+	case OpRetireNode:
+		return f.applyRetireNode(cmd.Data)
+	case OpSetControlNodes:
+		return f.applySetControlNodes(cmd.Data)
 	case OpCreateTask:
 		return f.applyCreateTask(cmd.Data)
 	case OpCreateTaskBatch:
@@ -158,6 +166,10 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	}
 
 	f.state = &state
+	f.pending = newPendingIndex()
+	for _, task := range state.Tasks {
+		f.pending.add(task)
+	}
 	f.logger.Info("fsm: state restored from snapshot",
 		zap.Uint64("version", state.Version),
 		zap.Int("tenants", len(state.Tenants)),
@@ -237,6 +249,7 @@ func (f *FSM) applyNodeDown(data json.RawMessage) interface{} {
 			task.Status = types.TaskStatusPending
 			task.NodeID = ""
 			task.ClaimedAt = time.Time{}
+			f.pending.add(task)
 			reQueued++
 		}
 	}
@@ -245,6 +258,58 @@ func (f *FSM) applyNodeDown(data json.RawMessage) interface{} {
 		zap.String("node", req.ID),
 		zap.Int("re_queued", reQueued),
 	)
+	return nil
+}
+
+func (f *FSM) applyWorkerOffline(data json.RawMessage) interface{} {
+	var req WorkerOfflineData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+	node, ok := f.state.Nodes[req.ID]
+	if !ok {
+		return nil
+	}
+	// A delayed close from an older process incarnation must not take the
+	// replacement worker offline.
+	if req.SessionID != "" && node.SessionID != "" && node.SessionID != req.SessionID {
+		return nil
+	}
+	node.Status = types.NodeStatusDown
+	delete(f.state.Allocations, req.ID)
+	f.logger.Warn("fsm: stateless worker offline",
+		zap.String("node", req.ID), zap.String("session", req.SessionID))
+	return nil
+}
+
+func (f *FSM) applyRetireNode(data json.RawMessage) interface{} {
+	var req RetireNodeData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+	delete(f.state.Allocations, req.ID)
+	delete(f.state.Nodes, req.ID)
+	// In-flight tasks deliberately retain their owner and lease. Lease expiry
+	// is the only safe point to make them pending again.
+	f.logger.Warn("fsm: node identity retired", zap.String("node", req.ID))
+	return nil
+}
+
+func (f *FSM) applySetControlNodes(data json.RawMessage) interface{} {
+	var req SetControlNodesData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+	for _, nodeID := range req.NodeIDs {
+		node := f.state.Nodes[nodeID]
+		if node == nil {
+			continue
+		}
+		node.Role = types.NodeRoleControl
+		node.SessionID = ""
+		node.TotalWorkers = 0
+		delete(f.state.Allocations, nodeID)
+	}
 	return nil
 }
 
@@ -285,7 +350,7 @@ func (f *FSM) insertPendingTask(req CreateTaskData) bool {
 		delete(f.state.Tasks, req.TaskID)
 		return false
 	}
-	f.state.Tasks[req.TaskID] = &types.TaskRecord{
+	record := &types.TaskRecord{
 		TaskID:      req.TaskID,
 		TenantID:    req.TenantID,
 		Status:      types.TaskStatusPending,
@@ -293,6 +358,8 @@ func (f *FSM) insertPendingTask(req CreateTaskData) bool {
 		Payload:     req.Payload,
 		CreatedAt:   time.Now().UTC(),
 	}
+	f.state.Tasks[req.TaskID] = record
+	f.pending.add(record)
 	return true
 }
 
@@ -304,6 +371,7 @@ func (f *FSM) applyClaimTask(data json.RawMessage) interface{} {
 
 	now := time.Now().UTC()
 	if _, completed := f.state.Results[req.TaskID]; completed {
+		f.pending.remove(f.state.Tasks[req.TaskID])
 		delete(f.state.Tasks, req.TaskID)
 		return fmt.Errorf("task %s already completed", req.TaskID)
 	}
@@ -314,6 +382,7 @@ func (f *FSM) applyClaimTask(data json.RawMessage) interface{} {
 			return fmt.Errorf("task %s already claimed by %s", req.TaskID, existing.NodeID)
 		}
 		// Task is in recovery-pending state — reclaim it.
+		f.pending.remove(existing)
 		existing.Status = types.TaskStatusInflight
 		existing.NodeID = req.NodeID
 		existing.ClaimedAt = now
@@ -373,6 +442,7 @@ func (f *FSM) applyClaimBatch(data json.RawMessage) interface{} {
 	now := time.Now().UTC()
 	for _, t := range req.Tasks {
 		if _, completed := f.state.Results[t.TaskID]; completed {
+			f.pending.remove(f.state.Tasks[t.TaskID])
 			delete(f.state.Tasks, t.TaskID)
 			result.Failed = append(result.Failed, t.TaskID)
 			continue
@@ -383,6 +453,7 @@ func (f *FSM) applyClaimBatch(data json.RawMessage) interface{} {
 				continue
 			}
 			// Recovery-pending → reclaim.
+			f.pending.remove(existing)
 			existing.Status = types.TaskStatusInflight
 			existing.NodeID = t.NodeID
 			existing.ClaimedAt = now
@@ -435,6 +506,7 @@ func (f *FSM) applyRequeueTasks(data json.RawMessage) interface{} {
 		task.Status = types.TaskStatusPending
 		task.NodeID = ""
 		task.ClaimedAt = time.Time{}
+		f.pending.add(task)
 		requeued++
 	}
 	if requeued > 0 {
@@ -451,6 +523,7 @@ func (f *FSM) finishTask(req CompleteTaskData, status string, completedAt time.T
 	if !exists {
 		return
 	}
+	f.pending.remove(task)
 	delete(f.state.Tasks, req.TaskID)
 
 	tenantID := task.TenantID
@@ -634,19 +707,8 @@ func (f *FSM) TaskStatus(taskID string) (string, bool) {
 func (f *FSM) FindPendingTasks(tenantID string) []*types.TaskRecord {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	var out []*types.TaskRecord
-	for _, t := range f.state.Tasks {
-		if t.TenantID == tenantID && t.Status == types.TaskStatusPending {
-			copyT := *t
-			out = append(out, &copyT)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
-			return out[i].TaskID < out[j].TaskID
-		}
-		return out[i].CreatedAt.Before(out[j].CreatedAt)
-	})
+	out := make([]*types.TaskRecord, 0)
+	appendPendingInOrder(f.pending.byTenant[tenantID], f.state, &out, time.Time{})
 	return out
 }
 
@@ -656,20 +718,8 @@ func (f *FSM) FindPendingTasks(tenantID string) []*types.TaskRecord {
 func (f *FSM) FindAllPendingTasks() []*types.TaskRecord {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	out := make([]*types.TaskRecord, 0)
-	for _, task := range f.state.Tasks {
-		if task.Status != types.TaskStatusPending {
-			continue
-		}
-		copyTask := *task
-		out = append(out, &copyTask)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
-			return out[i].TaskID < out[j].TaskID
-		}
-		return out[i].CreatedAt.Before(out[j].CreatedAt)
-	})
+	out := make([]*types.TaskRecord, 0, f.pending.count)
+	appendPendingInOrder(f.pending.all, f.state, &out, time.Time{})
 	return out
 }
 
@@ -680,20 +730,14 @@ func (f *FSM) FindAllPendingTasks() []*types.TaskRecord {
 func (f *FSM) FindStealablePendingTasks(excludeTenantID string, before time.Time) []*types.TaskRecord {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	var out []*types.TaskRecord
-	for _, task := range f.state.Tasks {
-		if task.Status != types.TaskStatusPending || task.TenantID == excludeTenantID || task.CreatedAt.IsZero() || !task.CreatedAt.Before(before) {
-			continue
+	candidates := make([]*types.TaskRecord, 0)
+	appendPendingInOrder(f.pending.all, f.state, &candidates, before)
+	out := candidates[:0]
+	for _, task := range candidates {
+		if task.TenantID != excludeTenantID && !task.CreatedAt.IsZero() {
+			out = append(out, task)
 		}
-		copyTask := *task
-		out = append(out, &copyTask)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
-			return out[i].TaskID < out[j].TaskID
-		}
-		return out[i].CreatedAt.Before(out[j].CreatedAt)
-	})
 	return out
 }
 
@@ -778,8 +822,10 @@ func (f *FSM) GetMetricsSnapshot() MetricsSnapshot {
 		snapshot.Unfinished[tenantID] = 0
 		snapshot.AllocatedWorkersByTenant[tenantID] = 0
 	}
-	for nodeID := range f.state.Nodes {
-		snapshot.AllocatedWorkersByNode[nodeID] = 0
+	for nodeID, node := range f.state.Nodes {
+		if node.TotalWorkers > 0 {
+			snapshot.AllocatedWorkersByNode[nodeID] = 0
+		}
 	}
 	for _, task := range f.state.Tasks {
 		snapshot.Unfinished[task.TenantID]++

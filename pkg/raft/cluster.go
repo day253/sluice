@@ -210,8 +210,15 @@ func (c *Cluster) ApplyCommand(op string, data interface{}, timeout time.Duratio
 
 // RegisterNode applies an OpNodeUp to announce this node's presence.
 func (c *Cluster) RegisterNode(httpAddr string, totalWorkers int) error {
+	return c.RegisterNodeWithRole(httpAddr, totalWorkers, "")
+}
+
+// RegisterNodeWithRole publishes the current control-plane identity without
+// coupling Raft membership to execution capacity.
+func (c *Cluster) RegisterNodeWithRole(httpAddr string, totalWorkers int, role string) error {
 	ni := types.NodeInfo{
 		ID:           c.config.NodeID,
+		Role:         role,
 		Address:      httpAddr,
 		RaftAddress:  c.config.RaftAddress,
 		Status:       types.NodeStatusUp,
@@ -282,6 +289,13 @@ type VoterReconcileResult struct {
 	Changed               bool
 	LeadershipTransferred bool
 	Status                MembershipStatus
+}
+
+// MemberPruneResult identifies replicas removed after execution has been
+// split into stateless Workers.
+type MemberPruneResult struct {
+	Changed bool
+	Removed []string
 }
 
 func validateMaxVoters(maxVoters int) error {
@@ -431,6 +445,50 @@ func (c *Cluster) ReconcileVoters(maxVoters int) (VoterReconcileResult, error) {
 	}
 	_, leaderID = c.raft.LeaderWithID()
 	return VoterReconcileResult{Changed: changed, Status: membershipStatus(configuration, leaderID)}, nil
+}
+
+// PruneMembers bounds total Raft replication independently from Worker count.
+// Stable lowest-ordinal members are retained; callers must run voter
+// reconciliation first so the retained set already contains a healthy quorum.
+func (c *Cluster) PruneMembers(maxMembers int) (MemberPruneResult, error) {
+	if maxMembers < 1 {
+		return MemberPruneResult{}, fmt.Errorf("max Raft members must be positive, got %d", maxMembers)
+	}
+	c.membershipMu.Lock()
+	defer c.membershipMu.Unlock()
+	if !c.IsLeader() {
+		return MemberPruneResult{}, raft.ErrNotLeader
+	}
+	configuration, err := c.configurationLocked()
+	if err != nil {
+		return MemberPruneResult{}, err
+	}
+	servers := sortedServers(configuration)
+	if len(servers) <= maxMembers {
+		return MemberPruneResult{}, nil
+	}
+	keep := make(map[raft.ServerID]struct{}, maxMembers)
+	for _, server := range servers[:maxMembers] {
+		keep[server.ID] = struct{}{}
+	}
+	_, leaderID := c.raft.LeaderWithID()
+	if _, ok := keep[leaderID]; !ok {
+		return MemberPruneResult{}, fmt.Errorf("refusing to prune current leader %s outside retained set", leaderID)
+	}
+	result := MemberPruneResult{}
+	for _, server := range servers[maxMembers:] {
+		if server.Suffrage == raft.Voter {
+			if err := c.raft.DemoteVoter(server.ID, 0, 0).Error(); err != nil {
+				return result, fmt.Errorf("demote pruned voter %s: %w", server.ID, err)
+			}
+		}
+		if err := c.raft.RemoveServer(server.ID, 0, 0).Error(); err != nil {
+			return result, fmt.Errorf("remove Raft replica %s: %w", server.ID, err)
+		}
+		result.Changed = true
+		result.Removed = append(result.Removed, string(server.ID))
+	}
+	return result, nil
 }
 
 // RemoveServer removes a server from the cluster.
