@@ -834,6 +834,22 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		t.Fatalf("performance diagnostics reported Raft errors: %+v", diagnostics.Current.Raft)
 	}
 
+	currentResponse, err := client.Get("http://" + tc.httpAddrs[follower] + "/api/v1/admin/performance?history=0")
+	if err != nil {
+		t.Fatalf("query current-only performance diagnostics through follower: %v", err)
+	}
+	var currentOnly metricspkg.PerformanceDiagnostics
+	decodeErr := json.NewDecoder(currentResponse.Body).Decode(&currentOnly)
+	currentResponse.Body.Close()
+	if currentResponse.StatusCode != http.StatusOK || decodeErr != nil {
+		t.Fatalf("current-only performance diagnostics status=%d decode=%v", currentResponse.StatusCode, decodeErr)
+	}
+	if currentOnly.NodeID != diagnostics.NodeID ||
+		currentOnly.Current.Raft[raftpkg.OpCompleteBatch].Items < taskCount ||
+		len(currentOnly.History) != 0 {
+		t.Fatalf("current-only performance diagnostics = %+v", currentOnly)
+	}
+
 	dashboardResponse, err := client.Get("http://" + tc.httpAddrs[follower] + "/")
 	if err != nil {
 		t.Fatalf("GET dashboard through follower: %v", err)
@@ -851,6 +867,7 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		`id="performance-raft-chart"`,
 		`id="performance-scheduler-chart"`,
 		`href="/api/v1/admin/performance"`,
+		`getJSON('/api/v1/admin/performance?history=0')`,
 	} {
 		if !strings.Contains(string(dashboardBody), fragment) {
 			t.Errorf("production dashboard is missing performance fragment %q", fragment)

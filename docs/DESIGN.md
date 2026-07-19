@@ -359,6 +359,10 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   都不进入 Raft/FSM/Snapshot，不参与分配、借用或 lease 决策。Leader 切换后读取新
   Leader 的本地观测，不承诺跨 Leader 拼接无缝时间线；当前也不提供逐 non-voter
   replication lag。
+- **读取边界**：端点默认返回完整当前快照与 174 点历史，保留给人工诊断和外部调用；
+  `history=0` 只返回 Leader 当前快照。WebUI 每秒只请求轻量快照，曲线复用同一刷新中
+  `/metrics` 已返回的历史，避免对相同历史重复序列化和传输。该参数只改变只读响应形状，
+  不改变采样、保存或任务协议。
 - **正确性边界**：观测只包裹既有 ApplyFuture 和选择流程，不增加或重排任何 Raft log，
   不改变 Leader 唯一分配、Worker 执行、批次上限、超时和最终状态语义。指标失败不能
   阻断任务路径。
@@ -366,7 +370,8 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   pending 选择在 Claim Apply 前记录；`pkg/api` 验证只读端点。真实 3 节点
   `TestPerformanceDiagnosticsProxyFromFollower` 走 Follower HTTP、Leader Raft、Worker、
   Result 和 Follower→Leader 诊断代理，要求 Create/Claim/Complete 与 selection 可见且
-  最终 unfinished=0。
+  最终 unfinished=0；同一路径还验证 `history=0` 经 Follower 传到 Leader 后保留当前值、
+  不复制历史，默认请求仍返回完整 JSON。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 

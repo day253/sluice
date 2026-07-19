@@ -433,8 +433,11 @@ func (n *Node) Pool() *worker.Pool             { return n.pool }
 func (n *Node) AllocEngine() *allocator.Engine { return n.allocEngine }
 func (n *Node) TenantManager() *tenant.Manager { return n.tenantMgr }
 
-func (n *Node) performanceDiagnostics(ctx context.Context, localOnly bool) (metrics.PerformanceDiagnostics, error) {
+func (n *Node) performanceDiagnostics(ctx context.Context, localOnly, includeHistory bool) (metrics.PerformanceDiagnostics, error) {
 	if n.raftCluster.IsLeader() {
+		if !includeHistory {
+			return n.collector.PerformanceCurrent(n.cfg.NodeID), nil
+		}
 		return n.collector.PerformanceDiagnostics(n.cfg.NodeID), nil
 	}
 	if localOnly {
@@ -448,8 +451,12 @@ func (n *Node) performanceDiagnostics(ctx context.Context, localOnly bool) (metr
 	if err != nil {
 		return metrics.PerformanceDiagnostics{}, err
 	}
+	query := "?local=1"
+	if !includeHistory {
+		query += "&history=0"
+	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"http://"+leaderAPI+"/api/v1/admin/performance?local=1", nil)
+		"http://"+leaderAPI+"/api/v1/admin/performance"+query, nil)
 	if err != nil {
 		return metrics.PerformanceDiagnostics{}, err
 	}

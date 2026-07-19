@@ -129,8 +129,10 @@ func TestRaftStatusEndpointReportsBoundedMembership(t *testing.T) {
 func TestPerformanceEndpointReturnsConfiguredLeaderDiagnostics(t *testing.T) {
 	h, _, _ := setupHandler(t)
 	localOnly := false
-	h.SetPerformanceFunc(func(_ context.Context, local bool) (metricspkg.PerformanceDiagnostics, error) {
+	includeHistory := false
+	h.SetPerformanceFunc(func(_ context.Context, local, history bool) (metricspkg.PerformanceDiagnostics, error) {
 		localOnly = local
+		includeHistory = history
 		return metricspkg.PerformanceDiagnostics{
 			NodeID: "node-0",
 			Current: metricspkg.PerformanceSnapshot{Raft: map[string]metricspkg.RaftOperationSnapshot{
@@ -146,12 +148,32 @@ func TestPerformanceEndpointReturnsConfiguredLeaderDiagnostics(t *testing.T) {
 	if !localOnly {
 		t.Fatal("performance endpoint did not preserve local-only proxy guard")
 	}
+	if !includeHistory {
+		t.Fatal("performance endpoint did not include history by default")
+	}
 	var diagnostics metricspkg.PerformanceDiagnostics
 	if err := json.Unmarshal(recorder.Body.Bytes(), &diagnostics); err != nil {
 		t.Fatal(err)
 	}
 	if diagnostics.NodeID != "node-0" || diagnostics.Current.Raft[raftpkg.OpClaimBatch].Items != 384 {
 		t.Fatalf("performance diagnostics = %+v", diagnostics)
+	}
+}
+
+func TestPerformanceEndpointCanReturnCurrentSnapshotWithoutHistory(t *testing.T) {
+	h, _, _ := setupHandler(t)
+	includeHistory := true
+	h.SetPerformanceFunc(func(_ context.Context, _, history bool) (metricspkg.PerformanceDiagnostics, error) {
+		includeHistory = history
+		return metricspkg.PerformanceDiagnostics{NodeID: "node-0"}, nil
+	})
+	recorder := httptest.NewRecorder()
+	newRouter(h).ServeHTTP(recorder, httptest.NewRequest("GET", "/api/v1/admin/performance?history=0", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("performance status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if includeHistory {
+		t.Fatal("performance endpoint ignored history=0")
 	}
 }
 

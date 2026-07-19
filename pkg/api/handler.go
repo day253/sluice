@@ -28,7 +28,7 @@ type Handler struct {
 	svc             *grpcpkg.Service
 	joinFunc        func(nodeID, raftAddr, httpAddr string, workers int) error
 	raftStatusFunc  func() (raftpkg.MembershipStatus, error)
-	performanceFunc func(context.Context, bool) (metrics.PerformanceDiagnostics, error)
+	performanceFunc func(context.Context, bool, bool) (metrics.PerformanceDiagnostics, error)
 	collector       interface {
 		Query(name string) ([]MetricsData, int)
 	}
@@ -67,9 +67,10 @@ func (h *Handler) SetRaftStatusFunc(fn func() (raftpkg.MembershipStatus, error))
 }
 
 // SetPerformanceFunc configures leader-local performance diagnostics. The
-// boolean is true for an internal local-only proxy request and prevents loops
-// if leadership changes while a follower is forwarding the read.
-func (h *Handler) SetPerformanceFunc(fn func(context.Context, bool) (metrics.PerformanceDiagnostics, error)) {
+// first boolean is true for an internal local-only proxy request and prevents
+// loops if leadership changes while a follower is forwarding the read. The
+// second boolean controls whether the bounded histories are included.
+func (h *Handler) SetPerformanceFunc(fn func(context.Context, bool, bool) (metrics.PerformanceDiagnostics, error)) {
 	h.performanceFunc = fn
 }
 
@@ -113,7 +114,11 @@ func (h *Handler) performance(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusInternalServerError, "performance diagnostics not configured")
 		return
 	}
-	diagnostics, err := h.performanceFunc(r.Context(), r.URL.Query().Get("local") == "1")
+	diagnostics, err := h.performanceFunc(
+		r.Context(),
+		r.URL.Query().Get("local") == "1",
+		r.URL.Query().Get("history") != "0",
+	)
 	if err != nil {
 		h.writeError(w, http.StatusServiceUnavailable, "performance diagnostics unavailable: "+err.Error())
 		return

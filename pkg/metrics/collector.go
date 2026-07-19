@@ -128,6 +128,22 @@ func (c *Collector) PerformanceDiagnostics(nodeID string) PerformanceDiagnostics
 	return diagnostics
 }
 
+// PerformanceCurrent returns the same cumulative snapshot as
+// PerformanceDiagnostics without copying the 174-point histories. It is used
+// by frequent UI polling; the full diagnostics endpoint remains the default
+// for operators and external consumers.
+func (c *Collector) PerformanceCurrent(nodeID string) PerformanceDiagnostics {
+	diagnostics := PerformanceDiagnostics{
+		NodeID: nodeID, CollectedAt: time.Now().UTC(), History: make(map[string]VarData),
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.perf != nil {
+		diagnostics.Current = c.perf.Snapshot()
+	}
+	return diagnostics
+}
+
 func (c *Collector) ensure(name string, labels map[string]string) *VarHistory {
 	if v, ok := c.vars[name]; ok {
 		return v

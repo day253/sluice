@@ -64,6 +64,14 @@ func TestCollectorStoresBoundedPerformanceHistory(t *testing.T) {
 	if len(diagnostics.History) == 0 {
 		t.Fatal("performance diagnostics omitted bounded history")
 	}
+
+	current := collector.PerformanceCurrent("node-0")
+	if current.NodeID != "node-0" || current.Current.Raft[raftpkg.OpCompleteBatch].Items != 2 {
+		t.Fatalf("current performance diagnostics = %+v", current)
+	}
+	if len(current.History) != 0 {
+		t.Fatalf("current performance diagnostics copied %d histories, want 0", len(current.History))
+	}
 }
 
 func TestCollectorStoresUnfinishedAndAllocatedWorkersByTenantAndNode(t *testing.T) {
