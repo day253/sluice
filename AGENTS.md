@@ -50,3 +50,27 @@ These rules apply to the entire repository.
   after the bug is fixed so later iterations cannot regress them.
 - If an integration path is temporarily impossible to automate, the change is
   incomplete: record the blocker and do not describe the behavior as covered.
+
+## Performance evidence and observability
+
+- Re-run the relevant fixed-shape performance baseline after every change that
+  can affect submission, scheduling, consensus, storage, worker execution, or
+  recovery. Never carry an earlier throughput conclusion across such a change.
+- Record every baseline and comparison in `docs/PERF.md`, including date,
+  hardware/failure domain, replica/voter/non-voter topology, tenant and task
+  counts, processor and payload shape, request batch/concurrency, submission
+  time, drain time, end-to-end throughput, errors, and unfinished final state.
+  Keep earlier results so a bottleneck moving from one subsystem to another is
+  visible instead of rewriting history.
+- Compare like-for-like runs. If the environment, workload, protocol, or
+  benchmark tooling differs, label the result separately and do not claim a
+  percentage improvement from the mismatch. Record blocked or incomplete
+  scale experiments and their infrastructure cause.
+- A performance change is incomplete without enough read-only observability to
+  identify its new limiting stage. At minimum preserve Raft Apply latency and
+  batch fill, pending-selection work, dispatcher queue depth, task backlog, and
+  error/lease-recovery signals relevant to the changed path.
+- Performance diagnostics are process-local current state or bounded historical
+  series. They must not be written into Raft, included in FSM snapshots, or fed
+  back into scheduling decisions unless a separate protocol change explicitly
+  defines and tests that behavior.

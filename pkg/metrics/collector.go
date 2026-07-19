@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,9 +15,18 @@ import (
 type Collector struct {
 	fsm    *raftpkg.FSM
 	logger *zap.Logger
+	perf   *Performance
 
 	mu   sync.RWMutex
 	vars map[string]*VarHistory
+}
+
+// SetPerformance attaches process-local control-plane observations. They are
+// sampled into bounded history but never written into the Raft FSM.
+func (c *Collector) SetPerformance(perf *Performance) {
+	c.mu.Lock()
+	c.perf = perf
+	c.mu.Unlock()
 }
 
 func NewCollector(fsm *raftpkg.FSM, logger *zap.Logger) *Collector {
@@ -43,6 +53,13 @@ func (c *Collector) Start(ctx context.Context) {
 
 func (c *Collector) collect() {
 	snapshot := c.fsm.GetMetricsSnapshot()
+	c.mu.RLock()
+	perf := c.perf
+	c.mu.RUnlock()
+	var performance performanceWindow
+	if perf != nil {
+		performance = perf.sample()
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -66,10 +83,49 @@ func (c *Collector) collect() {
 	}
 	c.ensure("allocated-workers:total", nil).Record(totalAllocatedWorkers)
 
+	// ---- leader-local control-plane performance history ----
+	for op, operation := range performance.Raft {
+		prefix := "performance:raft:" + op + ":"
+		c.ensure(prefix+"apply-rate", map[string]string{"op": op}).Record(int64(operation.Applies))
+		c.ensure(prefix+"item-rate", map[string]string{"op": op}).Record(int64(operation.Items))
+		c.ensure(prefix+"errors", map[string]string{"op": op}).Record(int64(operation.Errors))
+		c.ensure(prefix+"batch-size", map[string]string{"op": op}).Record(divideUint64(operation.Items, operation.Applies))
+		c.ensure(prefix+"apply-us", map[string]string{"op": op}).Record(divideInt64(operation.TotalMicros, operation.Applies))
+		c.ensure(prefix+"apply-max-us", map[string]string{"op": op}).Record(operation.MaxMicros)
+	}
+	scheduler := performance.Scheduler
+	c.ensure("performance:scheduler:selection-rate", nil).Record(int64(scheduler.Selections))
+	c.ensure("performance:scheduler:pending-scanned", nil).Record(int64(scheduler.PendingScanned))
+	c.ensure("performance:scheduler:tasks-selected", nil).Record(int64(scheduler.TasksSelected))
+	c.ensure("performance:scheduler:select-us", nil).Record(divideInt64(scheduler.TotalSelectMicros, scheduler.Selections))
+	c.ensure("performance:scheduler:select-max-us", nil).Record(scheduler.MaxSelectMicros)
+	c.ensure("performance:scheduler:assignment-queue-depth", nil).Record(scheduler.AssignmentQueueDepth)
+	c.ensure("performance:scheduler:completion-queue-depth", nil).Record(scheduler.CompletionQueueDepth)
+
 	// ---- Tick all vars ----
 	for _, v := range c.vars {
 		v.Tick()
 	}
+}
+
+// PerformanceDiagnostics returns current totals plus only the bounded
+// performance histories. Workload and allocation histories remain available
+// from the existing /api/v1/metrics endpoint.
+func (c *Collector) PerformanceDiagnostics(nodeID string) PerformanceDiagnostics {
+	diagnostics := PerformanceDiagnostics{
+		NodeID: nodeID, CollectedAt: time.Now().UTC(), History: make(map[string]VarData),
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.perf != nil {
+		diagnostics.Current = c.perf.Snapshot()
+	}
+	for name, history := range c.vars {
+		if strings.HasPrefix(name, "performance:") {
+			diagnostics.History[name] = history.Query()
+		}
+	}
+	return diagnostics
 }
 
 func (c *Collector) ensure(name string, labels map[string]string) *VarHistory {

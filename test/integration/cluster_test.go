@@ -27,6 +27,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
+	metricspkg "github.com/day253/sluice/pkg/metrics"
 	"github.com/day253/sluice/pkg/node"
 	"github.com/day253/sluice/pkg/queue"
 	raftpkg "github.com/day253/sluice/pkg/raft"
@@ -755,6 +756,82 @@ func TestHTTPBatchSubmitThroughFollower(t *testing.T) {
 	}
 	if got := tc.proc.totalProcessed(); got != taskCount {
 		t.Fatalf("idempotent batch retry processed %d tasks, want %d", got, taskCount)
+	}
+}
+
+// TestPerformanceDiagnosticsProxyFromFollower covers OBS-001 through the
+// production boundary: real follower HTTP forwarding, leader-owned assignment
+// and completion streams, real Raft Apply, worker execution, and the
+// follower-to-leader read-only diagnostics proxy.
+func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+	tc.addTenant("observed", 60)
+	tc.waitAllocation(20 * time.Second)
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	const taskCount = 256
+	batch := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, taskCount)}
+	for i := range batch.Tasks {
+		batch.Tasks[i] = types.TaskSubmitRequest{
+			TenantID: "observed", Payload: json.RawMessage(fmt.Sprintf(`{"index":%d}`, i)),
+			IdempotencyKey: fmt.Sprintf("observed-%d", i),
+		}
+	}
+	body, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	response, err := client.Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+		"application/json", bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("submit observed batch through follower: %v", err)
+	}
+	responseBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("observed batch status = %d, want 202; body=%s", response.StatusCode, responseBody)
+	}
+	tc.waitProcessed(taskCount, 30*time.Second)
+	tc.waitFor(func() bool {
+		leader := tc.leaderIdx()
+		return leader >= 0 && tc.nodes[leader].RaftCluster().FSM().CountUnfinishedPerTenant()["observed"] == 0
+	}, 30*time.Second, "observed tasks commit final state")
+
+	var diagnostics metricspkg.PerformanceDiagnostics
+	tc.waitFor(func() bool {
+		response, err := client.Get("http://" + tc.httpAddrs[follower] + "/api/v1/admin/performance")
+		if err != nil {
+			return false
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return false
+		}
+		if err := json.NewDecoder(response.Body).Decode(&diagnostics); err != nil {
+			return false
+		}
+		create := diagnostics.Current.Raft[raftpkg.OpCreateTaskBatch]
+		claim := diagnostics.Current.Raft[raftpkg.OpClaimBatch]
+		complete := diagnostics.Current.Raft[raftpkg.OpCompleteBatch]
+		return diagnostics.NodeID == fmt.Sprintf("node-%d", tc.leaderIdx()) &&
+			create.Items >= taskCount && claim.Items >= taskCount && complete.Items >= taskCount &&
+			diagnostics.Current.Scheduler.PendingScanned >= taskCount &&
+			diagnostics.Current.Scheduler.TasksSelected >= taskCount &&
+			len(diagnostics.History) > 0
+	}, 15*time.Second, "leader performance diagnostics through follower")
+
+	if diagnostics.Current.Raft[raftpkg.OpCreateTaskBatch].Errors != 0 ||
+		diagnostics.Current.Raft[raftpkg.OpClaimBatch].Errors != 0 ||
+		diagnostics.Current.Raft[raftpkg.OpCompleteBatch].Errors != 0 {
+		t.Fatalf("performance diagnostics reported Raft errors: %+v", diagnostics.Current.Raft)
 	}
 }
 

@@ -45,10 +45,18 @@ type InternalService struct {
 	completionJobs   chan completionJob
 	completionWindow time.Duration
 	completionMax    int
+	performance      PerformanceObserver
 
 	// allocation subscribers
 	subMu sync.RWMutex
 	subs  map[string]chan<- *grpcv1.AllocationPlan // nodeID → push channel
+}
+
+// PerformanceObserver receives read-only, process-local scheduling timings.
+// Implementations must never feed observations back into Raft or scheduling.
+type PerformanceObserver interface {
+	ObservePendingSelection(scanned, selected int, duration time.Duration)
+	SetDispatcherQueueDepths(assignment, completion int)
 }
 
 type assignmentJob struct {
@@ -94,6 +102,10 @@ func NewInternalService(
 		completionMax:    claimBatchMaxSize,
 		subs:             make(map[string]chan<- *grpcv1.AllocationPlan),
 	}
+}
+
+func (s *InternalService) SetPerformanceObserver(observer PerformanceObserver) {
+	s.performance = observer
 }
 
 // ---------------------------------------------------------------------------
@@ -347,6 +359,9 @@ func (s *InternalService) AssignmentStream(stream grpcv1.SluiceInternal_Assignme
 			select {
 			case s.assignmentJobs <- job:
 				pendingResponses++
+				if s.performance != nil {
+					s.performance.SetDispatcherQueueDepths(len(s.assignmentJobs), len(s.completionJobs))
+				}
 			case <-stream.Context().Done():
 				return stream.Context().Err()
 			}
@@ -401,7 +416,13 @@ func (s *InternalService) runAssignmentDispatcher() {
 			default:
 			}
 		}
+		if s.performance != nil {
+			s.performance.SetDispatcherQueueDepths(len(s.assignmentJobs), len(s.completionJobs))
+		}
 		s.dispatchAssignments(batch)
+		if s.performance != nil {
+			s.performance.SetDispatcherQueueDepths(len(s.assignmentJobs), len(s.completionJobs))
+		}
 	}
 }
 
@@ -427,6 +448,7 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 	}
 
 	s.claimMu.Lock()
+	selectionStarted := time.Now()
 	allocations := s.fsm.GetAllAllocations()
 	pending := s.fsm.FindAllPendingTasks()
 	selector := newPendingSelector(pending, time.Now().UTC(), nil)
@@ -446,6 +468,9 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 			continue
 		}
 		selected = append(selected, selectedAssignment{index: i, request: request, task: task})
+	}
+	if s.performance != nil {
+		s.performance.ObservePendingSelection(len(pending), len(selected), time.Since(selectionStarted))
 	}
 
 	claimed := make(map[string]struct{}, len(selected))
@@ -729,6 +754,9 @@ func (s *InternalService) ResultStream(stream grpcv1.SluiceInternal_ResultStream
 			select {
 			case s.completionJobs <- job:
 				pendingResponses++
+				if s.performance != nil {
+					s.performance.SetDispatcherQueueDepths(len(s.assignmentJobs), len(s.completionJobs))
+				}
 			case <-stream.Context().Done():
 				return stream.Context().Err()
 			}
@@ -779,7 +807,13 @@ func (s *InternalService) runCompletionDispatcher() {
 			default:
 			}
 		}
+		if s.performance != nil {
+			s.performance.SetDispatcherQueueDepths(len(s.assignmentJobs), len(s.completionJobs))
+		}
 		s.dispatchCompletions(batch)
+		if s.performance != nil {
+			s.performance.SetDispatcherQueueDepths(len(s.assignmentJobs), len(s.completionJobs))
+		}
 	}
 }
 

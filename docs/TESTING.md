@@ -21,7 +21,9 @@ Case、单元回归测试和真实集成回归测试；修复后仍保留这些 
 3. 增加能在旧实现失败的最小 Unit Case。
 4. 增加走真实生产边界、能在旧实现失败的 Integration Case。
 5. 修复实现并运行 `make test`；调度/存储/共识改动同步更新 `docs/DESIGN.md`。
-6. 远程部署后复核健康、容量上限、积压下降、错误日志和故障恢复路径。
+6. 性能相关变化按 `AGENTS.md` 的固定字段重跑同形状基线，在 `docs/PERF.md` 追加前后
+   结果和瓶颈变化；环境不同时分开记录。
+7. 远程部署后复核健康、容量上限、积压下降、错误日志和故障恢复路径。
 
 ## 历史 Case 矩阵
 
@@ -36,6 +38,7 @@ Case、单元回归测试和真实集成回归测试；修复后仍保留这些 
 | SCHED-004 | 4900 Worker 同时拉取/完成不能形成无界请求尖峰；单节点每类未决请求≤8、Raft Claim/Complete 批次≤128，单请求等待不能关闭共享流；Leader 仍唯一分配且业务 Worker 并发不受 credit 限制 | `pkg/grpc.TestClaimClientBoundsPerNodeRaftRequests`、`TestInternalServiceBoundsGlobalRaftBatchSize` | `test/integration.TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery`（真实 8 节点/4900 执行 Worker/4096 任务、批次边界、lease 前排空、exactly-once final state） |
 | SCHED-005 | allocation/借用缩容只能停止 retiring Worker 获取下一条任务，不能 cancel 已 claim Processor 并制造 30 秒 lease 尾部；已开始任务必须直接提交一次最终状态 | `pkg/worker.TestPoolReconcileScaleDownRetiresAfterInflightCompletion` | `test/integration.TestAllocationScaleDownLetsInflightProcessorsFinish`（真实 3 节点 Raft/Assignment/Result/Worker，执行中缩容、零取消、无需 lease、exactly-once final state） |
 | PERF-001 | 50 个执行实例不能等于 50 voter；新成员超过奇数上限后必须是 non-voter，旧超大 voter 集合必须先转移 Leader 再安全 demote；2 万 pending 每批只能建一次索引；durable Raft pending 不能再逐条复制到 Leader 本地 Queue | `pkg/raft.TestDesiredVoterIDsUseStableOrdinalOrder`、`TestValidateMaxVotersRejectsUnsafeEvenQuorum`；`pkg/grpc.TestPendingSelectorIndexesLargeBacklogOncePerBatch`、`TestSubmitBatchDoesNotDuplicateRaftPendingIntoLocalQueue`；`pkg/api.TestRaftStatusEndpointReportsBoundedMembership` | `test/integration.TestNewMembersBeyondVoterLimitAreNonvoters`、`TestOversizedVoterSetTransfersLeaderAndMigrates`、`TestBoundedVotersDrainTwentyThousandHTTPTasks`（真实 7 节点 Raft + Follower HTTP/gRPC + Worker + Bolt 持久化，4 tenant/20000 条、全部排空且每条只执行一次） |
+| OBS-001 | 性能修改后必须重跑并保留同形状基线；Leader 必须以不写 Raft、不影响调度的方式暴露 Apply 延迟/批次、pending selection 和 dispatcher 队列；Follower 查询必须代理当前 Leader，不能随机返回本地全零 | `pkg/metrics.TestPerformanceRecordsRaftBatchAndSchedulerWindows`、`TestCommandShapeCountsReplicatedItems`、`TestCollectorStoresBoundedPerformanceHistory`；`pkg/grpc.TestDispatchAssignmentsObservesPendingScanBeforeRaftApply`；`pkg/api.TestPerformanceEndpointReturnsConfiguredLeaderDiagnostics`；`pkg/node.TestResolveLeaderAPIAddressUsesRegisteredOrRaftHost` | `test/integration.TestPerformanceDiagnosticsProxyFromFollower`（真实 3 节点、Follower HTTP batch、Leader Create/Claim/Complete、Worker/Result、Follower→Leader 诊断代理、最终 unfinished=0） |
 | RESULT-001 | Completion 必须跨所有节点流全局聚批；只有 Raft 已提交结果可 ACK，取消流不能确认未提交结果 | `pkg/grpc.TestResultStreamBatchesCompletionsAcrossNodeStreams`、`TestDispatchCompletionsDoesNotAcknowledgeCanceledJob` | `test/integration.TestGlobalLeaderBatchingDrainsWithoutLeaseRecovery` |
 | STEAL-001 | work steal 是 Leader 对既有空闲槽位的调度：同 tenant/同节点优先，本节点其他 tenant 可立即分配，跨节点 fresh 必须等待 5 秒 | `pkg/grpc.TestSelectPendingForSlot_PreservesLocalityAndAgeBoundary`、旧协议边界 `TestCanStealRequiresAgedPendingTask` | `test/integration.TestWorkStealUsesAgedPendingWork`（跨节点 5 秒边界） |
 | LEADER-001 | Leader 只调度与提交，不接收 allocation、不运行或获取业务任务；选主后立即清空 Worker，Follower 继续完成任务 | `pkg/allocator.TestReconcile_LeaderHasNoAllocation`、`TestReconcile_OnlyLeaderClearsStaleAllocation`、`pkg/worker.TestPoolWorker_GuardPreventsLeaderExecution`、`pkg/grpc.TestAssignmentStreamBatchesDistinctLeaderCommittedTasks` | `test/integration.TestLeaderIsControlPlaneOnly`、`TestFailover` |

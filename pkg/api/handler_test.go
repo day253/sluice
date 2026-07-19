@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	grpcpkg "github.com/day253/sluice/pkg/grpc"
+	metricspkg "github.com/day253/sluice/pkg/metrics"
 	"github.com/day253/sluice/pkg/queue"
 	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/types"
@@ -122,6 +123,35 @@ func TestRaftStatusEndpointReportsBoundedMembership(t *testing.T) {
 	}
 	if status.LeaderID != "node-0" || len(status.Voters) != 3 || len(status.Nonvoters) != 2 {
 		t.Fatalf("raft status = %+v", status)
+	}
+}
+
+func TestPerformanceEndpointReturnsConfiguredLeaderDiagnostics(t *testing.T) {
+	h, _, _ := setupHandler(t)
+	localOnly := false
+	h.SetPerformanceFunc(func(_ context.Context, local bool) (metricspkg.PerformanceDiagnostics, error) {
+		localOnly = local
+		return metricspkg.PerformanceDiagnostics{
+			NodeID: "node-0",
+			Current: metricspkg.PerformanceSnapshot{Raft: map[string]metricspkg.RaftOperationSnapshot{
+				raftpkg.OpClaimBatch: {Applies: 3, Items: 384, AverageBatch: 128},
+			}},
+		}, nil
+	})
+	recorder := httptest.NewRecorder()
+	newRouter(h).ServeHTTP(recorder, httptest.NewRequest("GET", "/api/v1/admin/performance?local=1", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("performance status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !localOnly {
+		t.Fatal("performance endpoint did not preserve local-only proxy guard")
+	}
+	var diagnostics metricspkg.PerformanceDiagnostics
+	if err := json.Unmarshal(recorder.Body.Bytes(), &diagnostics); err != nil {
+		t.Fatal(err)
+	}
+	if diagnostics.NodeID != "node-0" || diagnostics.Current.Raft[raftpkg.OpClaimBatch].Items != 384 {
+		t.Fatalf("performance diagnostics = %+v", diagnostics)
 	}
 }
 

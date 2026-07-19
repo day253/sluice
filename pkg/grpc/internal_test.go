@@ -43,6 +43,36 @@ type internalTestApplyResult struct{ response interface{} }
 func (r internalTestApplyResult) Error() error          { return nil }
 func (r internalTestApplyResult) Response() interface{} { return r.response }
 
+type recordingPerformanceObserver struct {
+	mu         sync.Mutex
+	selections int
+	scanned    int
+	selected   int
+	assignment int
+	completion int
+}
+
+func (o *recordingPerformanceObserver) ObservePendingSelection(scanned, selected int, _ time.Duration) {
+	o.mu.Lock()
+	o.selections++
+	o.scanned = scanned
+	o.selected = selected
+	o.mu.Unlock()
+}
+
+func (o *recordingPerformanceObserver) SetDispatcherQueueDepths(assignment, completion int) {
+	o.mu.Lock()
+	o.assignment = assignment
+	o.completion = completion
+	o.mu.Unlock()
+}
+
+func (o *recordingPerformanceObserver) snapshot() (int, int, int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.selections, o.scanned, o.selected
+}
+
 // legacyInternalService models an older leader during a rolling deployment:
 // claim/result streams exist, but AssignmentStream is unimplemented.
 type legacyInternalService struct {
@@ -493,6 +523,50 @@ func TestAssignmentStreamBatchesDistinctLeaderCommittedTasks(t *testing.T) {
 	}
 	if task := fsm.GetTask("leader-must-not-run"); task == nil || task.Status != types.TaskStatusPending {
 		t.Fatalf("leader-only task state = %+v, want pending", task)
+	}
+}
+
+func TestDispatchAssignmentsObservesPendingScanBeforeRaftApply(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	raft := &internalTestRaft{fsm: fsm}
+	raft.leader.Store(true)
+	for op, data := range map[string]interface{}{
+		raftpkg.OpUpsertTenant: types.TenantConfig{ID: "tenant-a", MaxWorkers: 2},
+		raftpkg.OpUpdateAllocation: map[string]*types.NodeAllocation{
+			"worker-1": {NodeID: "worker-1", Tenants: map[string]int{"tenant-a": 2}},
+		},
+		raftpkg.OpCreateTaskBatch: raftpkg.CreateTaskBatchData{Tasks: []raftpkg.CreateTaskData{
+			{TaskID: "task-1", TenantID: "tenant-a", Payload: `{}`},
+			{TaskID: "task-2", TenantID: "tenant-a", Payload: `{}`},
+		}},
+	} {
+		response := fsm.Apply(&hashicorpraft.Log{Data: raftpkg.MustMarshalCommand(op, data), Type: hashicorpraft.LogCommand})
+		if err, ok := response.(error); ok {
+			t.Fatalf("seed %s: %v", op, err)
+		}
+	}
+
+	service := NewInternalService("leader", fsm, raft, zap.NewNop())
+	observer := &recordingPerformanceObserver{}
+	service.SetPerformanceObserver(observer)
+	outcomes := make(chan assignmentOutcome, 1)
+	service.dispatchAssignments([]assignmentJob{{
+		ctx: context.Background(),
+		request: &grpcv1.AssignmentRequest{
+			RequestId: "request-1", NodeId: "worker-1", PreferredTenantId: "tenant-a",
+		},
+		outcome: outcomes,
+	}})
+	outcome := <-outcomes
+	if outcome.err != nil || outcome.task == nil {
+		t.Fatalf("assignment outcome = %+v", outcome)
+	}
+	selections, scanned, selected := observer.snapshot()
+	if selections != 1 || scanned != 2 || selected != 1 {
+		t.Fatalf("performance observation = calls:%d scanned:%d selected:%d", selections, scanned, selected)
+	}
+	if got := raft.applyCount.Load(); got != 1 {
+		t.Fatalf("Raft applies = %d, want one ClaimBatch", got)
 	}
 }
 

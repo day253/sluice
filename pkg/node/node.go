@@ -4,8 +4,10 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -63,6 +65,7 @@ type Node struct {
 	apiServer   *api.Server
 	claimClient *grpcpkg.ClaimClient
 	collector   *metrics.Collector
+	performance *metrics.Performance
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -114,6 +117,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 		return nil, fmt.Errorf("raft cluster: %w", err)
 	}
 	n.raftCluster = cluster
+	n.performance = metrics.NewPerformance()
 
 	// ---- Local durable queue ----
 	qPath := cfg.DataDir + "/queue"
@@ -130,7 +134,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	}
 	n.queue = q
 
-	bridge := &raftApplierBridge{cluster: cluster}
+	bridge := &raftApplierBridge{cluster: cluster, performance: n.performance}
 
 	// ---- Worker pool (followers execute; leader is control-plane only) ----
 	n.pool = worker.NewPool(cfg.NodeID, q, cluster.FSM(), bridge, processor, logger)
@@ -148,14 +152,17 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	// ---- gRPC services (shared by HTTP adapter + gRPC server) ----
 	grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(), bridge, n.pool, logger)
 	internalSvc := grpcpkg.NewInternalService(cfg.NodeID, cluster.FSM(), bridge, logger)
+	internalSvc.SetPerformanceObserver(n.performance)
 
 	// ---- Metrics collector (server-side history) ----
 	n.collector = metrics.NewCollector(cluster.FSM(), logger)
+	n.collector.SetPerformance(n.performance)
 
 	// ---- HTTP handler (adapts gRPC service) ----
 	httpHandler := api.NewHandler(cfg.NodeID, grpcSvc, logger)
 	httpHandler.SetCollector(metricsAdapter{n.collector})
 	httpHandler.SetRaftStatusFunc(cluster.MembershipStatus)
+	httpHandler.SetPerformanceFunc(n.performanceDiagnostics)
 	httpHandler.SetJoinFunc(func(nodeID, raftAddr, httpAddr string, workers int) error {
 		if err := cluster.AddServer(nodeID, raftAddr, cfg.MaxRaftVoters); err != nil {
 			return err
@@ -426,28 +433,110 @@ func (n *Node) Pool() *worker.Pool             { return n.pool }
 func (n *Node) AllocEngine() *allocator.Engine { return n.allocEngine }
 func (n *Node) TenantManager() *tenant.Manager { return n.tenantMgr }
 
+func (n *Node) performanceDiagnostics(ctx context.Context, localOnly bool) (metrics.PerformanceDiagnostics, error) {
+	if n.raftCluster.IsLeader() {
+		return n.collector.PerformanceDiagnostics(n.cfg.NodeID), nil
+	}
+	if localOnly {
+		return metrics.PerformanceDiagnostics{}, fmt.Errorf("local node %s is not the leader", n.cfg.NodeID)
+	}
+	leaderRaft := n.raftCluster.LeaderAddr()
+	if leaderRaft == "" {
+		return metrics.PerformanceDiagnostics{}, fmt.Errorf("raft leader is unknown")
+	}
+	leaderAPI, err := resolveLeaderAPIAddress(leaderRaft, n.raftCluster.FSM().GetAllNodes(), n.cfg.APIAddress)
+	if err != nil {
+		return metrics.PerformanceDiagnostics{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://"+leaderAPI+"/api/v1/admin/performance?local=1", nil)
+	if err != nil {
+		return metrics.PerformanceDiagnostics{}, err
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		return metrics.PerformanceDiagnostics{}, fmt.Errorf("query leader %s: %w", leaderAPI, err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return metrics.PerformanceDiagnostics{}, fmt.Errorf("leader %s returned %s", leaderAPI, response.Status)
+	}
+	var diagnostics metrics.PerformanceDiagnostics
+	if err := json.NewDecoder(response.Body).Decode(&diagnostics); err != nil {
+		return metrics.PerformanceDiagnostics{}, fmt.Errorf("decode leader diagnostics: %w", err)
+	}
+	return diagnostics, nil
+}
+
+func resolveLeaderAPIAddress(leaderRaft string, nodes map[string]*types.NodeInfo, localAPI string) (string, error) {
+	for _, member := range nodes {
+		if member.RaftAddress != leaderRaft {
+			continue
+		}
+		if host, port, err := net.SplitHostPort(member.Address); err == nil &&
+			host != "" && host != "0.0.0.0" && host != "::" && port != "" {
+			return member.Address, nil
+		}
+	}
+	leaderHost, _, err := net.SplitHostPort(leaderRaft)
+	if err != nil || leaderHost == "" {
+		return "", fmt.Errorf("invalid raft leader address %q", leaderRaft)
+	}
+	_, apiPort, err := net.SplitHostPort(localAPI)
+	if err != nil || apiPort == "" {
+		return "", fmt.Errorf("invalid local API address %q", localAPI)
+	}
+	return net.JoinHostPort(leaderHost, apiPort), nil
+}
+
 // ---------------------------------------------------------------------------
 // raftApplierBridge
 // ---------------------------------------------------------------------------
 
 type raftApplierBridge struct {
-	cluster *raftpkg.Cluster
+	cluster     *raftpkg.Cluster
+	performance *metrics.Performance
 }
 
 func (b *raftApplierBridge) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {
+	started := time.Now()
 	future := b.cluster.GetRaft().Apply(cmd, time.Duration(timeoutMs)*time.Millisecond)
-	return &applyResultBridge{future: future}
+	return &applyResultBridge{future: future, observe: func(err error) {
+		if b.performance != nil {
+			b.performance.ObserveRaftApply(cmd, time.Since(started), err)
+		}
+	}}
 }
 
 func (b *raftApplierBridge) IsLeader() bool     { return b.cluster.IsLeader() }
 func (b *raftApplierBridge) LeaderAddr() string { return b.cluster.LeaderAddr() }
 
 type applyResultBridge struct {
-	future hashicorpraft.ApplyFuture
+	future  hashicorpraft.ApplyFuture
+	once    sync.Once
+	observe func(error)
 }
 
-func (r *applyResultBridge) Error() error          { return r.future.Error() }
-func (r *applyResultBridge) Response() interface{} { return r.future.Response() }
+func (r *applyResultBridge) Error() error {
+	err := r.future.Error()
+	r.record(err)
+	return err
+}
+
+func (r *applyResultBridge) Response() interface{} {
+	response := r.future.Response()
+	r.record(r.future.Error())
+	return response
+}
+
+func (r *applyResultBridge) record(err error) {
+	r.once.Do(func() {
+		if r.observe != nil {
+			r.observe(err)
+		}
+	})
+}
 
 // metricsAdapter bridges metrics.Collector → api.MetricsData for HTTP.
 type metricsAdapter struct{ c *metrics.Collector }

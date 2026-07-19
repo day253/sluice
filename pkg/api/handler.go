@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	grpcpkg "github.com/day253/sluice/pkg/grpc"
 	grpcv1 "github.com/day253/sluice/pkg/grpc/v1"
+	"github.com/day253/sluice/pkg/metrics"
 	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/types"
 )
@@ -22,11 +24,12 @@ import (
 // Handler adapts the gRPC Sluice service to HTTP REST.  Every endpoint
 // converts the HTTP request to a gRPC call and the response back to JSON.
 type Handler struct {
-	nodeID         string
-	svc            *grpcpkg.Service
-	joinFunc       func(nodeID, raftAddr, httpAddr string, workers int) error
-	raftStatusFunc func() (raftpkg.MembershipStatus, error)
-	collector      interface {
+	nodeID          string
+	svc             *grpcpkg.Service
+	joinFunc        func(nodeID, raftAddr, httpAddr string, workers int) error
+	raftStatusFunc  func() (raftpkg.MembershipStatus, error)
+	performanceFunc func(context.Context, bool) (metrics.PerformanceDiagnostics, error)
+	collector       interface {
 		Query(name string) ([]MetricsData, int)
 	}
 	logger *zap.Logger
@@ -63,6 +66,13 @@ func (h *Handler) SetRaftStatusFunc(fn func() (raftpkg.MembershipStatus, error))
 	h.raftStatusFunc = fn
 }
 
+// SetPerformanceFunc configures leader-local performance diagnostics. The
+// boolean is true for an internal local-only proxy request and prevents loops
+// if leadership changes while a follower is forwarding the read.
+func (h *Handler) SetPerformanceFunc(fn func(context.Context, bool) (metrics.PerformanceDiagnostics, error)) {
+	h.performanceFunc = fn
+}
+
 // RegisterRoutes attaches all endpoints to the given router.
 func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/tasks", h.submitTask).Methods("POST")
@@ -77,6 +87,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/admin/nodes", h.listNodes).Methods("GET")
 	r.HandleFunc("/api/v1/admin/allocations", h.getAllocations).Methods("GET")
 	r.HandleFunc("/api/v1/admin/raft", h.raftStatus).Methods("GET")
+	r.HandleFunc("/api/v1/admin/performance", h.performance).Methods("GET")
 
 	r.HandleFunc("/api/v1/cluster/join", h.joinCluster).Methods("POST")
 	r.HandleFunc("/api/v1/metrics", h.metrics).Methods("GET")
@@ -95,6 +106,19 @@ func (h *Handler) raftStatus(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	h.writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) performance(w http.ResponseWriter, r *http.Request) {
+	if h.performanceFunc == nil {
+		h.writeError(w, http.StatusInternalServerError, "performance diagnostics not configured")
+		return
+	}
+	diagnostics, err := h.performanceFunc(r.Context(), r.URL.Query().Get("local") == "1")
+	if err != nil {
+		h.writeError(w, http.StatusServiceUnavailable, "performance diagnostics unavailable: "+err.Error())
+		return
+	}
+	h.writeJSON(w, http.StatusOK, diagnostics)
 }
 
 // ---------------------------------------------------------------------------

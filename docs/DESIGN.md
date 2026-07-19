@@ -342,6 +342,32 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   30 秒 lease 尾部消失。测试窗口内所有 Pod 的执行中断、lease recovery、提交失败与
   error 日志均为 0，最终四个租户 unfinished 均为 0。
 
+### OBS-001：性能改动后缺少阶段化证据
+
+- **风险**：PERF-001 消除了每个 slot 重扫 pending，但 50000 条复测证明每个 128 条
+  dispatcher 批次仍复制排序全部剩余 pending；如果继续引用 20000 条结论，会把已经
+  转移到 selection 的瓶颈误认为仍是 Worker 或 quorum。只看端到端时间也无法区分
+  Apply 变慢、批次填充不足和 Leader dispatcher 排队。
+- **规则**：任何影响提交、调度、共识、存储、执行或恢复的变化，都必须重跑固定形状
+  基线并在 `docs/PERF.md` 追加环境、拓扑、负载、提交/排空/端到端结果和新限制；旧结果
+  保留，环境不同不得直接计算提升百分比。
+- **实现**：Leader 进程内记录每类 Raft Apply 的次数、任务数、错误、批次和延迟；记录
+  pending selection 的扫描/选中数与耗时，以及两个全局 dispatcher 队列深度。Collector
+  每秒把区间值采样到 174 点历史；`/api/v1/admin/performance` 同时返回累计当前快照和
+  历史，Follower 在服务端代理当前 Leader。
+- **数据边界**：累计值和队列深度是当前 Leader 进程镜像，174 点数据是有界历史；两者
+  都不进入 Raft/FSM/Snapshot，不参与分配、借用或 lease 决策。Leader 切换后读取新
+  Leader 的本地观测，不承诺跨 Leader 拼接无缝时间线；当前也不提供逐 non-voter
+  replication lag。
+- **正确性边界**：观测只包裹既有 ApplyFuture 和选择流程，不增加或重排任何 Raft log，
+  不改变 Leader 唯一分配、Worker 执行、批次上限、超时和最终状态语义。指标失败不能
+  阻断任务路径。
+- **回归覆盖**：`pkg/metrics` 验证累计/区间窗口、批次解析和历史；`pkg/grpc` 验证真实
+  pending 选择在 Claim Apply 前记录；`pkg/api` 验证只读端点。真实 3 节点
+  `TestPerformanceDiagnosticsProxyFromFollower` 走 Follower HTTP、Leader Raft、Worker、
+  Result 和 Follower→Leader 诊断代理，要求 Create/Claim/Complete 与 selection 可见且
+  最终 unfinished=0。
+
 ### RESULT-001：每节点完成流放大 Raft 日志
 
 - **风险**：Assignment 修复后，大量节点可能同时完成任务；若 ResultStream 各自提交
