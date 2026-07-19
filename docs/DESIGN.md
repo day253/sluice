@@ -391,6 +391,25 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   的生产 HTTP 页面验证脚本随 Leader 诊断一起交付；远程浏览器实际移动鼠标后断言 tooltip
   可见、包含时间/系列/数值且页面没有 console error。
 
+### UI-005：图表原始 JSON 可追溯
+
+- **需求**：Worker 分配、租户未完成任务、Raft Apply 和调度器四张图都提供可直接在新页
+  打开的 JSON 链接。Worker 链接只返回 `allocated-workers:node:`，租户链接只返回
+  `unfinished:`；两张 Leader 性能图指向同一份 `/api/v1/admin/performance`，保证当前值
+  和历史仍来自同一 Leader。
+- **接口边界**：`GET /api/v1/metrics?prefix=<prefix>` 新增只读 include filter，并可继续与
+  `performance=0` 组合。Collector 在复制 174 点 ring buffer 前同时应用 include/exclude，
+  因此原始页面不需要下载整包无关 metrics。参数不创建新历史、不写 Raft/FSM、不改变采样
+  和每秒 Dashboard 轮询；用户未点击 JSON 链接时也不会多发请求。
+- **范围**：链接返回服务端已有的原始存储单位和字段，不把四张图重新包装成新的聚合 API，
+  也不承诺跨 Leader 或跨负载均衡请求的逐采样原子快照。性能 JSON 仍由 Follower 代理 Leader；
+  workload 历史仍属于命中节点的有界本地镜像。
+- **回归覆盖**：`pkg/metrics.TestCollectorFiltersMetricHistoriesByPrefix` 验证复制前筛选且每条
+  仍为 174 点；`pkg/api.TestMetricsEndpointCanFilterHistoriesByPrefix` 验证 HTTP 参数传递；
+  `pkg/webui.TestDashboardChartsExposeRawJSONLinks` 固定四张图的新页链接。真实 3 节点
+  `TestPerformanceDiagnosticsProxyFromFollower` 验证 Follower HTTP 返回的 prefix 数据只含目标
+  系列、保留 174 点且 Dashboard 交付四个链接；远程浏览器逐个打开并校验 JSON 和零 console error。
+
 ### RESULT-001：每节点完成流放大 Raft 日志
 
 - **风险**：Assignment 修复后，大量节点可能同时完成任务；若 ResultStream 各自提交

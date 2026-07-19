@@ -58,6 +58,30 @@ func TestDashboardChartsExposeNearestPointTooltip(t *testing.T) {
 	}
 }
 
+func TestDashboardChartsExposeRawJSONLinks(t *testing.T) {
+	handler := Handler(http.NotFoundHandler())
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	body := recorder.Body.String()
+	for _, fragment := range []string{
+		`href="/api/v1/metrics?prefix=allocated-workers%3Anode%3A&amp;performance=0"`,
+		`aria-label="View worker allocation history as JSON"`,
+		`href="/api/v1/metrics?prefix=unfinished%3A&amp;performance=0"`,
+		`aria-label="View unfinished task history as JSON"`,
+		`aria-label="View Raft Apply history as JSON"`,
+		`aria-label="View scheduler history as JSON"`,
+		`target="_blank" rel="noopener"`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Errorf("dashboard is missing raw JSON link fragment %q", fragment)
+		}
+	}
+}
+
 func TestPerformanceJSONRouteStillDelegatesToAPI(t *testing.T) {
 	const diagnostics = `{"node_id":"leader-1","current":{"raft":{}},"history":{}}`
 	apiCalled := false

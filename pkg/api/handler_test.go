@@ -72,11 +72,13 @@ func (p *mockProcessor) Process(ctx context.Context, taskID, tenantID string, pa
 
 type recordingMetricsCollector struct {
 	name          string
+	includePrefix string
 	excludePrefix string
 }
 
-func (c *recordingMetricsCollector) Query(name, excludePrefix string) ([]MetricsData, int) {
+func (c *recordingMetricsCollector) Query(name, includePrefix, excludePrefix string) ([]MetricsData, int) {
 	c.name = name
+	c.includePrefix = includePrefix
 	c.excludePrefix = excludePrefix
 	return []MetricsData{{Name: "unfinished:company-a"}}, 1
 }
@@ -197,8 +199,22 @@ func TestMetricsEndpointCanExcludePerformanceHistories(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("metrics status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
-	if collector.name != "" || collector.excludePrefix != "performance:" {
-		t.Fatalf("metrics query name=%q exclude=%q", collector.name, collector.excludePrefix)
+	if collector.name != "" || collector.includePrefix != "" || collector.excludePrefix != "performance:" {
+		t.Fatalf("metrics query name=%q include=%q exclude=%q", collector.name, collector.includePrefix, collector.excludePrefix)
+	}
+}
+
+func TestMetricsEndpointCanFilterHistoriesByPrefix(t *testing.T) {
+	h, _, _ := setupHandler(t)
+	collector := &recordingMetricsCollector{}
+	h.SetCollector(collector)
+	recorder := httptest.NewRecorder()
+	newRouter(h).ServeHTTP(recorder, httptest.NewRequest("GET", "/api/v1/metrics?prefix=unfinished%3A&performance=0", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if collector.name != "" || collector.includePrefix != "unfinished:" || collector.excludePrefix != "performance:" {
+		t.Fatalf("metrics query name=%q include=%q exclude=%q", collector.name, collector.includePrefix, collector.excludePrefix)
 	}
 }
 

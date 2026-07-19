@@ -190,14 +190,27 @@ type NamedVarData struct {
 // QueryNamed returns named historical data. An optional prefix excludes
 // matching series before their ring buffers are copied.
 func (c *Collector) QueryNamed(name string, excludePrefix ...string) []NamedVarData {
+	excluded := ""
+	if len(excludePrefix) > 0 {
+		excluded = excludePrefix[0]
+	}
+	return c.QueryNamedFiltered(name, "", excluded)
+}
+
+// QueryNamedFiltered returns either one exact metric or every metric matching
+// includePrefix. Both prefix filters are applied before copying ring buffers.
+func (c *Collector) QueryNamedFiltered(name, includePrefix, excludePrefix string) []NamedVarData {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	excluded := func(metricName string) bool {
-		return len(excludePrefix) > 0 && excludePrefix[0] != "" && strings.HasPrefix(metricName, excludePrefix[0])
+		return excludePrefix != "" && strings.HasPrefix(metricName, excludePrefix)
+	}
+	included := func(metricName string) bool {
+		return includePrefix == "" || strings.HasPrefix(metricName, includePrefix)
 	}
 
 	if name != "" {
-		if excluded(name) {
+		if excluded(name) || !included(name) {
 			return nil
 		}
 		if v, ok := c.vars[name]; ok {
@@ -208,7 +221,7 @@ func (c *Collector) QueryNamed(name string, excludePrefix ...string) []NamedVarD
 
 	out := make([]NamedVarData, 0, len(c.vars))
 	for n, v := range c.vars {
-		if excluded(n) {
+		if excluded(n) || !included(n) {
 			continue
 		}
 		d := v.Query()

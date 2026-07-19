@@ -877,6 +877,38 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		return foundWorkload
 	}, 15*time.Second, "follower workload histories without local performance series")
 
+	tc.waitFor(func() bool {
+		response, err := client.Get("http://" + tc.httpAddrs[follower] + "/api/v1/metrics?prefix=unfinished%3A&performance=0")
+		if err != nil {
+			return false
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return false
+		}
+		var histories []struct {
+			Name  string  `json:"name"`
+			Secs  []int64 `json:"secs"`
+			Mins  []int64 `json:"mins"`
+			Hours []int64 `json:"hours"`
+			Days  []int64 `json:"days"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&histories); err != nil || len(histories) == 0 {
+			return false
+		}
+		foundObserved := false
+		for _, history := range histories {
+			if !strings.HasPrefix(history.Name, "unfinished:") ||
+				len(history.Secs)+len(history.Mins)+len(history.Hours)+len(history.Days) != 174 {
+				return false
+			}
+			if history.Name == "unfinished:observed" {
+				foundObserved = true
+			}
+		}
+		return foundObserved
+	}, 15*time.Second, "follower prefix-filtered unfinished histories")
+
 	dashboardResponse, err := client.Get("http://" + tc.httpAddrs[follower] + "/")
 	if err != nil {
 		t.Fatalf("GET dashboard through follower: %v", err)
@@ -900,6 +932,10 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		`canvas.addEventListener('pointermove',event=>moveChartHover(canvas,event))`,
 		`if(id!==canvas.id)hideChartHover($(id))`,
 		`Number.isFinite(selected.item.limit)`,
+		`href="/api/v1/metrics?prefix=allocated-workers%3Anode%3A&amp;performance=0"`,
+		`href="/api/v1/metrics?prefix=unfinished%3A&amp;performance=0"`,
+		`aria-label="View Raft Apply history as JSON"`,
+		`aria-label="View scheduler history as JSON"`,
 	} {
 		if !strings.Contains(string(dashboardBody), fragment) {
 			t.Errorf("production dashboard is missing performance fragment %q", fragment)

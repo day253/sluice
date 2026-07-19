@@ -113,3 +113,27 @@ func TestCollectorStoresUnfinishedAndAllocatedWorkersByTenantAndNode(t *testing.
 	assertLatest("allocated-workers:node:node-1", 7)
 	assertLatest("allocated-workers:total", 7)
 }
+
+func TestCollectorFiltersMetricHistoriesByPrefix(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyMetricCommand(t, fsm, raftpkg.OpUpsertTenant, types.TenantConfig{ID: "globex", MaxWorkers: 10})
+	applyMetricCommand(t, fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{TaskID: "task-1", TenantID: "globex"})
+	applyMetricCommand(t, fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"node-1": {NodeID: "node-1", Tenants: map[string]int{"globex": 7}},
+	})
+
+	collector := NewCollector(fsm, zap.NewNop())
+	collector.collect()
+	filtered := collector.QueryNamedFiltered("", "unfinished:", "performance:")
+	if len(filtered) != 2 {
+		t.Fatalf("unfinished history count = %d, want 2", len(filtered))
+	}
+	for _, history := range filtered {
+		if !strings.HasPrefix(history.Name, "unfinished:") {
+			t.Fatalf("prefix-filtered query retained %q", history.Name)
+		}
+		if got := len(history.Secs) + len(history.Mins) + len(history.Hours) + len(history.Days); got != 174 {
+			t.Fatalf("history %q points = %d, want 174", history.Name, got)
+		}
+	}
+}
