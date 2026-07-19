@@ -316,3 +316,26 @@ Complete 为 188/20000/106；三者 error 均为 0，最终 unfinished=0，assig
 `/metrics?performance=0` 返回 60 条 workload/allocation 历史且全部为 174 点，
 `performance:` 条目为 0。浏览器连接 `sluice-36`、诊断来源 Leader `sluice-3` 时，
 Create/Claim/Complete 当前值与历史峰值均非零，证明 Follower 页面没有再混用本地性能历史。
+
+### 7.2 174 点悬浮交互复核（2026-07-20）
+
+版本 `9bdde75` 在同一台远程 MicroK8s、50 Pod、5 voter/45 non-voter、每 Pod 100 Worker
+上复核。负载仍是 4 tenant 按条目轮转的 20000 条任务、HTTP 每批 500、4 并发请求；
+浏览器保持可见并每秒刷新，鼠标停在图上但压测期间不移动。测试前经历两次 50 Pod
+OrderedReady 滚动和一轮 500 条交互预热，Leader 为 `sluice-sluice-1`，因此不是上一节
+`b70959e`/Leader `sluice-sluice-3` 的干净隔离 A/B。
+
+| 版本/页面状态 | accepted | 排空 | 端到端 | 吞吐 | t50 | t90 |
+|---|---:|---:|---:|---:|---:|---:|
+| `9bdde75`，四图支持最近点悬浮且跨图只保留一个 tooltip | 3.415s | 30.551s | 33.966s | 588.8 task/s | 21.142s | 30.826s |
+
+本轮 Create 为 40 Apply/20000 items/平均批次 500/平均 Apply 240.378ms，Claim 为
+169/20000/118.3/129.823ms，Complete 为 198/20000/101.0/149.188ms；三者 error 均为
+0，最终 unfinished=0，assignment/completion 队列均为 0。选择 20000 条任务扫描
+1688091 条 pending（84.4x），与上一节 81.5x 同量级，主要瓶颈仍是每批重复扫描 pending。
+
+相对上一节最终单轮结果，accepted 从 3.617s 改善到 3.415s，但端到端从 29.617s 增到
+33.966s、吞吐低 12.8%。由于 Leader、滚动历史和 FSM 热状态不同，这只是回归预警，
+不能归因于悬浮交互。实现没有增加接口或轮询；每秒绘图复用原本已经构造的 174 点数组，
+跨图清理只在 pointer move 时遍历 4 个图，压测静止鼠标时不执行。若后续要把该波动定性为
+前端开销或服务端退化，必须在相同干净 Snapshot 上做多轮 tooltip on/off A/B 并报告中位数。
