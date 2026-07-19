@@ -898,6 +898,7 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		`getJSON('/api/v1/admin/performance')`,
 		`.chart-tooltip{`,
 		`canvas.addEventListener('pointermove',event=>moveChartHover(canvas,event))`,
+		`if(id!==canvas.id)hideChartHover($(id))`,
 		`Number.isFinite(selected.item.limit)`,
 	} {
 		if !strings.Contains(string(dashboardBody), fragment) {

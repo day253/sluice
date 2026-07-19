@@ -46,6 +46,7 @@ func TestDashboardChartsExposeNearestPointTooltip(t *testing.T) {
 		`const chartTimeLabel=index=>`,
 		`tooltip.setAttribute('role','tooltip')`,
 		`canvas.addEventListener('pointermove',event=>moveChartHover(canvas,event))`,
+		`if(id!==canvas.id)hideChartHover($(id))`,
 		`Number.isFinite(selected.item.limit)`,
 		`' workers'`,
 		`' tasks'`,
