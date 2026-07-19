@@ -833,6 +833,29 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		diagnostics.Current.Raft[raftpkg.OpCompleteBatch].Errors != 0 {
 		t.Fatalf("performance diagnostics reported Raft errors: %+v", diagnostics.Current.Raft)
 	}
+
+	dashboardResponse, err := client.Get("http://" + tc.httpAddrs[follower] + "/")
+	if err != nil {
+		t.Fatalf("GET dashboard through follower: %v", err)
+	}
+	dashboardBody, err := io.ReadAll(dashboardResponse.Body)
+	dashboardResponse.Body.Close()
+	if err != nil {
+		t.Fatalf("read dashboard through follower: %v", err)
+	}
+	if dashboardResponse.StatusCode != http.StatusOK {
+		t.Fatalf("dashboard status = %d, want 200", dashboardResponse.StatusCode)
+	}
+	for _, fragment := range []string{
+		`id="performance-title"`,
+		`id="performance-raft-chart"`,
+		`id="performance-scheduler-chart"`,
+		`href="/api/v1/admin/performance"`,
+	} {
+		if !strings.Contains(string(dashboardBody), fragment) {
+			t.Errorf("production dashboard is missing performance fragment %q", fragment)
+		}
+	}
 }
 
 // TestWorkStealUsesAgedPendingWork verifies the cross-tenant fallback path.

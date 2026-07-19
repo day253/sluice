@@ -26,13 +26,14 @@ button,input,select{font:inherit}button{cursor:pointer}.hidden{display:none!impo
 .chart-summary{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}.chart-current{font-size:30px;font-weight:760;letter-spacing:-.05em}.chart-unit{color:var(--muted);font-size:12px}.chart-wrap{height:230px;position:relative}.chart-wrap canvas{display:block;width:100%;height:100%}
 .chart-legend{display:flex;flex-wrap:wrap;gap:8px 16px;padding:0 19px 16px}.legend-item{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:10px}.legend-item i{width:8px;height:8px;border-radius:50%;flex:0 0 auto}.legend-item strong{color:var(--ink);font-size:11px}.legend-empty{color:var(--muted);font-size:11px}
 .chart-layout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:16px;align-items:stretch}.meter{height:5px;background:#e9edf2;border-radius:999px;overflow:hidden;margin-top:12px}.meter>i{display:block;height:100%;border-radius:inherit;background:var(--blue);min-width:2px}
+.performance-panel{margin-bottom:16px}.performance-actions{display:flex;align-items:center;gap:10px}.performance-source{color:var(--muted);font-size:11px;text-align:right}.btn-link{display:inline-flex;align-items:center;text-decoration:none;white-space:nowrap}.diagnostic-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:18px}.diagnostic-card{border:1px solid var(--line);border-radius:11px;padding:13px 14px;background:var(--surface-2);min-width:0}.diagnostic-label{color:var(--muted);font-size:10px;font-weight:750;letter-spacing:.06em;text-transform:uppercase}.diagnostic-value{font-size:22px;font-weight:760;letter-spacing:-.04em;margin-top:9px;white-space:nowrap}.diagnostic-note{font-size:10px;color:var(--muted);margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.performance-charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.performance-chart{border:1px solid var(--line);border-radius:11px;overflow:hidden}.performance-chart-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:12px 14px 0}.performance-chart-title{font-size:11px;font-weight:720}.performance-chart-note{font-size:10px;color:var(--muted)}.performance-chart .chart-wrap{height:190px;margin:0 12px}.performance-chart .chart-legend{padding:0 14px 12px}
 .toolbar{display:flex;align-items:center;gap:8px}.quick-count{height:34px;display:flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:8px;padding:0 8px;background:#fff;color:var(--muted);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}.quick-count input{width:62px;border:0;border-left:1px solid var(--line);padding:4px 0 4px 8px;outline:0;color:var(--ink);font-size:12px;font-weight:720;background:transparent}.btn{border:1px solid transparent;border-radius:8px;padding:8px 11px;font-size:12px;font-weight:680;background:var(--surface);color:var(--ink);transition:.15s ease}.btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(26,39,57,.08)}.btn:disabled{cursor:wait;opacity:.55;transform:none;box-shadow:none}.btn-secondary{border-color:var(--line)}.btn-primary{background:var(--ink);color:#fff}.btn-danger{border-color:#f1cbd0;color:var(--red);background:#fff}.icon-btn{padding:6px 9px;border-color:var(--line);color:var(--blue);background:#fff;white-space:nowrap}
 .table-wrap{overflow:auto}.data-table{width:100%;border-collapse:collapse;min-width:820px}.data-table th{text-align:left;padding:10px 16px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;font-weight:750;background:#fbfcfd;border-bottom:1px solid var(--line)}.data-table td{padding:13px 16px;border-bottom:1px solid var(--line);vertical-align:middle;font-size:12px}.data-table tbody tr{transition:background .15s}.data-table tbody tr:hover{background:#f8fbff}.data-table tbody tr:last-child td{border-bottom:0}.tenant-name{font-weight:720}.tenant-id{color:var(--muted);font-size:10px;margin-top:3px}.state-badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:5px 8px;font-size:10px;font-weight:700;background:var(--green-soft);color:var(--green)}.state-badge.idle{background:#eef1f5;color:#6a7687}.state-badge.queued{background:var(--amber-soft);color:var(--amber)}.quota-cell{min-width:150px}.quota-line{display:flex;justify-content:space-between;gap:10px;margin-bottom:5px}.quota-line span:last-child{color:var(--muted);font-size:10px}.placement{display:flex;flex-wrap:wrap;gap:4px}.placement span{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#eef3f9;color:#53647a;padding:3px 6px;border-radius:5px;font-size:9px}.empty{padding:38px!important;text-align:center;color:var(--muted)}
 dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));box-shadow:0 24px 90px rgba(16,24,40,.25);color:var(--ink)}dialog::backdrop{background:rgba(23,32,46,.48);backdrop-filter:blur(3px)}.dialog-head{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid var(--line)}.dialog-head h2{font-size:16px;margin:0}.dialog-close{border:0;background:transparent;color:var(--muted);font-size:20px;padding:0 4px}.dialog-body{padding:20px}.form-grid{display:grid;gap:13px}.field label{display:block;font-size:11px;color:var(--muted);font-weight:680;margin-bottom:6px}.field input,.field select{width:100%;border:1px solid #d8dee7;border-radius:8px;padding:10px 11px;color:var(--ink);outline:none;background:#fff}.field input:focus,.field select:focus{border-color:#8bb8f4;box-shadow:0 0 0 3px #e9f2ff}.dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.dialog-actions .danger-left{margin-right:auto}
 .toast{position:fixed;right:22px;bottom:22px;background:var(--ink);color:#fff;padding:11px 14px;border-radius:9px;font-size:12px;box-shadow:0 12px 34px rgba(16,24,40,.25);z-index:30;max-width:330px}
-@media(max-width:1080px){.summary-grid{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:800px){.chart-layout{grid-template-columns:1fr}}
-@media(max-width:700px){.topbar{height:auto;min-height:64px;padding:12px 16px;flex-wrap:wrap;gap:10px}.brand{min-width:0}.brand-sub,.top-meta .leader-meta{display:none}.top-meta{margin-left:auto}.shell{padding:20px 14px 36px}.page-heading{align-items:flex-start}.summary-grid{grid-template-columns:repeat(2,1fr)}.metric-card{padding:14px}.metric-value{font-size:24px}.summary-grid .metric-card:last-child{grid-column:span 2}.panel-head{align-items:flex-start;flex-direction:column}.toolbar{width:100%;flex-wrap:wrap}.quick-count{flex:1}.toolbar .btn{flex:1}.updated{display:none}}
+@media(max-width:1080px){.summary-grid{grid-template-columns:repeat(3,1fr)}.diagnostic-grid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:800px){.chart-layout,.performance-charts{grid-template-columns:1fr}.diagnostic-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:700px){.topbar{height:auto;min-height:64px;padding:12px 16px;flex-wrap:wrap;gap:10px}.brand{min-width:0}.brand-sub,.top-meta .leader-meta{display:none}.top-meta{margin-left:auto}.shell{padding:20px 14px 36px}.page-heading{align-items:flex-start}.summary-grid{grid-template-columns:repeat(2,1fr)}.metric-card{padding:14px}.metric-value{font-size:24px}.summary-grid .metric-card:last-child{grid-column:span 2}.panel-head{align-items:flex-start;flex-direction:column}.performance-actions{width:100%;justify-content:space-between}.performance-source{text-align:left}.toolbar{width:100%;flex-wrap:wrap}.quick-count{flex:1}.toolbar .btn{flex:1}.updated{display:none}}
 </style>
 </head>
 <body>
@@ -77,6 +78,34 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
     </section>
   </div>
 
+  <section class="panel performance-panel" aria-labelledby="performance-title">
+    <div class="panel-head">
+      <div><h2 class="panel-title" id="performance-title">Performance diagnostics</h2><div class="panel-kicker">Leader-local consensus and scheduler pressure · read-only 174-point history</div></div>
+      <div class="performance-actions"><span class="performance-source" id="performance-source">Waiting for Leader diagnostics…</span><a class="btn btn-secondary btn-link" href="/api/v1/admin/performance" target="_blank" rel="noopener">View JSON ↗</a></div>
+    </div>
+    <div class="panel-body">
+      <div class="diagnostic-grid" aria-label="Current performance diagnostics">
+        <article class="diagnostic-card"><div class="diagnostic-label">Create Apply</div><div class="diagnostic-value" id="performance-create-apply">—</div><div class="diagnostic-note" id="performance-create-note">No samples</div></article>
+        <article class="diagnostic-card"><div class="diagnostic-label">Claim Apply</div><div class="diagnostic-value" id="performance-claim-apply">—</div><div class="diagnostic-note" id="performance-claim-note">No samples</div></article>
+        <article class="diagnostic-card"><div class="diagnostic-label">Complete Apply</div><div class="diagnostic-value" id="performance-complete-apply">—</div><div class="diagnostic-note" id="performance-complete-note">No samples</div></article>
+        <article class="diagnostic-card"><div class="diagnostic-label">Pending scan</div><div class="diagnostic-value" id="performance-scan-ratio">—</div><div class="diagnostic-note" id="performance-scan-note">No selections</div></article>
+        <article class="diagnostic-card"><div class="diagnostic-label">Queues A / C</div><div class="diagnostic-value" id="performance-queues">—</div><div class="diagnostic-note" id="performance-queues-note">Assignment / completion</div></article>
+      </div>
+      <div class="performance-charts">
+        <div class="performance-chart">
+          <div class="performance-chart-head"><span class="performance-chart-title">Raft Apply latency</span><span class="performance-chart-note">milliseconds · per-second averages</span></div>
+          <div class="chart-wrap"><canvas id="performance-raft-chart" role="img" aria-label="Raft Apply latency history by operation"></canvas></div>
+          <div id="performance-raft-legend" class="chart-legend"></div>
+        </div>
+        <div class="performance-chart">
+          <div class="performance-chart-head"><span class="performance-chart-title">Scheduler work</span><span class="performance-chart-note">records per second</span></div>
+          <div class="chart-wrap"><canvas id="performance-scheduler-chart" role="img" aria-label="Pending scheduler scan and selection history"></canvas></div>
+          <div id="performance-scheduler-legend" class="chart-legend"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section class="panel">
     <div class="panel-head">
       <div><h2 class="panel-title">Tenant allocation</h2><div class="panel-kicker">Configured limits, current quota and placement by node</div></div>
@@ -107,13 +136,15 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
 
 <script>
 const emptyHistory=()=>({days:Array(30).fill(0),hours:Array(24).fill(0),mins:Array(60).fill(0),secs:Array(60).fill(0)});
-const S={health:null,nodes:[],tenants:[],allocations:[],workerHistories:[],tenantHistories:[],events:[],lastUpdate:null,lastLeader:null,lastOnline:null,editing:null};
+const S={health:null,nodes:[],tenants:[],allocations:[],workerHistories:[],tenantHistories:[],performance:null,performanceRaftHistories:[],performanceSchedulerHistories:[],events:[],lastUpdate:null,lastLeader:null,lastOnline:null,editing:null};
 const SAMPLE_TENANTS=[{id:'acme-corp',name:'Acme Corp',max_workers:100},{id:'globex',name:'Globex',max_workers:60},{id:'initech',name:'Initech',max_workers:30}];
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
 const fmt=n=>new Intl.NumberFormat().format(Number(n)||0);
 const historyRing=(values,size)=>Array(Math.max(0,size-(values||[]).length)).fill(0).concat(values||[]).slice(-size).map(Number);
 const metricHistory=metric=>metric?{days:historyRing(metric.days,30),hours:historyRing(metric.hours,24),mins:historyRing(metric.mins,60),secs:historyRing(metric.secs,60)}:emptyHistory();
+const scaleHistory=(history,divisor)=>Object.fromEntries(Object.entries(history).map(([period,values])=>[period,values.map(value=>Number(value||0)/divisor)]));
+const latestHistory=history=>Number(history?.secs?.[history.secs.length-1]||0);
 const shortNode=id=>String(id||'').replace(/^sluice-/,'');
 const compareNodes=(a,b)=>String(a.node_id||'').localeCompare(String(b.node_id||''),undefined,{numeric:true,sensitivity:'base'});
 const nowTime=()=>new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
@@ -150,6 +181,21 @@ function renderTenants(){
   $('tenant-list').innerHTML=tenants.map(tenant=>{const allocated=totals[tenant.id]||0,borrowedCount=borrowed[tenant.id]||0,limit=Number(tenant.max_workers||0),rate=limit?Math.min(100,Math.round(allocated/limit*100)):0,inflight=Number(tenant.inflight||0),idle=allocated<=1&&!inflight,state=inflight?'Active':idle?'Idle':'Reserved';const placements=S.nodes.map(node=>({node:shortNode(node.node_id),count:Number(byNode[node.node_id]?.[tenant.id]||0)})).filter(x=>x.count>0);return `<tr data-tenant="${esc(tenant.id)}"><td><div class="tenant-name">${esc(tenant.name||tenant.id)}</div>${tenant.name&&tenant.name!==tenant.id?`<div class="tenant-id">${esc(tenant.id)}</div>`:''}</td><td><span class="state-badge ${inflight?'queued':idle?'idle':''}"><span class="status-dot"></span>${state}</span></td><td>${fmt(limit)}</td><td class="quota-cell"><div class="quota-line"><strong>${fmt(allocated)}</strong><span>${rate}% of limit${borrowedCount?` · +${fmt(borrowedCount)} borrowed`:''}</span></div><div class="meter"><i style="width:${rate}%"></i></div></td><td><strong>${fmt(inflight)}</strong></td><td><div class="placement">${placements.map(p=>`<span>${esc(p.node)} · ${p.count}</span>`).join('')||'<span>unassigned</span>'}</div></td><td><button class="btn icon-btn load-control" type="button" data-action="load" data-tenant="${esc(tenant.id)}">+ Tasks</button></td></tr>`}).join('')||'<tr><td colspan="7" class="empty">No tenants configured.</td></tr>';
 }
 
+function durationUS(value){const us=Number(value||0);if(!us)return '0 ms';const ms=us/1000;return `${ms>=100?ms.toFixed(0):ms>=10?ms.toFixed(1):ms.toFixed(2)} ms`}
+function performanceOperation(name){return S.performance?.current?.raft?.[name]||{}}
+function performanceHistory(name,divisor=1){return scaleHistory(metricHistory(S.performance?.history?.[name]),divisor)}
+function renderPerformance(){
+  const current=S.performance?.current,scheduler=current?.scheduler||{};
+  if(!current){$('performance-source').textContent='Diagnostics unavailable';['performance-create-apply','performance-claim-apply','performance-complete-apply','performance-scan-ratio','performance-queues'].forEach(id=>$(id).textContent='—');S.performanceRaftHistories=[];S.performanceSchedulerHistories=[];return}
+  const collected=S.performance.collected_at?new Date(S.performance.collected_at).toLocaleTimeString():'now';$('performance-source').textContent=`Leader ${shortNode(S.performance.node_id)} · ${collected}`;
+  const operations=[['create_task_batch','performance-create-apply','performance-create-note'],['claim_batch','performance-claim-apply','performance-claim-note'],['complete_batch','performance-complete-apply','performance-complete-note']];
+  operations.forEach(([name,valueID,noteID])=>{const op=performanceOperation(name);$(valueID).textContent=durationUS(op.average_us);$(noteID).textContent=op.applies?`max ${durationUS(op.max_us)} · avg batch ${fmt(op.average_batch)}`:'No samples'});
+  const selected=Number(scheduler.tasks_selected||0),scanned=Number(scheduler.pending_scanned||0),ratio=selected?scanned/selected:0;$('performance-scan-ratio').textContent=selected?`${ratio.toFixed(ratio>=100?0:1)}×`:'0×';$('performance-scan-note').textContent=`${fmt(scanned)} scanned · ${fmt(selected)} selected`;
+  const assignment=Number(scheduler.assignment_queue_depth||0),completion=Number(scheduler.completion_queue_depth||0);$('performance-queues').textContent=`${fmt(assignment)} · ${fmt(completion)}`;$('performance-queues-note').textContent=`selector avg ${durationUS(scheduler.average_select_us)} · max ${durationUS(scheduler.max_select_us)}`;
+  S.performanceRaftHistories=[['create_task_batch','Create','#176bdf'],['claim_batch','Claim','#b66508'],['complete_batch','Complete','#14845d']].map(([op,name,color])=>{const history=performanceHistory(`performance:raft:${op}:apply-us`,1000);return{id:op,name,current:latestHistory(history),history,color}}).filter(item=>performanceOperation(item.id).applies||item.current);
+  S.performanceSchedulerHistories=[['performance:scheduler:pending-scanned','Pending scanned'],['performance:scheduler:tasks-selected','Tasks selected'],['performance:scheduler:selection-rate','Selections']].map(([key,name])=>{const history=performanceHistory(key);return{id:key,name,current:latestHistory(history),history}});
+}
+
 function drawSeriesChart(canvasID,legendID,inputSeries,sortByCurrent,colors,emptyLabel){
   const canvas=$(canvasID),rect=canvas.getBoundingClientRect(),dpr=Math.max(1,window.devicePixelRatio||1),w=Math.max(320,rect.width),h=Math.max(180,rect.height);canvas.width=w*dpr;canvas.height=h*dpr;const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
   const series=[...inputSeries].sort(sortByCurrent?(a,b)=>(b.current-a.current)||a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'}):(a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:'base'}));
@@ -164,14 +210,16 @@ function drawCharts(){
   $('workers-chart-current').textContent=fmt(S.workerHistories.reduce((sum,item)=>sum+item.current,0));$('workers-chart-limit').textContent=fmt(S.nodes.reduce((sum,node)=>sum+Number(node.total_workers||0),0));
   drawSeriesChart('workers-chart','worker-chart-legend',S.workerHistories,false,['#14845d','#176bdf','#b66508','#7c5ce0'],'No cluster instances reported.');
   drawSeriesChart('tenant-unfinished-chart','tenant-chart-legend',S.tenantHistories,true,['#176bdf','#c13e4b','#14845d','#b66508','#7c5ce0','#0b8f9c','#d14f9b','#64748b'],'No tenants configured.');
+  drawSeriesChart('performance-raft-chart','performance-raft-legend',S.performanceRaftHistories,false,['#176bdf','#b66508','#14845d'],'No Raft Apply samples yet.');
+  drawSeriesChart('performance-scheduler-chart','performance-scheduler-legend',S.performanceSchedulerHistories,false,['#c13e4b','#176bdf','#7c5ce0'],'No scheduler samples yet.');
 }
 
-function renderAll(){renderHeader();renderSummary();renderTenants();drawCharts()}
+function renderAll(){renderHeader();renderSummary();renderTenants();renderPerformance();drawCharts()}
 
 async function refresh(){
   try{
-    const [health,nodes,tenants,allocations,allMetrics]=await Promise.all([getJSON('/api/v1/health'),getJSON('/api/v1/admin/nodes'),getJSON('/api/v1/admin/tenants'),getJSON('/api/v1/admin/allocations'),getJSON('/api/v1/metrics')]);
-    S.health=health;S.nodes=[...(nodes.nodes||[])].sort(compareNodes);S.tenants=Object.values(tenants||{});S.allocations=allocations.nodes||[];const metrics=Array.isArray(allMetrics)?allMetrics:[],byName=Object.fromEntries(metrics.map(metric=>[metric.name,metric])),allocationByNode=Object.fromEntries(S.allocations.map(allocation=>[allocation.node_id,Object.values(allocation.tenants||{}).reduce((sum,count)=>sum+Number(count||0),0)]));S.workerHistories=S.nodes.map(node=>({id:node.node_id,name:shortNode(node.node_id),current:allocationByNode[node.node_id]||0,limit:Number(node.total_workers||0),history:metricHistory(byName[`allocated-workers:node:${node.node_id}`])}));S.tenantHistories=S.tenants.map(tenant=>({id:tenant.id,name:tenant.name||tenant.id,current:Number(tenant.inflight||0),history:metricHistory(byName[`unfinished:${tenant.id}`])}));
+    const [health,nodes,tenants,allocations,allMetrics,performance]=await Promise.all([getJSON('/api/v1/health'),getJSON('/api/v1/admin/nodes'),getJSON('/api/v1/admin/tenants'),getJSON('/api/v1/admin/allocations'),getJSON('/api/v1/metrics'),getJSON('/api/v1/admin/performance').catch(()=>null)]);
+    S.health=health;S.nodes=[...(nodes.nodes||[])].sort(compareNodes);S.tenants=Object.values(tenants||{});S.allocations=allocations.nodes||[];S.performance=performance;const metrics=Array.isArray(allMetrics)?allMetrics:[],byName=Object.fromEntries(metrics.map(metric=>[metric.name,metric])),allocationByNode=Object.fromEntries(S.allocations.map(allocation=>[allocation.node_id,Object.values(allocation.tenants||{}).reduce((sum,count)=>sum+Number(count||0),0)]));S.workerHistories=S.nodes.map(node=>({id:node.node_id,name:shortNode(node.node_id),current:allocationByNode[node.node_id]||0,limit:Number(node.total_workers||0),history:metricHistory(byName[`allocated-workers:node:${node.node_id}`])}));S.tenantHistories=S.tenants.map(tenant=>({id:tenant.id,name:tenant.name||tenant.id,current:Number(tenant.inflight||0),history:metricHistory(byName[`unfinished:${tenant.id}`])}));
     const online=S.nodes.filter(n=>n.status==='up').length;if(S.lastOnline!==null&&S.lastOnline!==online)addEvent(`Online members changed: ${S.lastOnline} → ${online}`);S.lastOnline=online;
     if(S.lastLeader&&S.lastLeader!==health.leader)addEvent(`Leader changed to ${leaderNode()?.node_id||health.leader}`);S.lastLeader=health.leader;if(!S.events.length)addEvent('Connected to the control plane');
     S.lastUpdate=new Date();$('connection-banner').classList.add('hidden');renderAll();
@@ -195,7 +243,7 @@ $('tenant-list').addEventListener('click',event=>{const button=event.target.clos
 $('tenant-form').addEventListener('submit',async event=>{event.preventDefault();const id=$('tenant-id').value.trim(),name=$('tenant-name').value.trim()||id,max_workers=Number($('tenant-limit').value)||50;try{await getJSON(`/api/v1/admin/tenants/${encodeURIComponent(id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,max_workers})});addEvent(`${S.editing?'Updated':'Created'} tenant ${id}`);closeDialog('tenant-dialog');toast(`Tenant ${id} saved`);await refresh()}catch(error){toast(`Could not save tenant: ${error.message}`)}});
 $('delete-tenant').addEventListener('click',async()=>{const id=S.editing;if(!id||!confirm(`Delete tenant ${id}?`))return;try{await getJSON(`/api/v1/admin/tenants/${encodeURIComponent(id)}`,{method:'DELETE'});addEvent(`Deleted tenant ${id}`);closeDialog('tenant-dialog');toast(`Tenant ${id} deleted`);await refresh()}catch(error){toast(`Could not delete tenant: ${error.message}`)}});
 
-const chartObserver=new ResizeObserver(drawCharts);chartObserver.observe($('workers-chart'));chartObserver.observe($('tenant-unfinished-chart'));
+const chartObserver=new ResizeObserver(drawCharts);chartObserver.observe($('workers-chart'));chartObserver.observe($('tenant-unfinished-chart'));chartObserver.observe($('performance-raft-chart'));chartObserver.observe($('performance-scheduler-chart'));
 refresh();setInterval(()=>{if(!document.hidden)refresh()},1000);
 </script>
 </body>
