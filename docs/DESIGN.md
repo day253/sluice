@@ -359,10 +359,11 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   都不进入 Raft/FSM/Snapshot，不参与分配、借用或 lease 决策。Leader 切换后读取新
   Leader 的本地观测，不承诺跨 Leader 拼接无缝时间线；当前也不提供逐 non-voter
   replication lag。
-- **读取边界**：端点默认返回完整当前快照与 174 点历史，保留给人工诊断和外部调用；
-  `history=0` 只返回 Leader 当前快照。WebUI 每秒只请求轻量快照，曲线复用同一刷新中
-  `/metrics` 已返回的历史，避免对相同历史重复序列化和传输。该参数只改变只读响应形状，
-  不改变采样、保存或任务协议。
+- **读取边界**：端点默认返回完整当前快照与 174 点历史，`history=0` 可只返回 Leader
+  当前快照。WebUI 必须从该 Leader 端点读取性能当前值和历史；普通 `/metrics` 是连接
+  节点的本地历史，不能冒充 Leader 数据。页面用 `/metrics?performance=0` 读取 workload/
+  allocation 历史，让 Collector 在复制 ring buffer 前排除 `performance:`，因此每秒只
+  序列化和传输一份性能历史。参数都只改变只读响应形状，不改变采样、保存或任务协议。
 - **正确性边界**：观测只包裹既有 ApplyFuture 和选择流程，不增加或重排任何 Raft log，
   不改变 Leader 唯一分配、Worker 执行、批次上限、超时和最终状态语义。指标失败不能
   阻断任务路径。

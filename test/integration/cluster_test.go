@@ -850,6 +850,33 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		t.Fatalf("current-only performance diagnostics = %+v", currentOnly)
 	}
 
+	tc.waitFor(func() bool {
+		response, err := client.Get("http://" + tc.httpAddrs[follower] + "/api/v1/metrics?performance=0")
+		if err != nil {
+			return false
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return false
+		}
+		var histories []struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&histories); err != nil {
+			return false
+		}
+		foundWorkload := false
+		for _, history := range histories {
+			if strings.HasPrefix(history.Name, "performance:") {
+				return false
+			}
+			if history.Name == "unfinished:observed" {
+				foundWorkload = true
+			}
+		}
+		return foundWorkload
+	}, 15*time.Second, "follower workload histories without local performance series")
+
 	dashboardResponse, err := client.Get("http://" + tc.httpAddrs[follower] + "/")
 	if err != nil {
 		t.Fatalf("GET dashboard through follower: %v", err)
@@ -867,7 +894,8 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		`id="performance-raft-chart"`,
 		`id="performance-scheduler-chart"`,
 		`href="/api/v1/admin/performance"`,
-		`getJSON('/api/v1/admin/performance?history=0')`,
+		`getJSON('/api/v1/metrics?performance=0')`,
+		`getJSON('/api/v1/admin/performance')`,
 	} {
 		if !strings.Contains(string(dashboardBody), fragment) {
 			t.Errorf("production dashboard is missing performance fragment %q", fragment)

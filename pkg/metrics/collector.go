@@ -187,12 +187,19 @@ type NamedVarData struct {
 	Days   []int64           `json:"days"`
 }
 
-// QueryNamed returns named historical data.
-func (c *Collector) QueryNamed(name string) []NamedVarData {
+// QueryNamed returns named historical data. An optional prefix excludes
+// matching series before their ring buffers are copied.
+func (c *Collector) QueryNamed(name string, excludePrefix ...string) []NamedVarData {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	excluded := func(metricName string) bool {
+		return len(excludePrefix) > 0 && excludePrefix[0] != "" && strings.HasPrefix(metricName, excludePrefix[0])
+	}
 
 	if name != "" {
+		if excluded(name) {
+			return nil
+		}
 		if v, ok := c.vars[name]; ok {
 			return []NamedVarData{{Name: name, Secs: v.Query().Secs, Mins: v.Query().Mins, Hours: v.Query().Hours, Days: v.Query().Days}}
 		}
@@ -201,6 +208,9 @@ func (c *Collector) QueryNamed(name string) []NamedVarData {
 
 	out := make([]NamedVarData, 0, len(c.vars))
 	for n, v := range c.vars {
+		if excluded(n) {
+			continue
+		}
 		d := v.Query()
 		out = append(out, NamedVarData{Name: n, Secs: d.Secs, Mins: d.Mins, Hours: d.Hours, Days: d.Days})
 	}

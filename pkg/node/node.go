@@ -548,8 +548,8 @@ func (r *applyResultBridge) record(err error) {
 // metricsAdapter bridges metrics.Collector → api.MetricsData for HTTP.
 type metricsAdapter struct{ c *metrics.Collector }
 
-func (a metricsAdapter) Query(name string) ([]api.MetricsData, int) {
-	data := a.c.QueryNamed(name)
+func (a metricsAdapter) Query(name, excludePrefix string) ([]api.MetricsData, int) {
+	data := a.c.QueryNamed(name, excludePrefix)
 	out := make([]api.MetricsData, len(data))
 	for i, d := range data {
 		out[i] = api.MetricsData{

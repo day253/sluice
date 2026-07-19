@@ -30,7 +30,7 @@ type Handler struct {
 	raftStatusFunc  func() (raftpkg.MembershipStatus, error)
 	performanceFunc func(context.Context, bool, bool) (metrics.PerformanceDiagnostics, error)
 	collector       interface {
-		Query(name string) ([]MetricsData, int)
+		Query(name, excludePrefix string) ([]MetricsData, int)
 	}
 	logger *zap.Logger
 }
@@ -51,7 +51,7 @@ func NewHandler(nodeID string, svc *grpcpkg.Service, logger *zap.Logger) *Handle
 
 // SetCollector sets the metrics collector for /api/v1/metrics endpoint.
 func (h *Handler) SetCollector(c interface {
-	Query(name string) ([]MetricsData, int)
+	Query(name, excludePrefix string) ([]MetricsData, int)
 }) {
 	h.collector = c
 }
@@ -325,7 +325,11 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := mux.Vars(r)["name"]
-	data, _ := h.collector.Query(name)
+	excludePrefix := ""
+	if r.URL.Query().Get("performance") == "0" {
+		excludePrefix = "performance:"
+	}
+	data, _ := h.collector.Query(name, excludePrefix)
 	h.writeJSON(w, http.StatusOK, data)
 }
 

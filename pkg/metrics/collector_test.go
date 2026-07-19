@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +72,16 @@ func TestCollectorStoresBoundedPerformanceHistory(t *testing.T) {
 	}
 	if len(current.History) != 0 {
 		t.Fatalf("current performance diagnostics copied %d histories, want 0", len(current.History))
+	}
+
+	withoutPerformance := collector.QueryNamed("", "performance:")
+	if len(withoutPerformance) == 0 {
+		t.Fatal("filtered metrics query removed non-performance histories")
+	}
+	for _, history := range withoutPerformance {
+		if strings.HasPrefix(history.Name, "performance:") {
+			t.Fatalf("filtered metrics query retained %q", history.Name)
+		}
 	}
 }
 

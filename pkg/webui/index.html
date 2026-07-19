@@ -136,7 +136,7 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
 
 <script>
 const emptyHistory=()=>({days:Array(30).fill(0),hours:Array(24).fill(0),mins:Array(60).fill(0),secs:Array(60).fill(0)});
-const S={health:null,nodes:[],tenants:[],allocations:[],workerHistories:[],tenantHistories:[],performance:null,performanceHistoryMetrics:{},performanceRaftHistories:[],performanceSchedulerHistories:[],events:[],lastUpdate:null,lastLeader:null,lastOnline:null,editing:null};
+const S={health:null,nodes:[],tenants:[],allocations:[],workerHistories:[],tenantHistories:[],performance:null,performanceRaftHistories:[],performanceSchedulerHistories:[],events:[],lastUpdate:null,lastLeader:null,lastOnline:null,editing:null};
 const SAMPLE_TENANTS=[{id:'acme-corp',name:'Acme Corp',max_workers:100},{id:'globex',name:'Globex',max_workers:60},{id:'initech',name:'Initech',max_workers:30}];
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
@@ -183,7 +183,7 @@ function renderTenants(){
 
 function durationUS(value){const us=Number(value||0);if(!us)return '0 ms';const ms=us/1000;return `${ms>=100?ms.toFixed(0):ms>=10?ms.toFixed(1):ms.toFixed(2)} ms`}
 function performanceOperation(name){return S.performance?.current?.raft?.[name]||{}}
-function performanceHistory(name,divisor=1){return scaleHistory(metricHistory(S.performanceHistoryMetrics?.[name]||S.performance?.history?.[name]),divisor)}
+function performanceHistory(name,divisor=1){return scaleHistory(metricHistory(S.performance?.history?.[name]),divisor)}
 function renderPerformance(){
   const current=S.performance?.current,scheduler=current?.scheduler||{};
   if(!current){$('performance-source').textContent='Diagnostics unavailable';['performance-create-apply','performance-claim-apply','performance-complete-apply','performance-scan-ratio','performance-queues'].forEach(id=>$(id).textContent='—');S.performanceRaftHistories=[];S.performanceSchedulerHistories=[];return}
@@ -218,8 +218,8 @@ function renderAll(){renderHeader();renderSummary();renderTenants();renderPerfor
 
 async function refresh(){
   try{
-    const [health,nodes,tenants,allocations,allMetrics,performance]=await Promise.all([getJSON('/api/v1/health'),getJSON('/api/v1/admin/nodes'),getJSON('/api/v1/admin/tenants'),getJSON('/api/v1/admin/allocations'),getJSON('/api/v1/metrics'),getJSON('/api/v1/admin/performance?history=0').catch(()=>null)]);
-    S.health=health;S.nodes=[...(nodes.nodes||[])].sort(compareNodes);S.tenants=Object.values(tenants||{});S.allocations=allocations.nodes||[];S.performance=performance;const metrics=Array.isArray(allMetrics)?allMetrics:[],byName=Object.fromEntries(metrics.map(metric=>[metric.name,metric])),allocationByNode=Object.fromEntries(S.allocations.map(allocation=>[allocation.node_id,Object.values(allocation.tenants||{}).reduce((sum,count)=>sum+Number(count||0),0)]));S.performanceHistoryMetrics=byName;S.workerHistories=S.nodes.map(node=>({id:node.node_id,name:shortNode(node.node_id),current:allocationByNode[node.node_id]||0,limit:Number(node.total_workers||0),history:metricHistory(byName[`allocated-workers:node:${node.node_id}`])}));S.tenantHistories=S.tenants.map(tenant=>({id:tenant.id,name:tenant.name||tenant.id,current:Number(tenant.inflight||0),history:metricHistory(byName[`unfinished:${tenant.id}`])}));
+    const [health,nodes,tenants,allocations,allMetrics,performance]=await Promise.all([getJSON('/api/v1/health'),getJSON('/api/v1/admin/nodes'),getJSON('/api/v1/admin/tenants'),getJSON('/api/v1/admin/allocations'),getJSON('/api/v1/metrics?performance=0'),getJSON('/api/v1/admin/performance').catch(()=>null)]);
+    S.health=health;S.nodes=[...(nodes.nodes||[])].sort(compareNodes);S.tenants=Object.values(tenants||{});S.allocations=allocations.nodes||[];S.performance=performance;const metrics=Array.isArray(allMetrics)?allMetrics:[],byName=Object.fromEntries(metrics.map(metric=>[metric.name,metric])),allocationByNode=Object.fromEntries(S.allocations.map(allocation=>[allocation.node_id,Object.values(allocation.tenants||{}).reduce((sum,count)=>sum+Number(count||0),0)]));S.workerHistories=S.nodes.map(node=>({id:node.node_id,name:shortNode(node.node_id),current:allocationByNode[node.node_id]||0,limit:Number(node.total_workers||0),history:metricHistory(byName[`allocated-workers:node:${node.node_id}`])}));S.tenantHistories=S.tenants.map(tenant=>({id:tenant.id,name:tenant.name||tenant.id,current:Number(tenant.inflight||0),history:metricHistory(byName[`unfinished:${tenant.id}`])}));
     const online=S.nodes.filter(n=>n.status==='up').length;if(S.lastOnline!==null&&S.lastOnline!==online)addEvent(`Online members changed: ${S.lastOnline} → ${online}`);S.lastOnline=online;
     if(S.lastLeader&&S.lastLeader!==health.leader)addEvent(`Leader changed to ${leaderNode()?.node_id||health.leader}`);S.lastLeader=health.leader;if(!S.events.length)addEvent('Connected to the control plane');
     S.lastUpdate=new Date();$('connection-banner').classList.add('hidden');renderAll();

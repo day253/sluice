@@ -70,6 +70,17 @@ func (p *mockProcessor) Process(ctx context.Context, taskID, tenantID string, pa
 	return "ok", nil
 }
 
+type recordingMetricsCollector struct {
+	name          string
+	excludePrefix string
+}
+
+func (c *recordingMetricsCollector) Query(name, excludePrefix string) ([]MetricsData, int) {
+	c.name = name
+	c.excludePrefix = excludePrefix
+	return []MetricsData{{Name: "unfinished:company-a"}}, 1
+}
+
 func mustMarshal(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
@@ -174,6 +185,20 @@ func TestPerformanceEndpointCanReturnCurrentSnapshotWithoutHistory(t *testing.T)
 	}
 	if includeHistory {
 		t.Fatal("performance endpoint ignored history=0")
+	}
+}
+
+func TestMetricsEndpointCanExcludePerformanceHistories(t *testing.T) {
+	h, _, _ := setupHandler(t)
+	collector := &recordingMetricsCollector{}
+	h.SetCollector(collector)
+	recorder := httptest.NewRecorder()
+	newRouter(h).ServeHTTP(recorder, httptest.NewRequest("GET", "/api/v1/metrics?performance=0", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if collector.name != "" || collector.excludePrefix != "performance:" {
+		t.Fatalf("metrics query name=%q exclude=%q", collector.name, collector.excludePrefix)
 	}
 }
 

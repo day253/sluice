@@ -23,7 +23,8 @@ func TestDashboardIncludesPerformanceVisualizationAndJSONLink(t *testing.T) {
 		`id="performance-raft-chart"`,
 		`id="performance-scheduler-chart"`,
 		`href="/api/v1/admin/performance"`,
-		`getJSON('/api/v1/admin/performance?history=0')`,
+		`getJSON('/api/v1/metrics?performance=0')`,
+		`getJSON('/api/v1/admin/performance')`,
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Errorf("dashboard is missing performance fragment %q", fragment)
