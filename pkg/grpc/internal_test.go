@@ -301,6 +301,14 @@ func TestInternalServiceBoundsGlobalRaftBatchSize(t *testing.T) {
 	}
 }
 
+func TestFourWorkerStreamsCanFillOneGlobalRaftBatch(t *testing.T) {
+	const activeWorkerStreams = 4
+	if capacity := activeWorkerStreams * workerRequestCredits; capacity < claimBatchMaxSize {
+		t.Fatalf("four Worker streams expose %d credits, need at least one %d-item Raft batch",
+			capacity, claimBatchMaxSize)
+	}
+}
+
 func TestClaimBatchPreservesArrivalOrder(t *testing.T) {
 	batch := []raftpkg.ClaimTaskData{
 		{TaskID: "first"},
@@ -613,6 +621,35 @@ func TestWorkerSessionReconnectCancelsOfflineAndDisconnectPreservesInflightLease
 	}
 	if task := fsm.GetTask("task-1"); task == nil || task.Status != types.TaskStatusInflight {
 		t.Fatalf("disconnect requeued in-flight task immediately: %+v", task)
+	}
+}
+
+func TestLeaderRecoveryPreservesWorkerSessionThatAlreadyConnected(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raftpkg.OpNodeUp, types.NodeInfo{
+		ID: "worker-1", Role: types.NodeRoleWorker, SessionID: "session-1",
+		Status: types.NodeStatusUp, TotalWorkers: 2,
+	})
+	raft := &internalTestRaft{fsm: fsm}
+	raft.leader.Store(true)
+	service := NewInternalService("leader", fsm, raft, zap.NewNop())
+	service.SetWorkerSessionGrace(20 * time.Millisecond)
+
+	// Reproduce the production ordering: Hashicorp Raft already reports this
+	// node as Leader, so AllocationPush opens, and only then the leadership
+	// observer starts recovery for the inherited worker mirror.
+	service.openWorkerSession("worker-1", "session-1")
+	service.SetLeader(true)
+
+	deadline := time.Now().Add(60 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if node := fsm.GetAllNodes()["worker-1"]; node.Status != types.NodeStatusUp {
+			t.Fatalf("connected worker changed status during leader recovery: %+v", node)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := raft.applyCount.Load(); got != 0 {
+		t.Fatalf("leader recovery wrote %d offline entries for an active stream, want 0", got)
 	}
 }
 

@@ -183,6 +183,36 @@ func TestSubmitBatchUsesOneRaftApply(t *testing.T) {
 	}
 }
 
+func TestSubmitBatchNotifiesWorkOnlyAfterDurableApply(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{ID: "tenant-a", MaxWorkers: 10})
+	testRaft := &internalTestRaft{fsm: fsm}
+	testRaft.leader.Store(true)
+	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
+	notified := make(chan int, 1)
+	svc.SetWorkAvailableFunc(func(tenantIDs []string) {
+		if len(tenantIDs) != 2 || tenantIDs[0] != "tenant-a" || tenantIDs[1] != "tenant-a" {
+			t.Errorf("notified tenants = %v, want submitted tenant IDs", tenantIDs)
+		}
+		notified <- len(fsm.FindAllPendingTasks())
+	})
+
+	if _, err := svc.SubmitBatch(context.Background(), &grpcv1.SubmitBatchRequest{Tasks: []*grpcv1.SubmitRequest{
+		{TenantId: "tenant-a", Payload: []byte(`{"n":1}`)},
+		{TenantId: "tenant-a", Payload: []byte(`{"n":2}`)},
+	}}); err != nil {
+		t.Fatalf("submit batch: %v", err)
+	}
+	select {
+	case pending := <-notified:
+		if pending != 2 {
+			t.Fatalf("pending tasks visible at notification = %d, want 2 durable tasks", pending)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("durable submission did not notify the allocator")
+	}
+}
+
 func TestSubmitBatchDoesNotDuplicateRaftPendingIntoLocalQueue(t *testing.T) {
 	fsm := raft.NewFSM(zap.NewNop())
 	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{ID: "tenant-a", MaxWorkers: 10})

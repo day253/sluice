@@ -41,12 +41,21 @@ type Service struct {
 	pool   *worker.Pool
 	logger *zap.Logger
 
+	workAvailable func([]string)
+
 	submitForwardTimeout time.Duration
 
 	forwardMu     sync.Mutex
 	forwardAddr   string
 	forwardConn   *googlegrpc.ClientConn
 	forwardClient grpcv1.SluiceClient
+}
+
+// SetWorkAvailableFunc installs the control-plane notification invoked only
+// after submitted tasks are durably committed by Raft. The callback is wired
+// during node construction, before the service starts handling requests.
+func (s *Service) SetWorkAvailableFunc(fn func([]string)) {
+	s.workAvailable = fn
 }
 
 func NewService(
@@ -132,6 +141,13 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 	if err := result.Error(); err != nil {
 		s.logger.Error("submit batch raft apply failed", zap.Error(err), zap.Int("tasks", len(create)))
 		return nil, status.Error(codes.Internal, "failed to create task batch")
+	}
+	if s.workAvailable != nil {
+		tenantIDs := make([]string, len(create))
+		for i := range create {
+			tenantIDs[i] = create[i].TenantID
+		}
+		s.workAvailable(tenantIDs)
 	}
 	if _, ok := result.Response().(*raftpkg.CreateTaskBatchResult); !ok {
 		return nil, status.Error(codes.Internal, "create task batch returned an invalid response")

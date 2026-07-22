@@ -82,6 +82,26 @@
   membership，Chart 单测锁定 ClusterIP 发现；真实 3-control 测试注入 legacy 容量和
   allocation，切 Leader 后要求镜像收敛，再由 stateless Worker 排空任务。
 
+### CTRL-004：Leader 接管不能覆盖已连接的 Worker Session
+
+- **现象**：50 Worker 滚动到 revision 43 并发生 Leader 切换后，49 个 Worker 为 up，
+  `worker-46` 的 Pod、Processor 流和 AllocationPush 都仍然存活，但 FSM 在新 Leader
+  就绪五秒后把它提交为 down。原因是 Raft 的 `IsLeader` 会先于 Node leadership observer
+  可见：AllocationPush 在这个窗口先打开 session，随后 `SetLeader(true)` 又无条件把同一
+  session 改成 disconnected 并启动恢复 timer；timer 到期后错误提交 WorkerOffline，而
+  活流不会重注册。
+- **修复与不变量**：Leader 接管只为尚未连接的 inherited Worker 镜像启动五秒恢复 timer；
+  若该 Worker 已在当前 Leader 的 session 表中标记 connected，则保留其 generation、session
+  和流。真实断流仍由 `closeWorkerSession` 启动 grace，未重连节点仍会撤出容量；旧 session
+  fencing、inflight lease 和 WorkerOffline 的 Raft 条件不变。
+- **失败模型和非目标**：覆盖选主通知与 Worker 重连任意先后顺序，以及短暂网络断连；
+  session/timer 仍是 Leader 本地瞬时状态，不写 Snapshot。此次不增加心跳日志、不修改五秒
+  grace、不让 Follower 判活，也不改变 task lease 或 allocation 规则。
+- **回归覆盖**：`TestLeaderRecoveryPreservesWorkerSessionThatAlreadyConnected` 确定性重放
+  “stream-open → leadership-observer”顺序并跨过 grace；真实
+  `TestStatelessWorkerRoleSplit` 切换 3-voter Leader 后持续跨过生产五秒 grace，要求 Worker
+  始终 up、有 allocation，随后继续 exactly-once 排空任务。
+
 ## 任务生命周期
 
 ```
@@ -170,11 +190,12 @@ Leader 只有一个 Assignment dispatcher：来自所有节点流的空闲槽位
 节点流交叉重复选择。ResultStream 同样使用跨所有节点流的全局 dispatcher，把完成状态
 合并为 `OpCompleteBatch`，避免大量节点分别提交完成日志。
 
-每个 Follower 的 `ClaimClient` 对 Assignment 和 Result 各维护 8 个独立 credit。业务
+每个 Worker 实例的 `ClaimClient` 对 Assignment 和 Result 各维护 32 个独立 credit。业务
 Worker 可以按 allocation 全量并发执行，但一个节点同时等待 Raft 确认的拉取和完成请求
-分别最多 8 个；确认后立即释放 credit 给下一个空闲 Worker，因此这个窗口只限制控制面
-排队，不限制 Processor 并发。N 个执行节点的 Leader 未决请求上界分别为 `8N`，并继续
-按全局 128 条切分 Raft 日志，避免 4900 Worker 同时启动形成请求尖峰。
+分别最多 32 个；确认后立即释放 credit 给下一个空闲 Worker，因此这个窗口只限制控制面
+排队，不限制 Processor 并发。N 个执行节点的 Leader 未决请求上界分别为 `32N`，
+Assignment 与 Result 合计最多 `64N`。四条活跃 Worker 流即可填满一个 128 条 Raft
+批次，同时仍按全局 128 条切分日志，避免 4900 Worker 同时启动形成无界请求尖峰。
 
 Raft FSM 仍保留最终防线：若状态已变化，未成功 claim 的任务不会返回给 Worker。响应
 丢失时任务保持 inflight，30 秒 lease 到期后由 Leader 重新放回 pending。Assignment 和
@@ -362,16 +383,37 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   Raft 日志；后续请求超过固定 15 秒。任意一个请求超时会调用全局 `invalidate`，同时关闭
   该节点共享的 Claim/Assignment/Result 三条流。Leader 已提交但响应接收者消失的任务只
   能等待 lease，重连后的 4900 个请求又形成下一轮尖峰。
-- **修复**：每节点 Assignment/Result 各使用 8-credit 未决窗口；已发送请求不再用固定
-  客户端 deadline 破坏共享流；Leader 将 Claim/Complete Raft 日志统一限制为 128 条。
+- **修复**：初版每节点 Assignment/Result 各使用 8-credit 未决窗口，PERF-003 在保持
+  有界的前提下扩为当前 32；已发送请求不再用固定客户端 deadline 破坏共享流；Leader
+  将 Claim/Complete Raft 日志统一限制为 128 条。
 - **不变量**：Leader 仍唯一选择并提交 task→node，credit 只限制等待共识的控制请求，
   不降低 allocation 或 Processor 并发；连接/Leader 失败仍取消整条流，未知提交仍走
   30 秒 lease。没有新增任务转移、取消执行或 Processor exactly-once 语义。
 - **回归覆盖**：`TestClaimClientBoundsPerNodeRaftRequests` 在服务端故意不确认时验证每类
-  只有 8 个请求且流不重建；`TestInternalServiceBoundsGlobalRaftBatchSize` 固定 128 上限；
+  只有当前 credit 上限的请求且流不重建；`TestInternalServiceBoundsGlobalRaftBatchSize` 固定 128 上限；
   真实 8 节点 `TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery` 启动 4900 个
   执行 Worker、处理 4096 个任务，断言所有 Raft 批次不超过 128、lease 前排空、每任务
   只执行一次且没有超时重连或 lease 回收。
+
+### PERF-003：每节点 credit 过小导致全局批次仍填不满
+
+- **现象证据**：SCHED-004 的 8 节点/4900 执行槽/4096 任务固定 Case 虽然不再发生
+  stream storm，但 Assignment 和 Complete 各产生 151 条 Raft 日志，平均每批只有
+  27.1 条。每节点 8-credit 意味着至少 16 条活跃 Worker 流才能填满 128 条；当 allocation
+  集中到较少实例时，即使节点内有数百个业务 Worker，全局 dispatcher 仍只能收到碎片批次。
+- **覆盖范围**：只把每个 Worker 实例的 Assignment/Result 独立未决窗口从 8 提高到
+  32；四条活跃流即可暴露 128 个请求。全局 dispatcher、5ms 窗口、每条 Raft 日志
+  128 上限、Leader 唯一选择、task→node 所有权和 ACK-after-commit 语义都不改变。
+- **容量与失败边界**：单节点每类最多 32、合计最多 64 个等待共识的请求；N 节点合计
+  上界 `64N`。失去 quorum、Leader 切换或 stream 断开仍通过原 stream context 解除等待；
+  已知已提交的完成才 ACK，未知 claim 仍由 30 秒 lease 恢复。credit 不写 Raft、FSM、
+  Snapshot 或 174 点历史，也不参与 allocation 决策。
+- **非目标**：本次不提高单日志 128 上限、不把 Claim/Complete 合成新协议、不改变
+  Processor 并发或任务超时、不实现 Multi-Raft，也不承诺增加 Worker 能突破单 shard
+  共识上限。
+- **验证**：同一真实 8 节点/4900 槽/4096 任务 Case 要求 Claim/Complete 各提交全部
+  4096 条、每批不超过 128、平均至少 64 条、零 stream timeout/lease recovery 且每任务
+  只处理一次；远程固定 5 control/50 Worker/4 tenant/20000 条基线单独记录在 PERF。
 
 ### PERF-001：2 万任务被共识规模、重复存储和重复扫描共同拖慢
 
@@ -544,3 +586,46 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **边界**：借用不保证固定吞吐，不把控制器试探值存成历史；pending 消失立即释放，
   Leader 切换后从正常配额重新试探。
 - **回归覆盖**：见 `docs/TESTING.md` 的 ALLOC-001。
+
+### ALLOC-002：并发 Worker 注册重叠执行 allocation reconcile
+
+- **现象**：两个 stateless Worker 同时注册时，HTTP 注册处理各自异步调用
+  `ReconcileNow`；它们与 3 秒定时器可能同时读 FSM、更新 `idleCycles` / `borrowedTargets`
+  并各自提交一份 allocation 快照。`make test` 的真实 3-control role-split Case 在 race
+  detector 下捕获到 map 读写竞争。
+- **修复**：每个 Leader allocator 用单独的 `reconcileMu` 串行化完整的
+  “lease 回收 → 状态读取 → idle/borrow 计算 → allocation Raft Apply”周期；Leader
+  状态切换和 leader-local map 重置也经过同一把锁。注册 API 仍可并发返回，后续
+  reconcile 会基于前一次已提交结果重新读取状态。
+- **不变量与失败模型**：只有当前 Leader 提交 allocation；每次提交仍受租户 Limit、
+  借用规则和存活 Worker 总容量约束。Leader 切换不会与旧 Leader 的本地状态重置并发，
+  Raft Apply 失败仍返回错误且不伪造成功计划。
+- **非目标**：本次不合并或丢弃重复 reconcile 请求，不把 allocator 本地状态复制到
+  Raft，也不改变 3 秒周期、Worker 注册协议、task lease 或具体 task assignment。
+- **回归覆盖**：`TestConcurrentReconcileRequestsAreSerialized` 用阻塞 Raft applier
+  确定性证明第二次计算不能越过第一次 commit；`TestStatelessWorkerRoleSplit` 同时释放
+  两个真实 Worker 注册，经过 HTTP、3-voter Raft、Allocator 和 allocation push，并在
+  race detector 下验证收敛。
+
+### PERF-004：idle 租户的新任务等待 3 秒 allocator tick
+
+- **现象证据**：revision 42 的远程 5-control/50-Worker 固定 20k Case 在提交完成后的
+  前约 3 秒只处理 67 条左右；四个长期空闲租户当时各只有一个 keep-alive Worker，必须
+  等下一个 3 秒 reconcile tick 才恢复正常 Limit。该轮端到端 14.938 秒、1338.9 task/s，
+  Claim/Complete 批次与 revision 41 基本不变，因此不是 credit 填充问题。
+- **覆盖范围**：Leader 的 `SubmitBatch` 只有在 `OpCreateTaskBatch` 已成功 Apply 后才把本批
+  tenant ID 通知 allocator。allocator 只在该租户当前 allocation≤1 且配置 Limit>1 时
+  非阻塞唤醒；活跃租户提交不写额外 allocation 日志，并发 burst 通过容量 1 的 channel
+  合并。3 秒 tick 保留为通知丢失、Leader 切换和 Limit=1 借用探测的 liveness fallback。
+- **不变量与失败模型**：通知不是任务状态，不能先于 durable Create、不能写 Raft/FSM/
+  Snapshot，也不参与具体 task→node 选择。唤醒后仍由当前 Leader 串行计算并提交完整
+  allocation；Follower 先转发 Leader，因此不会在本地做分配。失去 quorum 时 Create
+  失败且不通知；通知被合并或进程失败最多退回原 3 秒周期。
+- **非目标**：不改变 5 秒 borrowing age、租户 Limit/公平性、Worker credit、Claim lease、
+  Processor 取消语义或 Multi-Raft；不承诺 active workload 的稳态吞吐变化。
+- **回归覆盖**：`TestSubmitBatchNotifiesWorkOnlyAfterDurableApply`、
+  `TestWorkNotificationsCoalesceBeforeAllocatorRunLoop` 和
+  `TestAllocatedWorkersForTenantsReturnsRequestedCurrentTotals` 固定提交顺序、合并和 active
+  tenant 零额外日志；真实 `TestDurableSubmissionWakesIdleAllocator` 把 periodic tick 延长
+  为一小时，经 Follower HTTP、Leader Raft、Allocator、allocation push 和 Worker 验证
+  2 秒内唤醒、20 条任务最终各处理一次。

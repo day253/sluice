@@ -11,8 +11,8 @@ import (
 
 	"go.uber.org/zap"
 
-	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/queue"
+	raftpkg "github.com/day253/sluice/pkg/raft"
 )
 
 // ---------------------------------------------------------------------------
@@ -46,6 +46,26 @@ func BenchmarkPool_MultiTenant_10x10(b *testing.B) {
 	benchPoolMulti(b, 10, 10, b.N/10)
 }
 
+const benchmarkDrainDeadline = 10 * time.Second
+
+func benchmarkTaskID(tenantID string, index int) string {
+	return fmt.Sprintf("%s-task-%d", tenantID, index)
+}
+
+func waitBenchmarkProcessed(processed *atomic.Int64, want int64, timeout time.Duration) (int64, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		got := processed.Load()
+		if got >= want {
+			return got, true
+		}
+		if time.Now().After(deadline) {
+			return got, false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func benchPool(b *testing.B, tenants, workersPerTenant, tasks int) {
 	q := queue.NewMemoryQueue()
 	fsm := raftpkg.NewFSM(zap.NewNop())
@@ -62,7 +82,7 @@ func benchPool(b *testing.B, tenants, workersPerTenant, tasks int) {
 		alloc[tid] = workersPerTenant
 		for j := 0; j < tasks; j++ {
 			_ = q.Enqueue(tid, &queue.TaskEnvelope{
-				TaskID: tid + "-task", TenantID: tid, Payload: json.RawMessage(`{}`),
+				TaskID: benchmarkTaskID(tid, j), TenantID: tid, Payload: json.RawMessage(`{}`),
 			})
 		}
 	}
@@ -70,9 +90,11 @@ func benchPool(b *testing.B, tenants, workersPerTenant, tasks int) {
 	pool.Reconcile(alloc)
 
 	b.ResetTimer()
-	// Wait until all tasks processed.
-	for proc.processed.Load() < int64(tasks*tenants) {
-		time.Sleep(5 * time.Millisecond)
+	want := int64(tasks * tenants)
+	if got, ok := waitBenchmarkProcessed(&proc.processed, want, benchmarkDrainDeadline); !ok {
+		b.StopTimer()
+		_ = pool.Shutdown(5 * time.Second)
+		b.Fatalf("worker benchmark processed %d/%d tasks before %s deadline", got, want, benchmarkDrainDeadline)
 	}
 	b.StopTimer()
 
@@ -93,7 +115,7 @@ func benchPoolMulti(b *testing.B, tenants, workersPerTenant, tasksPerTenant int)
 		alloc[tid] = workersPerTenant
 		for j := 0; j < tasksPerTenant; j++ {
 			_ = q.Enqueue(tid, &queue.TaskEnvelope{
-				TaskID: tid + "-task", TenantID: tid, Payload: json.RawMessage(`{}`),
+				TaskID: benchmarkTaskID(tid, j), TenantID: tid, Payload: json.RawMessage(`{}`),
 			})
 		}
 	}
@@ -102,8 +124,10 @@ func benchPoolMulti(b *testing.B, tenants, workersPerTenant, tasksPerTenant int)
 
 	b.ResetTimer()
 	total := int64(tenants * tasksPerTenant)
-	for proc.processed.Load() < total {
-		time.Sleep(5 * time.Millisecond)
+	if got, ok := waitBenchmarkProcessed(&proc.processed, total, benchmarkDrainDeadline); !ok {
+		b.StopTimer()
+		_ = pool.Shutdown(5 * time.Second)
+		b.Fatalf("multi-tenant benchmark processed %d/%d tasks before %s deadline", got, total, benchmarkDrainDeadline)
 	}
 	b.StopTimer()
 
@@ -172,11 +196,37 @@ func BenchmarkClaimCompleteSequence(b *testing.B) {
 	pool.Reconcile(map[string]int{"a": nCPU * 2})
 
 	b.ResetTimer()
-	for proc.processed.Load() < int64(n) {
-		time.Sleep(5 * time.Millisecond)
+	if got, ok := waitBenchmarkProcessed(&proc.processed, int64(n), benchmarkDrainDeadline); !ok {
+		b.StopTimer()
+		_ = pool.Shutdown(5 * time.Second)
+		b.Fatalf("claim/complete benchmark processed %d/%d tasks before %s deadline", got, n, benchmarkDrainDeadline)
 	}
 	b.StopTimer()
 
 	_ = pool.Shutdown(5 * time.Second)
 	b.ReportMetric(float64(proc.processed.Load())/b.Elapsed().Seconds(), "tasks/s")
+}
+
+func TestBenchmarkTaskIDsAreUniqueAcrossConcurrentWorkers(t *testing.T) {
+	seen := make(map[string]struct{})
+	for _, tenantID := range []string{"tenant", "a", "b"} {
+		for index := 0; index < 256; index++ {
+			id := benchmarkTaskID(tenantID, index)
+			if _, exists := seen[id]; exists {
+				t.Fatalf("duplicate benchmark task ID %q", id)
+			}
+			seen[id] = struct{}{}
+		}
+	}
+}
+
+func TestBenchmarkWaitHasExplicitDeadline(t *testing.T) {
+	var processed atomic.Int64
+	started := time.Now()
+	if got, ok := waitBenchmarkProcessed(&processed, 1, 20*time.Millisecond); ok || got != 0 {
+		t.Fatalf("wait result = (%d, %v), want (0, false)", got, ok)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("bounded benchmark wait took %s", elapsed)
+	}
 }

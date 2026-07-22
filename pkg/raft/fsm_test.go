@@ -624,6 +624,22 @@ func TestApplyUpdateAllocation(t *testing.T) {
 	}
 }
 
+func TestAllocatedWorkersForTenantsReturnsRequestedCurrentTotals(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"n1": {NodeID: "n1", Tenants: map[string]int{"a": 2, "b": 4}},
+		"n2": {NodeID: "n2", Tenants: map[string]int{"a": 3, "b": 5}},
+	})
+
+	got := fsm.AllocatedWorkersForTenants([]string{"a", "missing", "a"})
+	if got["a"] != 5 || got["missing"] != 0 {
+		t.Fatalf("allocation totals = %v, want a=5 missing=0", got)
+	}
+	if _, ok := got["b"]; ok {
+		t.Fatalf("unrequested tenant leaked into allocation totals: %v", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot / Restore
 // ---------------------------------------------------------------------------

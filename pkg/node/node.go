@@ -51,6 +51,9 @@ type Config struct {
 	// DisableVoterReconciliation is reserved for externally managed embedded
 	// clusters and protocol tests. Production leaves it false.
 	DisableVoterReconciliation bool
+	// AllocatorInterval overrides the 3s periodic liveness tick. Production
+	// normally leaves it zero; protocol tests may extend it to prove event wakes.
+	AllocatorInterval time.Duration
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +164,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 	// ---- gRPC services (shared by HTTP adapter + gRPC server) ----
 	grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(), bridge, n.pool, logger)
+	grpcSvc.SetWorkAvailableFunc(n.allocEngine.NotifyWorkAvailable)
 	internalSvc := grpcpkg.NewInternalService(cfg.NodeID, cluster.FSM(), bridge, logger)
 	internalSvc.SetPerformanceObserver(n.performance)
 	n.internalSvc = internalSvc
@@ -228,7 +232,11 @@ func (n *Node) Start() error {
 		n.logger.Warn("register node (non-fatal)", zap.Error(err))
 	}
 
-	n.allocEngine.Start(n.ctx, 3*time.Second)
+	allocatorInterval := n.cfg.AllocatorInterval
+	if allocatorInterval <= 0 {
+		allocatorInterval = 3 * time.Second
+	}
+	n.allocEngine.Start(n.ctx, allocatorInterval)
 	go n.collector.Start(n.ctx)
 	go n.watchLeadership()
 	go n.watchAllocations()

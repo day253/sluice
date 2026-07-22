@@ -150,6 +150,13 @@ func (s *InternalService) SetLeader(leader bool) {
 		if node.Role != types.NodeRoleWorker || node.Status != types.NodeStatusUp {
 			continue
 		}
+		// IsLeader may become visible to AllocationPush before the node's
+		// leadership observer invokes SetLeader(true). Preserve a stream that
+		// already connected in that window; replacing it with a recovery timer
+		// would mark a healthy worker offline while its stream remained open.
+		if session := s.workerSessions[node.ID]; session != nil && session.connected {
+			continue
+		}
 		s.armWorkerOfflineLocked(node.ID, node.SessionID, false)
 	}
 }

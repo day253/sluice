@@ -2,8 +2,11 @@ package allocator
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -437,6 +440,124 @@ type fakeApplyResult struct{}
 
 func (r *fakeApplyResult) Error() error          { return nil }
 func (r *fakeApplyResult) Response() interface{} { return nil }
+
+type blockingRaftApplier struct {
+	fsm     *raftpkg.FSM
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingRaftApplier) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {
+	b.entered <- struct{}{}
+	<-b.release
+	b.once.Do(func() {
+		_ = b.fsm.Apply(&raft.Log{Data: cmd, Type: raft.LogCommand})
+	})
+	return &fakeApplyResult{}
+}
+
+func (b *blockingRaftApplier) IsLeader() bool     { return true }
+func (b *blockingRaftApplier) LeaderAddr() string { return "test:7000" }
+
+func TestConcurrentReconcileRequestsAreSerialized(t *testing.T) {
+	fsm := newTestFSM()
+	raft := &blockingRaftApplier{
+		fsm: fsm, entered: make(chan struct{}, 2), release: make(chan struct{}, 2),
+	}
+	e := NewEngine("test-node", fsm, raft, zap.NewNop())
+
+	done := make(chan error, 2)
+	go func() { done <- e.Reconcile() }()
+	select {
+	case <-raft.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first reconciliation did not reach Raft Apply")
+	}
+
+	go func() { done <- e.Reconcile() }()
+	select {
+	case <-raft.entered:
+		raft.release <- struct{}{}
+		raft.release <- struct{}{}
+		<-done
+		<-done
+		t.Fatal("second reconciliation entered Raft Apply before the first completed")
+	case <-time.After(100 * time.Millisecond):
+		// The second caller must remain behind reconcileMu.
+	}
+
+	raft.release <- struct{}{}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("first reconciliation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first reconciliation did not finish")
+	}
+	select {
+	case <-raft.entered:
+	case <-time.After(time.Second):
+		t.Fatal("second reconciliation did not start after the first completed")
+	}
+	raft.release <- struct{}{}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("second reconciliation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second reconciliation did not finish")
+	}
+}
+
+type countingRaftApplier struct {
+	fsm     *raftpkg.FSM
+	applies atomic.Int64
+}
+
+func (c *countingRaftApplier) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {
+	c.applies.Add(1)
+	_ = c.fsm.Apply(&raft.Log{Data: cmd, Type: raft.LogCommand})
+	return &fakeApplyResult{}
+}
+
+func (c *countingRaftApplier) IsLeader() bool     { return true }
+func (c *countingRaftApplier) LeaderAddr() string { return "test:7000" }
+
+func TestWorkNotificationsCoalesceBeforeAllocatorRunLoop(t *testing.T) {
+	fsm := newTestFSM()
+	raft := &countingRaftApplier{fsm: fsm}
+	e := NewEngine("test-node", fsm, raft, zap.NewNop())
+	e.SetLeader(true)
+	for i := 0; i < 100; i++ {
+		e.NotifyWorkAvailable([]string{"a"})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.Start(ctx, time.Hour)
+	deadline := time.After(time.Second)
+	for raft.applies.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("work notification did not trigger reconciliation")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := raft.applies.Load(); got != 1 {
+		t.Fatalf("100 concurrent notifications caused %d reconciliations, want one coalesced run", got)
+	}
+	for i := 0; i < 100; i++ {
+		e.NotifyWorkAvailable([]string{"a"})
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := raft.applies.Load(); got != 1 {
+		t.Fatalf("active tenant notifications caused %d reconciliations, want no redundant allocation log", got)
+	}
+}
 
 func TestReconcile_ProducesValidPlan(t *testing.T) {
 	fsm := newTestFSM()

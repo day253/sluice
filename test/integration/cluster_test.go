@@ -16,6 +16,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -35,6 +38,31 @@ import (
 	"github.com/day253/sluice/pkg/types"
 )
 
+// TestWorkerBenchmarkCommandTerminates preserves CI-001 at the real CI
+// process boundary. Multiple workers must consume distinct benchmark task IDs;
+// the benchmark command must finish rather than waiting forever for tasks that
+// were dequeued but rejected by the local duplicate-ID reservation guard.
+func TestWorkerBenchmarkCommandTerminates(t *testing.T) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve integration test source path")
+	}
+	repositoryRoot := filepath.Clean(filepath.Join(filepath.Dir(filename), "../.."))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "go", "test", "./pkg/worker",
+		"-run", "^$", "-bench", `BenchmarkPool_SingleTenant_(10|100)Workers$`,
+		"-benchtime=25x", "-count=1")
+	command.Dir = repositoryRoot
+	output, err := command.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("worker benchmark command exceeded 20s deadline: %s", output)
+	}
+	if err != nil {
+		t.Fatalf("worker benchmark command failed: %v\n%s", err, output)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Test harness
 // ---------------------------------------------------------------------------
@@ -50,6 +78,7 @@ type testCluster struct {
 	workers                    int
 	maxVoters                  int
 	disableVoterReconciliation bool
+	allocatorInterval          time.Duration
 
 	mu      sync.Mutex
 	results map[string]*types.TaskResult // taskID → final result (polled from FSM)
@@ -86,21 +115,30 @@ func newClaimRejectCountingLogger(rejectedClaims *atomic.Int64) *zap.Logger {
 }
 
 func newTestClusterWithLogger(tb testing.TB, n int, totalWorkersPerNode int, logger *zap.Logger) *testCluster {
-	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, raftpkg.DefaultMaxVoters, false, logger,
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, raftpkg.DefaultMaxVoters, false, 0, logger,
+		func(cluster *raftpkg.Cluster, nodeID, address string) error {
+			return cluster.AddVoter(nodeID, address)
+		})
+}
+
+func newTestClusterWithAllocatorInterval(
+	tb testing.TB, n int, totalWorkersPerNode int, interval time.Duration,
+) *testCluster {
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, raftpkg.DefaultMaxVoters, false, interval, zap.NewNop(),
 		func(cluster *raftpkg.Cluster, nodeID, address string) error {
 			return cluster.AddVoter(nodeID, address)
 		})
 }
 
 func newTestClusterWithVoterLimit(tb testing.TB, n int, totalWorkersPerNode, maxVoters int, logger *zap.Logger) *testCluster {
-	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, maxVoters, false, logger,
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, maxVoters, false, 0, logger,
 		func(cluster *raftpkg.Cluster, nodeID, address string) error {
 			return cluster.AddServer(nodeID, address, maxVoters)
 		})
 }
 
 func newAllVoterTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster {
-	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, n, true, zap.NewNop(),
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, n, true, 0, zap.NewNop(),
 		func(cluster *raftpkg.Cluster, nodeID, address string) error {
 			return cluster.AddVoter(nodeID, address)
 		})
@@ -112,6 +150,7 @@ func newTestClusterWithMemberAdder(
 	totalWorkersPerNode int,
 	maxVoters int,
 	disableVoterReconciliation bool,
+	allocatorInterval time.Duration,
 	logger *zap.Logger,
 	addMember func(*raftpkg.Cluster, string, string) error,
 ) *testCluster {
@@ -132,6 +171,7 @@ func newTestClusterWithMemberAdder(
 		workers:                    totalWorkersPerNode,
 		maxVoters:                  maxVoters,
 		disableVoterReconciliation: disableVoterReconciliation,
+		allocatorInterval:          allocatorInterval,
 	}
 
 	// ---- Allocate random loopback ports ----
@@ -167,6 +207,7 @@ func newTestClusterWithMemberAdder(
 		TotalWorkers:               totalWorkersPerNode,
 		MaxRaftVoters:              maxVoters,
 		DisableVoterReconciliation: disableVoterReconciliation,
+		AllocatorInterval:          allocatorInterval,
 	}, tc.proc, logger)
 	if err != nil {
 		tb.Fatalf("create node-0: %v", err)
@@ -194,6 +235,7 @@ func newTestClusterWithMemberAdder(
 			TotalWorkers:               totalWorkersPerNode,
 			MaxRaftVoters:              maxVoters,
 			DisableVoterReconciliation: disableVoterReconciliation,
+			AllocatorInterval:          allocatorInterval,
 		}, tc.proc, logger)
 		if err != nil {
 			tb.Fatalf("create node-%d: %v", i, err)
@@ -427,6 +469,7 @@ func (tc *testCluster) restartAll() {
 			TotalWorkers:               tc.workers,
 			MaxRaftVoters:              tc.maxVoters,
 			DisableVoterReconciliation: tc.disableVoterReconciliation,
+			AllocatorInterval:          tc.allocatorInterval,
 		}, tc.proc, logger)
 		if err != nil {
 			tc.tb.Fatalf("recreate node-%d: %v", i, err)
@@ -715,6 +758,9 @@ func TestStatelessWorkerRoleSplit(t *testing.T) {
 
 	// Use control-2 as the stable discovery endpoint so killing the initial
 	// control-0 Leader later exercises Worker reconnection through a follower.
+	// Release both starts together: concurrent registration used to launch
+	// overlapping allocator reconciliations that raced on leader-local state.
+	workerStart := make(chan struct{})
 	for index := range workers {
 		execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
 			NodeID: fmt.Sprintf("worker-%d", index), APIAddress: "127.0.0.1:0",
@@ -724,8 +770,12 @@ func TestStatelessWorkerRoleSplit(t *testing.T) {
 			t.Fatalf("create worker-%d: %v", index, err)
 		}
 		workers[index] = execution
-		go func(workerNode *node.StatelessWorker) { _ = workerNode.Start() }(execution)
+		go func(workerNode *node.StatelessWorker) {
+			<-workerStart
+			_ = workerNode.Start()
+		}(execution)
 	}
+	close(workerStart)
 
 	apply := func(op string, data interface{}) {
 		leader := -1
@@ -936,6 +986,21 @@ func TestStatelessWorkerRoleSplit(t *testing.T) {
 		}
 		return true
 	})
+	// CTRL-003: AllocationPush may reach the new Leader after Raft's state
+	// transition is visible but before its leadership observer starts recovery.
+	// Keep checking beyond the five-second session grace: an already connected
+	// worker must never be overwritten by the recovery timer and marked down.
+	stableUntil := time.Now().Add(6 * time.Second)
+	for time.Now().Before(stableUntil) {
+		workerInfo := controls[1].RaftCluster().FSM().GetAllNodes()["worker-0"]
+		allocation, allocated := controls[1].RaftCluster().FSM().GetAllocation("worker-0")
+		if workerInfo == nil || workerInfo.Status != types.NodeStatusUp ||
+			!allocated || allocation.Tenants["role-split"] == 0 {
+			t.Fatalf("connected Worker did not remain active through Leader recovery: node=%+v allocation=%+v",
+				workerInfo, allocation)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	second := submit(httpAddrs[2], "after-failover", 80)
 	waitDone(second)
 	assertMembership()
@@ -1559,6 +1624,8 @@ func TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery(t *testing.T
 	}
 	assignmentBatches := 0
 	completionBatches := 0
+	assignmentItems := int64(0)
+	completionItems := int64(0)
 	for _, entry := range logs.All() {
 		fields := entry.ContextMap()
 		errText := fmt.Sprint(fields["error"])
@@ -1573,18 +1640,37 @@ func TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery(t *testing.T
 			assignmentBatches++
 			if size, ok := fields["tasks"].(int64); !ok || size < 1 || size > 128 {
 				t.Fatalf("assignment Raft batch size = %v, want 1..128", fields["tasks"])
+			} else {
+				assignmentItems += size
 			}
 		}
 		if entry.Message == "completion raft batch committed" {
 			completionBatches++
 			if size, ok := fields["tasks"].(int64); !ok || size < 1 || size > 128 {
 				t.Fatalf("completion Raft batch size = %v, want 1..128", fields["tasks"])
+			} else {
+				completionItems += size
 			}
 		}
 	}
 	if assignmentBatches == 0 || completionBatches == 0 {
 		t.Fatalf("observed assignment batches=%d completion batches=%d, want both", assignmentBatches, completionBatches)
 	}
+	if assignmentItems != taskCount || completionItems != taskCount {
+		t.Fatalf("credit fanout committed assignment=%d completion=%d items, want %d each",
+			assignmentItems, completionItems, taskCount)
+	}
+	// Four or more active streams can now expose a full 128-item window. A
+	// healthy sustained backlog must average at least 64 items per Apply; the
+	// old eight-credit window produced 151 Claim and 151 Complete entries
+	// (27.1 items each) for this exact shape.
+	const maxBatchesPerTransition = taskCount / 64
+	if assignmentBatches > maxBatchesPerTransition || completionBatches > maxBatchesPerTransition {
+		t.Fatalf("credit fanout fragmented batches: assignment=%d completion=%d, want <=%d each",
+			assignmentBatches, completionBatches, maxBatchesPerTransition)
+	}
+	t.Logf("credit fanout batches: assignment=%d/%d completion=%d/%d",
+		assignmentBatches, assignmentItems, completionBatches, completionItems)
 }
 
 // TestAllocationScaleDownLetsInflightProcessorsFinish preserves SCHED-005.
@@ -2151,6 +2237,94 @@ func TestDynamicTenant(t *testing.T) {
 	// Alice should have lost some workers to Bob.
 	if aliceTotal2 >= aliceTotal {
 		t.Logf("alice unchanged (%d → %d) — may be fully allocated", aliceTotal, aliceTotal2)
+	}
+}
+
+// TestDurableSubmissionWakesIdleAllocator locks the event-driven wake path.
+// The periodic safety tick is extended to one hour so only the real follower
+// HTTP -> Leader gRPC -> Raft Apply -> allocator notification path can restore
+// an idle tenant's workers within the deadline.
+func TestDurableSubmissionWakesIdleAllocator(t *testing.T) {
+	tc := newTestClusterWithAllocatorInterval(t, 2, 20, time.Hour)
+	defer tc.shutdown()
+
+	tenantID := "submission-wake"
+	tc.addTenant(tenantID, 10)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader")
+	}
+	tc.waitFor(func() bool {
+		return tc.nodes[leader].AllocEngine().IsLeader()
+	}, 2*time.Second, "allocator observes leadership")
+	allocationTotal := func() int {
+		total := 0
+		for _, allocation := range tc.fsms().GetAllAllocations() {
+			total += allocation.Tenants[tenantID]
+		}
+		return total
+	}
+	for i := 0; i < 4; i++ {
+		if err := tc.nodes[leader].AllocEngine().ReconcileNow(); err != nil {
+			t.Fatalf("prepare idle allocation: %v", err)
+		}
+	}
+	if got := allocationTotal(); got != 1 {
+		t.Fatalf("idle allocation = %d, want one keep-alive worker", got)
+	}
+
+	started, release := tc.proc.gate(tenantID)
+	defer release()
+	request := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, 20)}
+	for i := range request.Tasks {
+		request.Tasks[i] = types.TaskSubmitRequest{
+			TenantID: tenantID,
+			Payload:  json.RawMessage(fmt.Sprintf(`{"index":%d}`, i)),
+		}
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	follower := 1 - leader
+	response, err := (&http.Client{Timeout: 5 * time.Second}).Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+		"application/json", bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("submit through follower: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		data, _ := io.ReadAll(response.Body)
+		t.Fatalf("submit status = %d, want 202; body=%s", response.StatusCode, data)
+	}
+	var submitted types.BatchTaskResponse
+	if err := json.NewDecoder(response.Body).Decode(&submitted); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("keep-alive worker did not start the submitted backlog")
+	}
+	tc.waitFor(func() bool { return allocationTotal() > 1 }, 2*time.Second,
+		"durable submission wakes allocation before periodic tick")
+
+	release()
+	tc.waitFor(func() bool {
+		for _, task := range submitted.Tasks {
+			result := tc.fsms().GetResult(task.TaskID)
+			if result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return len(submitted.Tasks) == len(request.Tasks)
+	}, 10*time.Second, "event-woken backlog completes")
+	for _, task := range submitted.Tasks {
+		if count := tc.proc.processedTaskCount(task.TaskID); count != 1 {
+			t.Fatalf("task %s processed %d times, want once", task.TaskID, count)
+		}
 	}
 }
 

@@ -663,6 +663,24 @@ func (f *FSM) GetAllAllocations() map[string]*types.NodeAllocation {
 	return out
 }
 
+// AllocatedWorkersForTenants returns current allocation totals only for the
+// requested tenants. It avoids cloning the full node×tenant allocation mirror
+// on the submission hot path.
+func (f *FSM) AllocatedWorkersForTenants(tenantIDs []string) map[string]int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	totals := make(map[string]int, len(tenantIDs))
+	for _, tenantID := range tenantIDs {
+		totals[tenantID] = 0
+	}
+	for _, allocation := range f.state.Allocations {
+		for tenantID := range totals {
+			totals[tenantID] += allocation.Tenants[tenantID]
+		}
+	}
+	return totals
+}
+
 // GetTask returns a task record.  Returns nil if not found.
 func (f *FSM) GetTask(taskID string) *types.TaskRecord {
 	f.mu.RLock()

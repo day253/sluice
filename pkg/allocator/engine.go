@@ -63,6 +63,12 @@ type Engine struct {
 	mu       sync.Mutex
 	isLeader bool
 
+	// Reconciliation mutates leader-local idle/borrowing state and commits one
+	// allocation snapshot. Timer ticks, leadership callbacks, and Worker
+	// registrations may all request it concurrently, so keep the whole
+	// read-compute-commit cycle single-flight.
+	reconcileMu sync.Mutex
+
 	// per-tenant idle tracking (leader-local, not replicated)
 	idleCycles map[string]int // tenantID → consecutive cycles with 0 inflight
 
@@ -73,6 +79,11 @@ type Engine struct {
 
 	// configuration
 	minWorkersPerTenant int
+
+	// workAvailable is a coalescing edge-trigger. A durable submission wakes an
+	// idle allocation immediately instead of waiting for the periodic safety
+	// tick; a burst occupies at most one buffered notification.
+	workAvailable chan struct{}
 }
 
 // NewEngine creates an allocator engine.
@@ -90,6 +101,7 @@ func NewEngine(
 		idleCycles:          make(map[string]int),
 		borrowedTargets:     make(map[string]int),
 		minWorkersPerTenant: 1,
+		workAvailable:       make(chan struct{}, 1),
 	}
 }
 
@@ -100,6 +112,8 @@ func NewEngine(
 // SetLeader must be called with true when this node becomes the Raft leader,
 // and false when it steps down.
 func (e *Engine) SetLeader(leader bool) {
+	e.reconcileMu.Lock()
+	defer e.reconcileMu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.isLeader = leader
@@ -133,11 +147,12 @@ func (e *Engine) Start(ctx context.Context, interval time.Duration) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				if !e.IsLeader() {
-					continue
+			case <-e.workAvailable:
+				if err := e.ReconcileNow(); err != nil {
+					e.logger.Error("allocator: work-triggered reconcile failed", zap.Error(err))
 				}
-				if err := e.Reconcile(); err != nil {
+			case <-ticker.C:
+				if err := e.ReconcileNow(); err != nil {
 					e.logger.Error("allocator: reconcile failed", zap.Error(err))
 				}
 			}
@@ -145,12 +160,49 @@ func (e *Engine) Start(ctx context.Context, interval time.Duration) {
 	}()
 }
 
+// NotifyWorkAvailable wakes the run loop after tasks have been durably
+// committed for a tenant that is still on its single idle keep-alive worker.
+// Active tenants do not create redundant allocation logs. The notification
+// never blocks and concurrent idle-tenant batches coalesce; the periodic tick
+// remains the liveness fallback.
+func (e *Engine) NotifyWorkAvailable(tenantIDs []string) {
+	eligible := make([]string, 0, len(tenantIDs))
+	seen := make(map[string]struct{}, len(tenantIDs))
+	for _, tenantID := range tenantIDs {
+		if _, ok := seen[tenantID]; ok {
+			continue
+		}
+		seen[tenantID] = struct{}{}
+		tenant, ok := e.fsm.GetTenant(tenantID)
+		if ok && tenant.MaxWorkers > e.minWorkersPerTenant {
+			eligible = append(eligible, tenantID)
+		}
+	}
+	allocated := e.fsm.AllocatedWorkersForTenants(eligible)
+	needsWake := false
+	for _, tenantID := range eligible {
+		if allocated[tenantID] <= e.minWorkersPerTenant {
+			needsWake = true
+			break
+		}
+	}
+	if !needsWake {
+		return
+	}
+	select {
+	case e.workAvailable <- struct{}{}:
+	default:
+	}
+}
+
 // ReconcileNow triggers an immediate reconciliation (if leader).
 func (e *Engine) ReconcileNow() error {
+	e.reconcileMu.Lock()
+	defer e.reconcileMu.Unlock()
 	if !e.IsLeader() {
 		return nil
 	}
-	return e.Reconcile()
+	return e.reconcile()
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +212,12 @@ func (e *Engine) ReconcileNow() error {
 // Reconcile computes the fair allocation, applies idle detection, and writes
 // the final plan to Raft.
 func (e *Engine) Reconcile() error {
+	e.reconcileMu.Lock()
+	defer e.reconcileMu.Unlock()
+	return e.reconcile()
+}
+
+func (e *Engine) reconcile() error {
 	if err := e.requeueStaleTasks(); err != nil {
 		return err
 	}
