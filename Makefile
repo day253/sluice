@@ -1,4 +1,4 @@
-.PHONY: all build test unit-test integration-test bench clean deps proto docker push-docker remote-deploy multipass multipass-clean run-dev run-node1 run-node2 run-node3
+.PHONY: all build test unit-test integration-test bench clean deps proto docker push-docker remote-deploy run-dev run-node1 run-node2 run-node3
 
 APP      := sluice
 CMD_DIR  := ./cmd/sluice
@@ -89,13 +89,6 @@ helm-lint:
 
 helm-template:
 	helm template sluice ./charts/sluice
-
-# ---- Multipass (legacy) ----
-multipass: build
-	./multipass/setup.sh
-
-multipass-clean:
-	./multipass/teardown.sh
 
 # ---- Run (development single-node) ----
 run-dev: build
