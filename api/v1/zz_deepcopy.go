@@ -2,6 +2,7 @@
 package v1
 
 import (
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -34,13 +35,34 @@ func (in *SluiceClusterSpec) DeepCopyInto(out *SluiceClusterSpec) {
 		clone := ResourceSpec{}
 		if in.Resources.Requests != nil {
 			clone.Requests = make(map[string]string, len(in.Resources.Requests))
-			for k, v := range in.Resources.Requests { clone.Requests[k] = v }
+			for k, v := range in.Resources.Requests {
+				clone.Requests[k] = v
+			}
 		}
 		if in.Resources.Limits != nil {
 			clone.Limits = make(map[string]string, len(in.Resources.Limits))
-			for k, v := range in.Resources.Limits { clone.Limits[k] = v }
+			for k, v := range in.Resources.Limits {
+				clone.Limits[k] = v
+			}
 		}
 		out.Resources = &clone
+	}
+	if in.Autoscaling != nil {
+		out.Autoscaling = new(WorkerAutoscalingSpec)
+		in.Autoscaling.DeepCopyInto(out.Autoscaling)
+	}
+}
+
+func (in *WorkerAutoscalingSpec) DeepCopyInto(out *WorkerAutoscalingSpec) {
+	*out = *in
+	if in.Metrics != nil {
+		out.Metrics = make([]autoscalingv2.MetricSpec, len(in.Metrics))
+		for i := range in.Metrics {
+			in.Metrics[i].DeepCopyInto(&out.Metrics[i])
+		}
+	}
+	if in.Behavior != nil {
+		out.Behavior = in.Behavior.DeepCopy()
 	}
 }
 
@@ -123,19 +145,27 @@ func (in *TenantList) DeepCopy() *TenantList {
 // ---- runtime.Object ----
 
 func (in *SluiceCluster) DeepCopyObject() runtime.Object {
-	if c := in.DeepCopy(); c != nil { return c }
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
 	return nil
 }
 func (in *SluiceClusterList) DeepCopyObject() runtime.Object {
-	if c := in.DeepCopy(); c != nil { return c }
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
 	return nil
 }
 func (in *Tenant) DeepCopyObject() runtime.Object {
-	if c := in.DeepCopy(); c != nil { return c }
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
 	return nil
 }
 func (in *TenantList) DeepCopyObject() runtime.Object {
-	if c := in.DeepCopy(); c != nil { return c }
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
 	return nil
 }
 

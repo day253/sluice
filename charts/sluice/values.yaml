@@ -7,6 +7,39 @@ control:
 # and session fencing, but no PVC and no Raft membership.
 worker:
   replicas: 50
+  # HPA only scales the stateless Worker StatefulSet. The Raft/control
+  # StatefulSet above always remains at control.replicas.
+  autoscaling:
+    enabled: false
+    minReplicas: 5
+    maxReplicas: 100
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 70
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        selectPolicy: Max
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 60
+          - type: Pods
+            value: 10
+            periodSeconds: 60
+      # Worker shutdown drains already-started Processor calls. A five-minute
+      # stabilization window avoids churn and repeated task lease recovery.
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        selectPolicy: Max
+        policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
 
 # Consensus quorum size within the fixed control plane.
 raftVoters: 5
@@ -54,3 +87,17 @@ affinity:
 # Toleration / nodeSelector (for microk8s single-node, disable affinity).
 tolerations: []
 nodeSelector: {}
+
+# Optional CRD controller. The chart's direct control/worker resources and HPA
+# work without it; enable this when SluiceCluster/Tenant custom resources will
+# manage additional clusters in the namespace/cluster.
+operator:
+  enabled: false
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi

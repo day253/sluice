@@ -7,7 +7,9 @@ metadata:
     app.kubernetes.io/component: worker
 spec:
   serviceName: {{ include "sluice.fullname" . }}-worker-headless
+  {{- if not .Values.worker.autoscaling.enabled }}
   replicas: {{ .Values.worker.replicas }}
+  {{- end }}
   podManagementPolicy: Parallel
   selector:
     matchLabels:

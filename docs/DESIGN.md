@@ -629,3 +629,44 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   tenant 零额外日志；真实 `TestDurableSubmissionWakesIdleAllocator` 把 periodic tick 延长
   为一小时，经 Follower HTTP、Leader Raft、Allocator、allocation push 和 Worker 验证
   2 秒内唤醒、20 条任务最终各处理一次。
+
+### HPA-001：只扩缩无状态 Worker 的 Kubernetes HPA
+
+- **需求边界**：`spec.replicas` / `control.replicas` 是固定、奇数的 control/Raft 成员数，
+  永远不是 HPA target；`spec.workerReplicas` / `worker.replicas` 是无状态执行面的静态或
+  初始规模。Helm 与 `SluiceCluster` CRD 都只创建 `autoscaling/v2` HPA，且
+  `scaleTargetRef` 必须是独立的 Worker StatefulSet。扩一个 Worker 只增加
+  `workersPerNode` 个执行槽，不增加 Raft 日志副本、quorum 或 PVC。
+- **所有权**：Helm 开启 `worker.autoscaling.enabled` 后不再渲染 Worker 的
+  `spec.replicas`；CRD operator 在 HPA 开启期间保留 scale subresource 的当前值，不能在
+  每次 reconcile 把副本数改回 `workerReplicas`。关闭 HPA 时删除本 CR 拥有的 HPA，并恢复
+  静态 Worker 数。control 始终由声明值管理。
+- **服务发现**：CRD operator 为每个 control ordinal 创建稳定的 Pod-specific ClusterIP
+  Service，control 用实际 IP advertise/join；同时读取 control API Service 的 ClusterIP 并
+  注入 Worker Pod。control/Worker 都不依赖目标环境可能被代理成 fake IP 的集群 DNS。
+  ClusterIP 在 Service 生命周期内保持不变；人工删除并重建 control Pod Service 属于显式
+  Raft 地址迁移，不由 HPA 隐式处理。地址只是当前 Kubernetes 镜像，不进入业务
+  Raft/FSM/Snapshot。
+- **指标与默认值**：默认目标是 CPU utilization 70%，因此 Worker 必须设置 CPU request，
+  并要求集群提供 Metrics API。Helm `metrics` 和 CRD `spec.autoscaling.metrics` 都接受原生
+  autoscaling/v2 resource、Pods、Object 或 External 指标；生产上更推荐经已有 metrics
+  adapter 暴露集群 unfinished backlog，因为 CPU 不能识别“控制面已饱和但 Worker 空闲”。
+  本 Chart/Operator 不安装 metrics-server、Prometheus Adapter，也不把 workload 历史写入
+  Raft 或反馈调度。
+- **缩容与故障模型**：默认 `minReplicas>=1`、扩容窗口 0 秒、缩容稳定窗口 300 秒且每分钟
+  最多收回 25%。Pod 获得终止信号后停止领取新 assignment，并在 30 秒 grace 内完成已开始
+  Processor；断流后 Leader 撤销该 Worker 的未来容量，但 inflight 不立即重派，仍按既有
+  claim lease 恢复，避免同一业务副作用并发执行。HPA 的推荐最小值还必须满足租户基础
+  Limit、单 Worker 槽数和故障余量，不能只按平均 CPU 取值。
+- **非目标**：本次不支持 control/Raft 自动扩缩、scale-to-zero/KEDA、按租户独立 Pod 池、
+  Multi-Raft shard 自动扩缩，也不让 Kubernetes HPA 选择具体 task 或 allocation。具体
+  task→Worker 归属仍只有当前 Raft Leader 选择并提交。
+- **用法**：直接 Helm 部署设置
+  `worker.autoscaling.enabled=true`、`minReplicas`、`maxReplicas` 和原生 `metrics`；CRD 模式
+  先以 `operator.enabled=true` 安装 operator，再在 `SluiceCluster.spec.autoscaling` 中设置
+  同样字段。两种入口不能同时管理同名 Worker StatefulSet。
+- **回归覆盖**：CRD deepcopy、reconciler 和 Chart 单测固定 HPA target、上下界、默认
+  behavior、资源 request、replica 所有权和关闭恢复。真实
+  `TestStatelessWorkerRoleSplit` 在三 voter 集群中扩一个 Worker、制造 durable backlog、
+  验证新容量参与分配且 membership 不变，再缩回并确认后续任务无 lease 尾部、Leader
+  故障后仍 exactly-once 排空。

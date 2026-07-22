@@ -1,0 +1,47 @@
+apiVersion: sluice.day253.github.com/v1
+kind: SluiceCluster
+metadata:
+  name: sample
+  namespace: default
+spec:
+  # Fixed Raft/control quorum. HPA never changes this field.
+  replicas: 3
+  workerReplicas: 5
+  workersPerNode: 100
+  image: ghcr.io/day253/sluice:latest
+  autoscaling:
+    enabled: true
+    minReplicas: 5
+    maxReplicas: 100
+    metrics:
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 70
+    behavior:
+      scaleUp:
+        stabilizationWindowSeconds: 0
+        selectPolicy: Max
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 60
+          - type: Pods
+            value: 10
+            periodSeconds: 60
+      scaleDown:
+        stabilizationWindowSeconds: 300
+        selectPolicy: Max
+        policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi

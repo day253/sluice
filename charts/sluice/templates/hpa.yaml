@@ -1,0 +1,32 @@
+{{- if .Values.worker.autoscaling.enabled }}
+{{- $autoscaling := .Values.worker.autoscaling -}}
+{{- if lt (int $autoscaling.minReplicas) 1 -}}
+{{- fail "worker.autoscaling.minReplicas must be at least 1" -}}
+{{- end -}}
+{{- if lt (int $autoscaling.maxReplicas) (int $autoscaling.minReplicas) -}}
+{{- fail "worker.autoscaling.maxReplicas must be >= minReplicas" -}}
+{{- end -}}
+{{- if empty $autoscaling.metrics -}}
+{{- fail "worker.autoscaling.metrics must contain at least one autoscaling/v2 metric" -}}
+{{- end -}}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "sluice.fullname" . }}-worker
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: {{ include "sluice.fullname" . }}-worker
+  minReplicas: {{ $autoscaling.minReplicas }}
+  maxReplicas: {{ $autoscaling.maxReplicas }}
+  metrics:
+    {{- toYaml $autoscaling.metrics | nindent 4 }}
+  {{- with $autoscaling.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

@@ -545,11 +545,24 @@ func (p *recordingProcessor) Process(ctx context.Context, taskID, tenantID strin
 func (p *recordingProcessor) gate(tenantID string) (<-chan string, func()) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	started := make(chan string, 128)
+	release := make(chan struct{})
 	p.gateTenant = tenantID
-	p.gateStarted = make(chan string, 128)
-	p.gateRelease = make(chan struct{})
+	p.gateStarted = started
+	p.gateRelease = release
 	var once sync.Once
-	return p.gateStarted, func() { once.Do(func() { close(p.gateRelease) }) }
+	return started, func() {
+		once.Do(func() {
+			close(release)
+			p.mu.Lock()
+			if p.gateRelease == release {
+				p.gateTenant = ""
+				p.gateStarted = nil
+				p.gateRelease = nil
+			}
+			p.mu.Unlock()
+		})
+	}
 }
 
 func (p *recordingProcessor) canceledCount() int {
@@ -836,6 +849,43 @@ func TestStatelessWorkerRoleSplit(t *testing.T) {
 	}
 	assertMembership()
 
+	// HPA-001 scale-out boundary: a new execution Pod registers as a stateless
+	// Worker, receives allocation, and must not join the three-voter Raft
+	// membership. Kubernetes HPA changes only this Worker StatefulSet size.
+	scaledWorker, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+		NodeID: "worker-2", APIAddress: "127.0.0.1:0",
+		ControllerAddress: httpAddrs[2], TotalWorkers: 8,
+	}, processor, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workers = append(workers, scaledWorker)
+	go func() { _ = scaledWorker.Start() }()
+	waitFor(10*time.Second, "HPA scale-out Worker registered", func() bool {
+		nodeInfo := controls[1].RaftCluster().FSM().GetAllNodes()["worker-2"]
+		return nodeInfo != nil && nodeInfo.Status == types.NodeStatusUp
+	})
+	assertMembership()
+	// Extra Pods do not move a satisfied tenant merely for placement symmetry.
+	// Raising Limit alone also does not wake an idle tenant: create durable
+	// backlog as the actual demand signal before requiring new capacity.
+	apply(raftpkg.OpUpsertTenant, types.TenantConfig{ID: "role-split", Name: "Role Split", MaxWorkers: 24})
+	_, releaseScaleOut := processor.gate("role-split")
+	defer releaseScaleOut()
+	scaleOutTasks := make([]raftpkg.CreateTaskData, 24)
+	scaleOutTaskIDs := make([]string, len(scaleOutTasks))
+	for index := range scaleOutTasks {
+		taskID := fmt.Sprintf("hpa-scale-out-%d", index)
+		scaleOutTaskIDs[index] = taskID
+		scaleOutTasks[index] = raftpkg.CreateTaskData{TaskID: taskID, TenantID: "role-split", Payload: `{"hpa":"scale-out"}`}
+	}
+	apply(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: scaleOutTasks})
+	waitFor(10*time.Second, "HPA scale-out Worker allocated after capacity demand grows", func() bool {
+		allocation, ok := controls[1].RaftCluster().FSM().GetAllocation("worker-2")
+		return ok && allocation.Tenants["role-split"] > 0
+	})
+	releaseScaleOut()
+
 	submit := func(address, prefix string, count int) []string {
 		tasks := make([]types.TaskSubmitRequest, count)
 		for index := range tasks {
@@ -864,18 +914,53 @@ func TestStatelessWorkerRoleSplit(t *testing.T) {
 		return ids
 	}
 	waitDone := func(ids []string) {
-		waitFor(30*time.Second, "stateless worker task completion", func() bool {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
 			fsm := controls[1].RaftCluster().FSM()
+			complete := true
 			for _, taskID := range ids {
 				if result := fsm.GetResult(taskID); result == nil || result.Status != types.TaskStatusDone {
-					return false
+					complete = false
+					break
 				}
 			}
-			return true
-		})
+			if complete {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		states := map[string]int{}
+		fsm := controls[1].RaftCluster().FSM()
+		for _, taskID := range ids {
+			if result := fsm.GetResult(taskID); result != nil {
+				states["result:"+result.Status]++
+			} else if task := fsm.GetTask(taskID); task != nil {
+				states["task:"+task.Status+":"+task.NodeID]++
+			} else {
+				states["missing"]++
+			}
+		}
+		t.Fatalf("timed out waiting for stateless worker task completion: %v", states)
 	}
+	waitDone(scaleOutTaskIDs)
 	first := submit(httpAddrs[2], "initial", 80)
 	waitDone(first)
+
+	// Scale-in must drain already-started Processor calls and then remove only
+	// execution capacity. The control membership remains exactly three voters,
+	// and subsequent work must continue without waiting for a task lease.
+	if err := workers[2].Shutdown(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	workers[2] = nil
+	waitFor(10*time.Second, "HPA scale-in Worker removed from capacity", func() bool {
+		nodeInfo := controls[1].RaftCluster().FSM().GetAllNodes()["worker-2"]
+		_, allocated := controls[1].RaftCluster().FSM().GetAllocation("worker-2")
+		return nodeInfo != nil && nodeInfo.Status == types.NodeStatusDown && !allocated
+	})
+	assertMembership()
+	scaleInTasks := submit(httpAddrs[2], "after-scale-in", 32)
+	waitDone(scaleInTasks)
 
 	oldSession := controls[1].RaftCluster().FSM().GetAllNodes()["worker-0"].SessionID
 	oldWorker := workers[0]
@@ -1006,7 +1091,7 @@ func TestStatelessWorkerRoleSplit(t *testing.T) {
 	assertMembership()
 
 	counts := processor.processedTaskCounts()
-	allTasks := append(append(first, replacementTasks...), second...)
+	allTasks := append(append(append(append(scaleOutTaskIDs, first...), scaleInTasks...), replacementTasks...), second...)
 	for _, taskID := range allTasks {
 		if counts[taskID] != 1 {
 			t.Fatalf("task %s executed %d times, want once", taskID, counts[taskID])

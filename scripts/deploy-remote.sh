@@ -59,6 +59,15 @@ microk8s helm3 template "${RELEASE}" ./charts/sluice \
   --namespace "${NAMESPACE}" \
   --set control.replicas=5 \
   --set worker.replicas=50 >/tmp/sluice-rendered.yaml
+microk8s helm3 template "${RELEASE}" ./charts/sluice \
+  --namespace "${NAMESPACE}" \
+  --set control.replicas=5 \
+  --set worker.autoscaling.enabled=true \
+  --set worker.autoscaling.minReplicas=50 \
+  --set worker.autoscaling.maxReplicas=100 \
+  --set operator.enabled=true >/tmp/sluice-autoscaling-rendered.yaml
+microk8s kubectl apply --dry-run=server --namespace "${NAMESPACE}" \
+  -f /tmp/sluice-autoscaling-rendered.yaml >/dev/null
 
 printf '\n==> Building container on remote host\n'
 if ! docker build -t "${IMAGE}" .; then
@@ -74,8 +83,10 @@ if ! docker build -t "${IMAGE}" .; then
   printf 'Docker Hub unavailable; compiling locally and reusing %s\n' "${BASE_IMAGE}"
   mkdir -p bin
   CGO_ENABLED=0 go build -trimpath -o bin/sluice ./cmd/sluice
+  CGO_ENABLED=0 go build -trimpath -o bin/sluice-operator ./cmd/operator
   offline_container="$(docker create "${BASE_IMAGE}")"
-  if ! docker cp bin/sluice "${offline_container}:/usr/local/bin/sluice"; then
+  if ! docker cp bin/sluice "${offline_container}:/usr/local/bin/sluice" || \
+    ! docker cp bin/sluice-operator "${offline_container}:/usr/local/bin/sluice-operator"; then
     docker rm "${offline_container}" >/dev/null
     exit 1
   fi

@@ -28,7 +28,9 @@ func init() {
 
 func main() {
 	var probeAddr string
+	var enableLeaderElection bool
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "Health probe endpoint")
+	flag.BoolVar(&enableLeaderElection, "leader-elect", true, "Use a Kubernetes Lease so only one operator replica reconciles")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -36,8 +38,11 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		HealthProbeBindAddress: probeAddr,
+		Scheme:                        scheme,
+		HealthProbeBindAddress:        probeAddr,
+		LeaderElection:                enableLeaderElection,
+		LeaderElectionID:              "sluice-operator.sluice.day253.github.com",
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
