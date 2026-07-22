@@ -658,6 +658,10 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   Processor；断流后 Leader 撤销该 Worker 的未来容量，但 inflight 不立即重派，仍按既有
   claim lease 恢复，避免同一业务副作用并发执行。HPA 的推荐最小值还必须满足租户基础
   Limit、单 Worker 槽数和故障余量，不能只按平均 CPU 取值。
+- **缩容后的身份镜像**：FSM 可以保留曾注册 ordinal/session 的 `down` Worker 当前状态，
+  供相同 ordinal 恢复时复用；它不是历史时序、Raft member 或可用容量。部署验收只统计
+  `status=up` 的 Worker，并要求 allocation 只指向这些 Worker，不能用 FSM Node 总数推导
+  StatefulSet 当前副本数。保留身份的 ordinal 受 HPA `maxReplicas` 限制，不随任务增长。
 - **非目标**：本次不支持 control/Raft 自动扩缩、scale-to-zero/KEDA、按租户独立 Pod 池、
   Multi-Raft shard 自动扩缩，也不让 Kubernetes HPA 选择具体 task 或 allocation。具体
   task→Worker 归属仍只有当前 Raft Leader 选择并提交。

@@ -233,19 +233,9 @@ for _ in $(seq 1 60); do
     wget -qO- 'http://127.0.0.1:9090/api/v1/admin/nodes')"
   allocations_json="$(microk8s kubectl exec --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
     wget -qO- 'http://127.0.0.1:9090/api/v1/admin/allocations')"
-  if NODES_JSON="${nodes_json}" ALLOCATIONS_JSON="${allocations_json}" python3 -c '
-import json, os, sys
-nodes = json.loads(os.environ["NODES_JSON"])["nodes"]
-allocations = json.loads(os.environ["ALLOCATIONS_JSON"])["nodes"]
-controls = [node for node in nodes if node.get("role") == "control"]
-workers = [node for node in nodes if node.get("role") == "worker" and node.get("status") == "up"]
-roles = {node["node_id"]: node.get("role") for node in nodes}
-valid = (len(nodes) == 55 and len(controls) == 5 and len(workers) == 50 and
-         all(node.get("total_workers") == 0 for node in controls) and
-         sum(node.get("total_workers", 0) for node in workers) == 5000 and
-         all(roles.get(allocation["node_id"]) == "worker" for allocation in allocations))
-sys.exit(0 if valid else 1)
-'; then
+  if NODES_JSON="${nodes_json}" ALLOCATIONS_JSON="${allocations_json}" \
+    python3 scripts/validate-topology.py \
+      --controls 5 --workers 50 --worker-capacity 5000; then
     topology_ready=true
     break
   fi

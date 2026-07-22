@@ -526,7 +526,10 @@ MicroK8s、5 control voter + 50 stateless Worker、每 Worker 100 槽；Demo Pro
 50～200ms。四租户 Limit 为 100/60/30/500，按条目轮转提交 20,000 条，payload 是小型 JSON，
 HTTP batch=500、concurrency=4，直接访问同一个 Leader。Helm revision 45 的运行镜像为
 `localhost:32000/sluice:bddafeb-20260722173728`；标签中的 commit 是部署前基准，镜像包含
-本节待提交工作树，故后续提交后用正式 commit 标签替换，不把标签误当源码证明。
+本节待提交工作树，故不把标签误当源码证明。提交后正式镜像
+`localhost:32000/sluice:636ff40-20260722181142` 已滚动到 revision 46 的 5 control/50
+Worker；该替换只改变镜像标签，下面基线来自同一份二进制和 Chart 内容，不冒充另一轮性能
+样本。
 
 | 版本/拓扑 | accepted | accepted 后排空 | 端到端 | 吞吐 | t50 | t90 | 最终 unfinished |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -553,6 +556,11 @@ t50/t90 略慢是单轮抖动，不能归因于默认关闭、且不在任务路
   `spec.autoscaling.minReplicas/maxReplicas` 后，HPA 与 FSM 均收敛 1→2→1，Raft 始终只有
   `smoke-0` 一个 voter、无 non-voter。smoke namespace、operator、RBAC 和 Lease 随后全部
   删除，主 release 保持 5/50。
+
+HPA 51→50 后 FSM 按设计保留 `worker-50` 的 down 身份镜像，但没有 allocation 指向它，
+也不计入 5000 个可用执行槽。revision 46 首次部署后的旧门禁用 FSM Node 总数等同 Pod
+副本数，因而误报 56≠55；HPA-002 改为检查 5 个 up control、50 个 up Worker、up Worker
+容量和 allocation owner。它只修复验收判断，不改变上述性能路径，因此不另算性能样本。
 
 目标 MicroK8s 的 metrics-server 仍未启用，所以本轮只验证 HPA API、scale ownership、
 min/max 控制器路径和 Sluice 注册/缩容正确性，不宣称 CPU 或 backlog 指标驱动的自动决策

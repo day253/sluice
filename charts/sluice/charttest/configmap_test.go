@@ -1,10 +1,75 @@
 package charttest
 
 import (
+	"encoding/json"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
+
+func TestRemoteTopologyValidationAllowsHPAReplicaHistory(t *testing.T) {
+	type node struct {
+		NodeID       string `json:"node_id"`
+		Role         string `json:"role"`
+		Status       string `json:"status"`
+		TotalWorkers int    `json:"total_workers"`
+	}
+	type allocation struct {
+		NodeID string `json:"node_id"`
+	}
+
+	controls := []node{
+		{NodeID: "control-0", Role: "control", Status: "up"},
+		{NodeID: "control-1", Role: "control", Status: "up"},
+		{NodeID: "control-2", Role: "control", Status: "up"},
+		{NodeID: "control-3", Role: "control", Status: "up"},
+		{NodeID: "control-4", Role: "control", Status: "up"},
+	}
+	workers := []node{
+		{NodeID: "worker-0", Role: "worker", Status: "up", TotalWorkers: 100},
+		{NodeID: "worker-1", Role: "worker", Status: "up", TotalWorkers: 100},
+	}
+	downHistory := node{NodeID: "worker-2", Role: "worker", Status: "down", TotalWorkers: 100}
+
+	run := func(t *testing.T, nodes []node, allocations []allocation, wantValid bool) {
+		t.Helper()
+		nodesJSON, err := json.Marshal(map[string]any{"nodes": nodes})
+		if err != nil {
+			t.Fatal(err)
+		}
+		allocationsJSON, err := json.Marshal(map[string]any{"nodes": allocations})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("python3", "../../../scripts/validate-topology.py",
+			"--controls", "5", "--workers", "2", "--worker-capacity", "200")
+		cmd.Env = append(os.Environ(),
+			"NODES_JSON="+string(nodesJSON),
+			"ALLOCATIONS_JSON="+string(allocationsJSON),
+		)
+		err = cmd.Run()
+		if wantValid && err != nil {
+			t.Fatalf("expected topology to be valid: %v", err)
+		}
+		if !wantValid && err == nil {
+			t.Fatal("expected topology to be rejected")
+		}
+	}
+
+	t.Run("retained down identity is not current capacity", func(t *testing.T) {
+		nodes := append(append(append([]node{}, controls...), workers...), downHistory)
+		run(t, nodes, []allocation{{NodeID: "worker-0"}, {NodeID: "worker-1"}}, true)
+	})
+	t.Run("allocation cannot target retained down identity", func(t *testing.T) {
+		nodes := append(append(append([]node{}, controls...), workers...), downHistory)
+		run(t, nodes, []allocation{{NodeID: "worker-2"}}, false)
+	})
+	t.Run("retained identity cannot replace an up worker", func(t *testing.T) {
+		nodes := append(append([]node{}, controls...), workers[0], downHistory)
+		run(t, nodes, []allocation{{NodeID: "worker-0"}}, false)
+	})
+}
 
 func TestWorkerEntrypointUsesStableServiceIPInsteadOfClusterDNS(t *testing.T) {
 	data, err := os.ReadFile("../templates/configmap.yaml")
