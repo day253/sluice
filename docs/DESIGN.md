@@ -652,6 +652,39 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   为一小时，经 Follower HTTP、Leader Raft、Allocator、allocation push 和 Worker 验证
   2 秒内唤醒、20 条任务最终各处理一次。
 
+### CAPACITY-001：单个 Worker 实例的可配置 Processor 并发
+
+- **需求边界**：`PUT /api/v1/admin/nodes/{worker_id}/capacity` 接受
+  `{"total_workers":1..1000}`，配置的是一个存活 stateless Worker 实例实际可并发领取任务的
+  Processor 槽位，不是 tenant `Limit`、Pod 副本数、CPU/内存 request 或业务 Processor
+  耗时。WebUI 的 Load Lab 直接列出按 ID 稳定排序的 live Worker，可在不弹窗的情况下修改
+  此值并显示 startup default / Raft override。
+- **共识与存储**：容量 override 是 `NodeInfo` 的当前配置镜像，经
+  `OpSetWorkerCapacity` 写入 Raft/FSM/Snapshot；它不是 174 点历史。`TotalWorkers` 始终是
+  allocator 使用的有效容量，`CapacityOverride=0` 表示采用进程注册时的启动值。相同稳定
+  `worker_id`（Kubernetes StatefulSet ordinal）重启并报告 Helm/CLI 默认值时，已提交
+  override 仍优先；Worker stream、实际 goroutine 和 Processor 状态仍只在进程内存。
+- **收敛与缩容语义**：任意 Follower HTTP 接入都转发当前 Leader。Leader 先提交容量；
+  同一 Raft entry 会把该节点已有 allocation 确定性裁到新上限，保证 Leader 在第二次
+  allocation commit 前故障也不会留下超容量镜像；随后同步运行 allocator 并提交全局公平
+  计划，成功响应后由 AllocationPush 让本地 Pool 收敛。缩掉的槽不再领取下一条 assignment，
+  但已经 claim 并进入 Processor 的任务不取消，直接完成并提交一次 final state。
+- **失败模型**：容量和最终 allocation 之间若失去 Leader/quorum，API 返回失败；已提交的
+  安全裁剪仍有效，新 Leader 的周期 reconcile 会完成重新分配。Worker 断线时 override 随
+  down 身份保留但不计 live capacity；同 ID 恢复后复用。未知节点、control、down Worker
+  和范围外值都拒绝，防止误把 control 或无界 goroutine 池加入执行容量。
+- **HPA 关系与非目标**：workload autoscaler 仍只修改 Worker StatefulSet 副本，不自动
+  调此 API。由于各 Pod 可异构，它的 allocation utilization 投影改用真实 live Worker
+  实例数，不再用 `total capacity / workersPerPod` 猜副本数。本阶段不根据 backlog 自动
+  调单 Pod 并发、不修改资源 request/limit、不跨不同 worker_id 搬迁正在执行的 Processor，
+  也不提供容量历史或绕过 Leader-only assignment。
+- **覆盖**：FSM 单测固定范围/角色校验、原子安全裁剪、注册与 Snapshot 后 override
+  保持；Node/API 单测固定重复注册 no-op、HTTP 校验与委托；autoscaler 单测固定异构容量
+  的真实实例数；Chrome 组件测试从页面完成一次更新。真实
+  `TestWorkerInstanceCapacityAPIConvergesRuntimeAndSurvivesRestart` 经 Follower HTTP、
+  3-voter Raft、Leader allocation、AllocationPush、stateless Pool 完成 3→1→4，并以
+  启动默认 3 重启同 ID，最终仍保持 override 4。
+
 ### HPA-001：只扩缩无状态 Worker 的原生 Kubernetes HPA
 
 - **需求边界**：`spec.replicas` / `control.replicas` 是固定、奇数的 control/Raft 成员数，
@@ -701,9 +734,9 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 
 - **问题与需求边界**：Demo Processor 主要是 sleep/I/O 时，Pod CPU 很低并不代表执行面有
   空闲；unfinished 持续增加而 CPU HPA 不动作会让积压排空过慢。`mode=workload` 每 5 秒
-  只读取三个当前时刻镜像：所有 tenant 的 `inflight` 总和、`status=up/role=worker` 的
-  `total_workers` 总容量、allocation 中已分配 Worker 总数。它们不新增历史、不进入 Raft、
-  FSM 或 Snapshot，也不参与 task→node 选择。
+  只读取当前时刻镜像：所有 tenant 的 `inflight` 总和、`status=up/role=worker` 的实例数
+  和 `total_workers` 总容量、同一 live NodeID 集合的 allocation 总数。它们不新增历史、
+  不进入 Raft/FSM/Snapshot，也不参与 task→node 选择。
 - **决策**：backlog 建议副本为
   `ceil(total unfinished / targetBacklogPerPod)`；利用率建议副本按已注册 Worker Pod 数和
   `allocatedWorkers / liveWorkerCapacity` 投影到 `targetWorkerUtilization`。两者取最大值，
@@ -720,9 +753,9 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   policy patch 对应 Worker。`mode=workload` 不创建 HPA，`mode=hpa` 不运行 workload
   决策，两个入口不能同时拥有同一个 Worker `spec.replicas`。control/Raft StatefulSet
   永不成为 target。
-- **每 Pod 并发**：本轮只增加无状态 Worker Pod 数，不在线修改 `workersPerNode`。动态
-  增大单 Pod Processor 并发会绕过 CPU/内存 request/limit、连接池和下游限流的容量边界，
-  也让一次 Pod 故障丢失更大的已领取工作面；需要单独协议和容量实验后才能支持。
+- **每 Pod 并发**：autoscaler 只增加无状态 Worker Pod 数，不调用 CAPACITY-001 的实例
+  容量接口；显式人工修改单实例并发时，操作者必须同时评估 CPU/内存 request/limit、
+  连接池和下游限流，因为一次 Pod 故障也会影响更大的已领取工作面。
 - **故障模型与不变量**：扩容只增加执行槽；租户 Limit、借用、公平分配、集群存活容量、
   Leader-only assignment、Raft durable create/claim/final commit 和 exactly-once final
   state 都不变。autoscaler 重启会丢失本地缩容稳定计时并重新等待完整窗口，最坏情况是晚

@@ -27,6 +27,7 @@ type Signals struct {
 	Backlog          int64
 	AllocatedWorkers int64
 	WorkerCapacity   int64
+	WorkerInstances  int64
 }
 
 // Config defines workload-aware horizontal scaling bounds.
@@ -150,7 +151,16 @@ func (p Policy) Recommend(current int32, signals Signals, now time.Time, state *
 	utilizationDesired := int32(0)
 	if signals.Backlog > 0 && signals.WorkerCapacity > 0 {
 		utilization = float64(signals.AllocatedWorkers) / float64(signals.WorkerCapacity) * 100
-		registeredPods := ceilDiv(signals.WorkerCapacity, int64(config.WorkersPerPod))
+		registeredPods := signals.WorkerInstances
+		// Keep compatibility with externally supplied signal readers while the
+		// production reader always reports the exact heterogeneous instance
+		// count.
+		if registeredPods == 0 {
+			registeredPods = int64(ceilDiv(
+				signals.WorkerCapacity,
+				int64(config.WorkersPerPod),
+			))
+		}
 		utilizationDesired = int32(math.Ceil(
 			float64(registeredPods) * utilization / float64(config.TargetWorkerUtilization),
 		))
@@ -259,6 +269,7 @@ func (r HTTPReader) Read(ctx context.Context, baseURL string) (Signals, error) {
 		if node.Role == "worker" && node.Status == "up" {
 			liveWorkers[node.NodeID] = struct{}{}
 			signals.WorkerCapacity += node.TotalWorkers
+			signals.WorkerInstances++
 		}
 	}
 	for _, allocation := range allocations.Nodes {
@@ -392,7 +403,8 @@ func (r *Runner) ReconcileOnce(ctx context.Context) error {
 		if signals.Backlog > 0 {
 			log.FromContext(ctx).Info("workload autoscaler observed pressure",
 				"backlog", signals.Backlog, "allocatedWorkers", signals.AllocatedWorkers,
-				"workerCapacity", signals.WorkerCapacity, "replicas", current,
+				"workerCapacity", signals.WorkerCapacity,
+				"workerInstances", signals.WorkerInstances, "replicas", current,
 				"rawDesired", recommendation.RawDesired, "reason", recommendation.Reason)
 		}
 		return nil
@@ -408,7 +420,8 @@ func (r *Runner) ReconcileOnce(ctx context.Context) error {
 	log.FromContext(ctx).Info("workload autoscaler changed Worker replicas",
 		"from", current, "to", recommendation.Desired, "rawDesired", recommendation.RawDesired,
 		"backlog", signals.Backlog, "allocatedWorkers", signals.AllocatedWorkers,
-		"workerCapacity", signals.WorkerCapacity, "utilizationPercent", recommendation.UtilizationPercent,
+		"workerCapacity", signals.WorkerCapacity, "workerInstances", signals.WorkerInstances,
+		"utilizationPercent", recommendation.UtilizationPercent,
 		"reason", recommendation.Reason)
 	return nil
 }

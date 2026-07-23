@@ -489,7 +489,10 @@ func TestListNodes(t *testing.T) {
 	h, fsm, _ := setupHandler(t)
 	router := newRouter(h)
 
-	applyOp(fsm, raftpkg.OpNodeUp, types.NodeInfo{ID: "n1"})
+	applyOp(fsm, raftpkg.OpNodeUp, types.NodeInfo{
+		ID: "n1", Role: types.NodeRoleWorker, TotalWorkers: 250,
+		CapacityOverride: 250,
+	})
 
 	req := httptest.NewRequest("GET", "/api/v1/admin/nodes", nil)
 	rec := httptest.NewRecorder()
@@ -497,6 +500,90 @@ func TestListNodes(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("list nodes: status = %d, want 200", rec.Code)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"capacity_override":250`)) {
+		t.Fatalf("list nodes omitted capacity override: %s", rec.Body.String())
+	}
+}
+
+func TestSetWorkerCapacityEndpointValidatesAndDelegates(t *testing.T) {
+	h, fsm, _ := setupHandler(t)
+	applyOp(fsm, raftpkg.OpNodeUp, types.NodeInfo{
+		ID: "worker-1", Role: types.NodeRoleWorker, TotalWorkers: 100,
+	})
+	var gotNodeID string
+	var gotWorkers int
+	calls := 0
+	h.SetWorkerCapacityFunc(func(
+		_ context.Context,
+		nodeID string,
+		totalWorkers int,
+	) (types.WorkerCapacityResponse, error) {
+		calls++
+		gotNodeID, gotWorkers = nodeID, totalWorkers
+		return types.WorkerCapacityResponse{
+			NodeID: nodeID, TotalWorkers: totalWorkers, CapacityOverride: totalWorkers,
+		}, nil
+	})
+	router := newRouter(h)
+
+	request := httptest.NewRequest(
+		http.MethodPut,
+		"/api/v1/admin/nodes/worker-1/capacity",
+		bytes.NewReader([]byte(`{"total_workers":250}`)),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || calls != 1 ||
+		gotNodeID != "worker-1" || gotWorkers != 250 {
+		t.Fatalf(
+			"capacity update status=%d calls=%d node=%q workers=%d body=%s",
+			recorder.Code, calls, gotNodeID, gotWorkers, recorder.Body.String(),
+		)
+	}
+	var response types.WorkerCapacityResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.TotalWorkers != 250 || response.CapacityOverride != 250 {
+		t.Fatalf("capacity response = %+v", response)
+	}
+
+	for name, test := range map[string]struct {
+		path       string
+		body       string
+		wantStatus int
+	}{
+		"zero": {
+			path: "/api/v1/admin/nodes/worker-1/capacity",
+			body: `{"total_workers":0}`, wantStatus: http.StatusBadRequest,
+		},
+		"over maximum": {
+			path: "/api/v1/admin/nodes/worker-1/capacity",
+			body: `{"total_workers":1001}`, wantStatus: http.StatusBadRequest,
+		},
+		"missing": {
+			path: "/api/v1/admin/nodes/missing/capacity",
+			body: `{"total_workers":10}`, wantStatus: http.StatusNotFound,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(
+				http.MethodPut, test.path, bytes.NewReader([]byte(test.body)),
+			)
+			out := httptest.NewRecorder()
+			router.ServeHTTP(out, req)
+			if out.Code != test.wantStatus {
+				t.Fatalf(
+					"status=%d want=%d body=%s",
+					out.Code, test.wantStatus, out.Body.String(),
+				)
+			}
+		})
+	}
+	if calls != 1 {
+		t.Fatalf("invalid requests reached mutation callback %d times", calls)
 	}
 }
 

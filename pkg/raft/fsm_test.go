@@ -140,6 +140,109 @@ func TestApplyNodeUpAndDown(t *testing.T) {
 	}
 }
 
+func TestSetWorkerCapacityTrimsAllocationAndSurvivesRegistration(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpNodeUp, types.NodeInfo{
+		ID: "worker-1", Role: types.NodeRoleWorker, SessionID: "session-1",
+		TotalWorkers: 10,
+	})
+	applyCmd(t, fsm, OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"worker-1": {
+			NodeID: "worker-1",
+			Tenants: map[string]int{
+				"tenant-a": 3,
+				"tenant-b": 4,
+			},
+			Borrowed: map[string]int{
+				"tenant-a": 1,
+				"tenant-b": 4,
+			},
+		},
+	})
+
+	applyCmd(t, fsm, OpSetWorkerCapacity, SetWorkerCapacityData{
+		NodeID: "worker-1", TotalWorkers: 4,
+	})
+	node := fsm.GetAllNodes()["worker-1"]
+	if node.TotalWorkers != 4 || node.CapacityOverride != 4 {
+		t.Fatalf("worker capacity mirror = %+v, want effective override 4", node)
+	}
+	allocation, ok := fsm.GetAllocation("worker-1")
+	if !ok {
+		t.Fatal("capacity reduction removed the allocation mirror")
+	}
+	total := 0
+	for tenantID, workers := range allocation.Tenants {
+		total += workers
+		if allocation.Borrowed[tenantID] > workers {
+			t.Fatalf("borrowed allocation exceeds effective workers: %+v", allocation)
+		}
+	}
+	if total != 4 {
+		t.Fatalf("trimmed allocation = %+v, want total 4", allocation)
+	}
+
+	// The process reconnects with its chart default, but the durable override
+	// remains attached to the stable worker identity.
+	applyCmd(t, fsm, OpNodeUp, types.NodeInfo{
+		ID: "worker-1", Role: types.NodeRoleWorker, SessionID: "session-2",
+		TotalWorkers: 100,
+	})
+	node = fsm.GetAllNodes()["worker-1"]
+	if node.TotalWorkers != 4 || node.CapacityOverride != 4 ||
+		node.SessionID != "session-2" {
+		t.Fatalf("worker reconnect lost capacity override: %+v", node)
+	}
+}
+
+func TestSetWorkerCapacityRejectsInvalidTarget(t *testing.T) {
+	for name, test := range map[string]struct {
+		setup   types.NodeInfo
+		request SetWorkerCapacityData
+		offline bool
+	}{
+		"missing": {
+			request: SetWorkerCapacityData{NodeID: "missing", TotalWorkers: 1},
+		},
+		"control": {
+			setup:   types.NodeInfo{ID: "control-0", Role: types.NodeRoleControl},
+			request: SetWorkerCapacityData{NodeID: "control-0", TotalWorkers: 1},
+		},
+		"offline": {
+			setup:   types.NodeInfo{ID: "worker-0", Role: types.NodeRoleWorker},
+			request: SetWorkerCapacityData{NodeID: "worker-0", TotalWorkers: 1},
+			offline: true,
+		},
+		"zero": {
+			setup:   types.NodeInfo{ID: "worker-0", Role: types.NodeRoleWorker},
+			request: SetWorkerCapacityData{NodeID: "worker-0", TotalWorkers: 0},
+		},
+		"over maximum": {
+			setup: types.NodeInfo{ID: "worker-0", Role: types.NodeRoleWorker},
+			request: SetWorkerCapacityData{
+				NodeID: "worker-0", TotalWorkers: types.MaxWorkerCapacityPerInstance + 1,
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fsm := newTestFSM(t)
+			if test.setup.ID != "" {
+				applyCmd(t, fsm, OpNodeUp, test.setup)
+				if test.offline {
+					applyCmd(t, fsm, OpWorkerOffline, WorkerOfflineData{ID: test.setup.ID})
+				}
+			}
+			response := fsm.Apply(&raft.Log{
+				Data: MustMarshalCommand(OpSetWorkerCapacity, test.request),
+				Type: raft.LogCommand,
+			})
+			if _, ok := response.(error); !ok {
+				t.Fatalf("invalid capacity request unexpectedly succeeded: %+v", test.request)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Task lifecycle tests
 // ---------------------------------------------------------------------------
@@ -648,7 +751,12 @@ func TestSnapshotRestore_RoundTrip(t *testing.T) {
 	fsm := newTestFSM(t)
 
 	// Seed some state.
-	applyCmd(t, fsm, OpNodeUp, types.NodeInfo{ID: "n1", TotalWorkers: 50})
+	applyCmd(t, fsm, OpNodeUp, types.NodeInfo{
+		ID: "n1", Role: types.NodeRoleWorker, TotalWorkers: 50,
+	})
+	applyCmd(t, fsm, OpSetWorkerCapacity, SetWorkerCapacityData{
+		NodeID: "n1", TotalWorkers: 25,
+	})
 	applyCmd(t, fsm, OpUpsertTenant, types.TenantConfig{ID: "t1", MaxWorkers: 10})
 	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
 		TaskID: "task-1", TenantID: "t1", NodeID: "n1", Payload: `{}`,
@@ -684,6 +792,10 @@ func TestSnapshotRestore_RoundTrip(t *testing.T) {
 	task := fsm2.GetTask("task-1")
 	if task == nil || task.Status != types.TaskStatusInflight {
 		t.Error("task not restored correctly")
+	}
+	if node := fsm2.GetAllNodes()["n1"]; node == nil ||
+		node.TotalWorkers != 25 || node.CapacityOverride != 25 {
+		t.Fatalf("worker capacity override not restored: %+v", node)
 	}
 
 	// Version should be preserved.

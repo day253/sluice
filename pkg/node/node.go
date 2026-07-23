@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -194,6 +195,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 		return cluster.GetRaft().Apply(cmd, 5*time.Second).Error()
 	})
 	httpHandler.SetWorkerRegisterFunc(n.registerWorker)
+	httpHandler.SetWorkerCapacityFunc(n.setWorkerCapacity)
 
 	// ---- API server (cmux or legacy HTTP) ----
 	if cfg.APIAddress != "" {
@@ -657,9 +659,97 @@ func (n *Node) registerWorker(info types.NodeInfo) error {
 }
 
 func workerRegistrationChanged(existing, next *types.NodeInfo) bool {
+	capacityChanged := existing != nil && next != nil && existing.CapacityOverride == 0 &&
+		existing.TotalWorkers != next.TotalWorkers
 	return existing == nil || next == nil || existing.Role != next.Role ||
 		existing.SessionID != next.SessionID || existing.Status != next.Status ||
-		existing.TotalWorkers != next.TotalWorkers || existing.Address != next.Address
+		capacityChanged || existing.Address != next.Address
+}
+
+func (n *Node) setWorkerCapacity(
+	ctx context.Context,
+	nodeID string,
+	totalWorkers int,
+) (types.WorkerCapacityResponse, error) {
+	if !n.raftCluster.IsLeader() {
+		leaderAPI, err := resolveLeaderAPIAddress(
+			n.raftCluster.LeaderAddr(), n.raftCluster.FSM().GetAllNodes(), n.cfg.APIAddress,
+		)
+		if err != nil {
+			return types.WorkerCapacityResponse{}, err
+		}
+		body, err := json.Marshal(map[string]int{"total_workers": totalWorkers})
+		if err != nil {
+			return types.WorkerCapacityResponse{}, err
+		}
+		request, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodPut,
+			"http://"+leaderAPI+"/api/v1/admin/nodes/"+url.PathEscape(nodeID)+"/capacity",
+			bytes.NewReader(body),
+		)
+		if err != nil {
+			return types.WorkerCapacityResponse{}, err
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := (&http.Client{Timeout: 10 * time.Second}).Do(request)
+		if err != nil {
+			return types.WorkerCapacityResponse{}, fmt.Errorf(
+				"forward worker capacity update to %s: %w", leaderAPI, err,
+			)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			var apiError types.ErrorResponse
+			_ = json.NewDecoder(response.Body).Decode(&apiError)
+			if apiError.Error == "" {
+				apiError.Error = response.Status
+			}
+			return types.WorkerCapacityResponse{}, fmt.Errorf(
+				"leader worker capacity update returned %s: %s",
+				response.Status, apiError.Error,
+			)
+		}
+		var result types.WorkerCapacityResponse
+		if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+			return types.WorkerCapacityResponse{}, fmt.Errorf(
+				"decode leader worker capacity response: %w", err,
+			)
+		}
+		return result, nil
+	}
+
+	node := n.raftCluster.FSM().GetAllNodes()[nodeID]
+	if node == nil {
+		return types.WorkerCapacityResponse{}, fmt.Errorf("worker %s not found", nodeID)
+	}
+	if node.Role != types.NodeRoleWorker || node.Status != types.NodeStatusUp {
+		return types.WorkerCapacityResponse{}, fmt.Errorf("worker %s is not live", nodeID)
+	}
+	response, err := n.raftCluster.ApplyCommand(
+		raftpkg.OpSetWorkerCapacity,
+		raftpkg.SetWorkerCapacityData{NodeID: nodeID, TotalWorkers: totalWorkers},
+		5*time.Second,
+	)
+	if err != nil {
+		return types.WorkerCapacityResponse{}, err
+	}
+	if applyErr, ok := response.(error); ok && applyErr != nil {
+		return types.WorkerCapacityResponse{}, applyErr
+	}
+	// Reconcile synchronously so a successful response means both the
+	// capacity and a capacity-safe globally fair allocation are committed.
+	if err := n.allocEngine.ReconcileNow(); err != nil {
+		return types.WorkerCapacityResponse{}, fmt.Errorf(
+			"reconcile worker capacity: %w", err,
+		)
+	}
+	node = n.raftCluster.FSM().GetAllNodes()[nodeID]
+	return types.WorkerCapacityResponse{
+		NodeID:           nodeID,
+		TotalWorkers:     node.TotalWorkers,
+		CapacityOverride: node.CapacityOverride,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

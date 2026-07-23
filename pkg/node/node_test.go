@@ -69,6 +69,23 @@ func TestWorkerRegistrationSameSessionIsNoOp(t *testing.T) {
 	}
 }
 
+func TestWorkerRegistrationKeepsDurableCapacityOverride(t *testing.T) {
+	existing := &types.NodeInfo{
+		ID: "worker-1", Role: types.NodeRoleWorker, SessionID: "session-1",
+		Status: types.NodeStatusUp, Address: "127.0.0.1:9001",
+		TotalWorkers: 250, CapacityOverride: 250,
+	}
+	startupDefault := *existing
+	startupDefault.TotalWorkers = 100
+	if workerRegistrationChanged(existing, &startupDefault) {
+		t.Fatal("startup default mismatch would overwrite a durable capacity override")
+	}
+	startupDefault.SessionID = "session-2"
+	if !workerRegistrationChanged(existing, &startupDefault) {
+		t.Fatal("replacement process session was hidden by capacity override")
+	}
+}
+
 func TestControlNodesNeedingMigrationUsesOnlyRaftMembersInStableOrder(t *testing.T) {
 	status := raftpkg.MembershipStatus{
 		Voters:    []string{"control-10", "control-2", "control-0"},

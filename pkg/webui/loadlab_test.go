@@ -112,6 +112,9 @@ func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
 		`id="load-create-tenants"`, `id="load-run-custom"`,
 		`id="load-run-current"`, `id="load-run-history"`,
 		`id="load-stop"`, `data-load-json=`,
+		`id="worker-capacity-node"`, `id="worker-capacity-value"`,
+		`id="worker-capacity-apply"`, `Processor slots`,
+		`/capacity`, `body:JSON.stringify({total_workers:totalWorkers})`,
 		`idempotency_key:`, `buildRoundRobinJobs`,
 		`<script src="/assets/loadlab.js"></script>`,
 	} {

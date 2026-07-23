@@ -28,20 +28,36 @@ const (
 	NodeRoleWorker  = "worker"
 )
 
+// MaxWorkerCapacityPerInstance bounds the API-configurable Processor
+// concurrency of one stateless Worker process. The bound prevents an
+// accidental control-plane write from creating an unbounded goroutine pool.
+const MaxWorkerCapacityPerInstance = 1000
+
 // ---------------------------------------------------------------------------
 // Cluster & node
 // ---------------------------------------------------------------------------
 
 // NodeInfo represents a cluster node registered in the Raft FSM.
 type NodeInfo struct {
-	ID            string    `json:"id"`
-	Role          string    `json:"role,omitempty"`       // "control" | "worker"
-	SessionID     string    `json:"session_id,omitempty"` // worker process incarnation
-	Address       string    `json:"address"`              // HTTP API address
-	RaftAddress   string    `json:"raft_address"`         // Raft transport address
-	Status        string    `json:"status"`               // "up" | "down"
-	TotalWorkers  int       `json:"total_workers"`        // worker capacity of this node
-	LastHeartbeat time.Time `json:"last_heartbeat"`
+	ID           string `json:"id"`
+	Role         string `json:"role,omitempty"`       // "control" | "worker"
+	SessionID    string `json:"session_id,omitempty"` // worker process incarnation
+	Address      string `json:"address"`              // HTTP API address
+	RaftAddress  string `json:"raft_address"`         // Raft transport address
+	Status       string `json:"status"`               // "up" | "down"
+	TotalWorkers int    `json:"total_workers"`        // effective worker capacity of this node
+	// CapacityOverride is durable current configuration. Zero means the
+	// instance uses the capacity reported by its startup configuration.
+	CapacityOverride int       `json:"capacity_override,omitempty"`
+	LastHeartbeat    time.Time `json:"last_heartbeat"`
+}
+
+// WorkerCapacityResponse is returned after an instance capacity mutation has
+// committed through Raft.
+type WorkerCapacityResponse struct {
+	NodeID           string `json:"node_id"`
+	TotalWorkers     int    `json:"total_workers"`
+	CapacityOverride int    `json:"capacity_override"`
 }
 
 // ---------------------------------------------------------------------------

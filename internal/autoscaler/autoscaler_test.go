@@ -55,6 +55,26 @@ func TestPolicyUsesAllocatedWorkerUtilizationForSmallBacklog(t *testing.T) {
 	}
 }
 
+func TestPolicyUsesActualHeterogeneousWorkerInstanceCount(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	recommendation := (Policy{Config: config}).Recommend(
+		2,
+		Signals{
+			Backlog: 1, AllocatedWorkers: 300, WorkerCapacity: 300,
+			WorkerInstances: 2,
+		},
+		time.Unix(1000, 0),
+		&State{},
+	)
+	if recommendation.UtilizationDesired != 3 || recommendation.Desired != 3 {
+		t.Fatalf(
+			"heterogeneous recommendation = %+v, want actual 2-instance utilization target 3",
+			recommendation,
+		)
+	}
+}
+
 func TestPolicyRequiresSustainedSpareCapacityBeforeBoundedScaleDown(t *testing.T) {
 	config := DefaultConfig()
 	policy := Policy{Config: config}
@@ -104,7 +124,9 @@ func TestHTTPReaderCombinesBacklogAndOnlyLiveWorkerCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if signals != (Signals{Backlog: 22, AllocatedWorkers: 85, WorkerCapacity: 100}) {
+	if signals != (Signals{
+		Backlog: 22, AllocatedWorkers: 85, WorkerCapacity: 100, WorkerInstances: 1,
+	}) {
 		t.Fatalf("signals = %+v", signals)
 	}
 }
@@ -144,7 +166,9 @@ func TestHTTPReaderDefaultClientIgnoresEnvironmentProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if signals != (Signals{Backlog: 3, AllocatedWorkers: 4, WorkerCapacity: 10}) {
+	if signals != (Signals{
+		Backlog: 3, AllocatedWorkers: 4, WorkerCapacity: 10, WorkerInstances: 1,
+	}) {
 		t.Fatalf("signals = %+v", signals)
 	}
 	if got := proxyRequests.Load(); got != 0 {
@@ -174,7 +198,9 @@ func TestHTTPReaderExcludesStaleAllocationFromRollingDownWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if signals != (Signals{Backlog: 1, AllocatedWorkers: 50, WorkerCapacity: 100}) {
+	if signals != (Signals{
+		Backlog: 1, AllocatedWorkers: 50, WorkerCapacity: 100, WorkerInstances: 1,
+	}) {
 		t.Fatalf("rolling signals = %+v, want only live Worker allocation", signals)
 	}
 }

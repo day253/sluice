@@ -3122,6 +3122,186 @@ func TestManyTenantsRespectPerWorkerNodeCapacity(t *testing.T) {
 	}
 }
 
+// TestWorkerInstanceCapacityAPIConvergesRuntimeAndSurvivesRestart preserves
+// CAPACITY-001 across follower HTTP forwarding, a real three-voter Raft
+// control plane, Leader allocation, AllocationPush, the stateless Processor
+// pool, and a replacement process reporting its original startup default.
+func TestWorkerInstanceCapacityAPIConvergesRuntimeAndSurvivesRestart(t *testing.T) {
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no Raft leader")
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(
+			raftpkg.OpSetControlNodes,
+			raftpkg.SetControlNodesData{NodeIDs: []string{"node-0", "node-1", "node-2"}},
+		),
+		5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("migrate voters to control-only role: %v", err)
+	}
+
+	const workerID = "configurable-worker-0"
+	execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+		NodeID: workerID, APIAddress: "127.0.0.1:0",
+		ControllerAddress: tc.httpAddrs[(leader+1)%len(tc.nodes)], TotalWorkers: 3,
+	}, tc.proc, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if execution != nil {
+			_ = execution.Shutdown(5 * time.Second)
+		}
+	}()
+	go func() { _ = execution.Start() }()
+
+	tc.waitFor(func() bool {
+		nodeInfo := tc.fsms().GetAllNodes()[workerID]
+		return nodeInfo != nil && nodeInfo.Role == types.NodeRoleWorker &&
+			nodeInfo.Status == types.NodeStatusUp && nodeInfo.TotalWorkers == 3
+	}, 10*time.Second, "configurable stateless Worker registration")
+
+	const tenantID = "capacity-api"
+	tc.addTenant(tenantID, 8)
+	_, release := tc.proc.gate(tenantID)
+	defer release()
+	submission := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, 24)}
+	for index := range submission.Tasks {
+		submission.Tasks[index] = types.TaskSubmitRequest{
+			TenantID:       tenantID,
+			Payload:        json.RawMessage(fmt.Sprintf(`{"capacity":%d}`, index)),
+			IdempotencyKey: fmt.Sprintf("capacity-001:%d", index),
+		}
+	}
+	submissionBody, err := json.Marshal(submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	response, err := (&http.Client{Timeout: 10 * time.Second}).Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+		"application/json",
+		bytes.NewReader(submissionBody),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusAccepted {
+		payload, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		t.Fatalf("submit capacity workload status=%s body=%s", response.Status, payload)
+	}
+	response.Body.Close()
+	tc.waitFor(func() bool {
+		allocation, ok := tc.fsms().GetAllocation(workerID)
+		return ok && sumIntegrationWorkers(allocation.Tenants) == 3 &&
+			sumIntegrationWorkers(execution.Pool().GetStatus()) == 3
+	}, 10*time.Second, "startup capacity reaches allocation and Processor pool")
+
+	setCapacity := func(totalWorkers int) types.WorkerCapacityResponse {
+		body, marshalErr := json.Marshal(map[string]int{"total_workers": totalWorkers})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		request, requestErr := http.NewRequest(
+			http.MethodPut,
+			"http://"+tc.httpAddrs[follower]+"/api/v1/admin/nodes/"+
+				url.PathEscape(workerID)+"/capacity",
+			bytes.NewReader(body),
+		)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		result, requestErr := (&http.Client{Timeout: 15 * time.Second}).Do(request)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		defer result.Body.Close()
+		if result.StatusCode != http.StatusOK {
+			payload, _ := io.ReadAll(result.Body)
+			t.Fatalf(
+				"set capacity %d status=%s body=%s",
+				totalWorkers, result.Status, payload,
+			)
+		}
+		var decoded types.WorkerCapacityResponse
+		if decodeErr := json.NewDecoder(result.Body).Decode(&decoded); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		return decoded
+	}
+
+	if result := setCapacity(1); result.TotalWorkers != 1 ||
+		result.CapacityOverride != 1 {
+		t.Fatalf("scale-down response = %+v", result)
+	}
+	tc.waitFor(func() bool {
+		for _, control := range tc.nodes {
+			nodeInfo := control.RaftCluster().FSM().GetAllNodes()[workerID]
+			if nodeInfo == nil || nodeInfo.TotalWorkers != 1 ||
+				nodeInfo.CapacityOverride != 1 {
+				return false
+			}
+			if allocation, ok := control.RaftCluster().FSM().GetAllocation(workerID); ok &&
+				sumIntegrationWorkers(allocation.Tenants) > 1 {
+				return false
+			}
+		}
+		return sumIntegrationWorkers(execution.Pool().GetStatus()) <= 1
+	}, 10*time.Second, "capacity reduction converges across Raft and Processor pool")
+
+	if result := setCapacity(4); result.TotalWorkers != 4 ||
+		result.CapacityOverride != 4 {
+		t.Fatalf("scale-up response = %+v", result)
+	}
+	tc.waitFor(func() bool {
+		allocation, ok := tc.fsms().GetAllocation(workerID)
+		return ok && sumIntegrationWorkers(allocation.Tenants) == 4 &&
+			sumIntegrationWorkers(execution.Pool().GetStatus()) == 4
+	}, 10*time.Second, "capacity increase reaches allocation and Processor pool")
+
+	// Finish already-started work before replacing the process. The runtime
+	// override must still win over the replacement's startup default of 3.
+	release()
+	tc.waitFor(func() bool {
+		return tc.fsms().CountUnfinishedPerTenant()[tenantID] == 0
+	}, 20*time.Second, "capacity workload drains before restart")
+	if err := execution.Shutdown(5 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	execution = nil
+	tc.waitFor(func() bool {
+		nodeInfo := tc.fsms().GetAllNodes()[workerID]
+		return nodeInfo != nil && nodeInfo.Status == types.NodeStatusDown &&
+			nodeInfo.CapacityOverride == 4
+	}, 10*time.Second, "capacity override retained while Worker is offline")
+
+	replacement, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+		NodeID: workerID, APIAddress: "127.0.0.1:0",
+		ControllerAddress: tc.httpAddrs[follower], TotalWorkers: 3,
+	}, tc.proc, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution = replacement
+	go func() { _ = replacement.Start() }()
+	tc.waitFor(func() bool {
+		for _, control := range tc.nodes {
+			nodeInfo := control.RaftCluster().FSM().GetAllNodes()[workerID]
+			if nodeInfo == nil || nodeInfo.Status != types.NodeStatusUp ||
+				nodeInfo.TotalWorkers != 4 || nodeInfo.CapacityOverride != 4 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "replacement process preserves Raft capacity override")
+}
+
 func sumIntegrationWorkers(workers map[string]int) int {
 	total := 0
 	for _, count := range workers {

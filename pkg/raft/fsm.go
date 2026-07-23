@@ -72,6 +72,8 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		return f.applyRetireNode(cmd.Data)
 	case OpSetControlNodes:
 		return f.applySetControlNodes(cmd.Data)
+	case OpSetWorkerCapacity:
+		return f.applySetWorkerCapacity(cmd.Data)
 	case OpCreateTask:
 		return f.applyCreateTask(cmd.Data)
 	case OpCreateTaskBatch:
@@ -223,11 +225,95 @@ func (f *FSM) applyNodeUp(data json.RawMessage) interface{} {
 	if err := json.Unmarshal(data, &ni); err != nil {
 		return err
 	}
+	// A runtime capacity override belongs to the stable Worker identity, not
+	// to one process incarnation. Preserve it when the same StatefulSet
+	// ordinal reconnects and reports its chart/CLI startup default.
+	if existing := f.state.Nodes[ni.ID]; existing != nil &&
+		existing.Role == types.NodeRoleWorker && ni.Role == types.NodeRoleWorker &&
+		existing.CapacityOverride > 0 {
+		ni.CapacityOverride = existing.CapacityOverride
+		ni.TotalWorkers = existing.CapacityOverride
+	}
 	ni.Status = types.NodeStatusUp
 	ni.LastHeartbeat = time.Now().UTC()
 	f.state.Nodes[ni.ID] = &ni
 	f.logger.Debug("fsm: node up", zap.String("node", ni.ID))
 	return nil
+}
+
+func (f *FSM) applySetWorkerCapacity(data json.RawMessage) interface{} {
+	var req SetWorkerCapacityData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+	if req.TotalWorkers < 1 || req.TotalWorkers > types.MaxWorkerCapacityPerInstance {
+		return fmt.Errorf(
+			"worker capacity must be between 1 and %d",
+			types.MaxWorkerCapacityPerInstance,
+		)
+	}
+	node, ok := f.state.Nodes[req.NodeID]
+	if !ok {
+		return fmt.Errorf("node %s not found", req.NodeID)
+	}
+	if node.Role != types.NodeRoleWorker {
+		return fmt.Errorf("node %s is not a worker", req.NodeID)
+	}
+	if node.Status != types.NodeStatusUp {
+		return fmt.Errorf("worker %s is not live", req.NodeID)
+	}
+
+	node.TotalWorkers = req.TotalWorkers
+	node.CapacityOverride = req.TotalWorkers
+	f.trimNodeAllocation(req.NodeID, req.TotalWorkers)
+	f.logger.Info("fsm: worker capacity updated",
+		zap.String("node", req.NodeID),
+		zap.Int("total_workers", req.TotalWorkers),
+	)
+	return nil
+}
+
+// trimNodeAllocation makes a capacity reduction safe in the same Raft entry.
+// The allocator will produce a new globally fair plan immediately afterwards,
+// but a leader loss between those commits must never leave this node assigned
+// above its new capacity.
+func (f *FSM) trimNodeAllocation(nodeID string, capacity int) {
+	allocation := f.state.Allocations[nodeID]
+	if allocation == nil {
+		return
+	}
+	tenantIDs := make([]string, 0, len(allocation.Tenants))
+	total := 0
+	for tenantID, workers := range allocation.Tenants {
+		tenantIDs = append(tenantIDs, tenantID)
+		total += workers
+	}
+	if total <= capacity {
+		return
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(tenantIDs)))
+	overflow := total - capacity
+	for _, tenantID := range tenantIDs {
+		if overflow == 0 {
+			break
+		}
+		current := allocation.Tenants[tenantID]
+		remove := current
+		if remove > overflow {
+			remove = overflow
+		}
+		remaining := current - remove
+		overflow -= remove
+		if remaining == 0 {
+			delete(allocation.Tenants, tenantID)
+			delete(allocation.Borrowed, tenantID)
+			continue
+		}
+		allocation.Tenants[tenantID] = remaining
+		if allocation.Borrowed[tenantID] > remaining {
+			allocation.Borrowed[tenantID] = remaining
+		}
+	}
 }
 
 func (f *FSM) applyNodeDown(data json.RawMessage) interface{} {

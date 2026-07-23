@@ -22,12 +22,15 @@ type loadLabBrowserAPI struct {
 	tenants        map[string]map[string]any
 	submitted      int
 	idempotencyKey map[string]bool
+	workerCapacity int
+	capacityWrites int
 }
 
 func newLoadLabBrowserAPI() *loadLabBrowserAPI {
 	return &loadLabBrowserAPI{
 		tenants:        make(map[string]map[string]any),
 		idempotencyKey: make(map[string]bool),
+		workerCapacity: 100,
 	}
 }
 
@@ -39,10 +42,19 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"status": "ok", "node_id": "control-0", "leader": "127.0.0.1:7000",
 		})
 	case r.URL.Path == "/api/v1/admin/nodes":
+		a.mu.Lock()
+		workerCapacity := a.workerCapacity
+		a.mu.Unlock()
 		writeBrowserJSON(w, map[string]any{"nodes": []map[string]any{
 			{
 				"node_id": "worker-0", "role": "worker", "status": "up",
-				"total_workers": 100,
+				"total_workers": workerCapacity,
+				"capacity_override": func() int {
+					if workerCapacity == 100 {
+						return 0
+					}
+					return workerCapacity
+				}(),
 			},
 			{
 				"node_id": "worker-retained", "role": "worker", "status": "down",
@@ -62,6 +74,24 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeBrowserJSON(w, []any{})
 	case r.URL.Path == "/api/v1/admin/performance":
 		writeBrowserJSON(w, map[string]any{})
+	case r.Method == http.MethodPut &&
+		r.URL.Path == "/api/v1/admin/nodes/worker-0/capacity":
+		var request struct {
+			TotalWorkers int `json:"total_workers"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil ||
+			request.TotalWorkers < 1 || request.TotalWorkers > 1000 {
+			http.Error(w, `{"error":"bad worker capacity"}`, http.StatusBadRequest)
+			return
+		}
+		a.mu.Lock()
+		a.workerCapacity = request.TotalWorkers
+		a.capacityWrites++
+		a.mu.Unlock()
+		writeBrowserJSON(w, map[string]any{
+			"node_id": "worker-0", "total_workers": request.TotalWorkers,
+			"capacity_override": request.TotalWorkers,
+		})
 	case r.Method == http.MethodPut &&
 		strings.HasPrefix(r.URL.Path, "/api/v1/admin/tenants/"):
 		var request struct {
@@ -177,6 +207,13 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 			capacity, allocated, nodeSummary, workerLegend,
 		)
 	}
+	if err := chromedp.Run(ctx,
+		chromedp.SetValue("#worker-capacity-value", "7", chromedp.ByQuery),
+		chromedp.Click("#worker-capacity-apply", chromedp.ByQuery),
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitForWorkerCapacity(t, ctx, api, 7, 8*time.Second)
 	waitForLoadLabStatus(t, ctx, "completed", 8*time.Second)
 
 	if err := chromedp.Run(ctx, chromedp.Click("#load-run-custom", chromedp.ByQuery)); err != nil {
@@ -193,12 +230,44 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	}
 	api.mu.Lock()
 	defer api.mu.Unlock()
-	if len(api.tenants) != 3 || api.submitted != 6 || len(api.idempotencyKey) != 6 {
+	if len(api.tenants) != 3 || api.submitted != 6 ||
+		len(api.idempotencyKey) != 6 || api.capacityWrites != 1 {
 		t.Fatalf(
-			"browser operations = %d tenants, %d tasks, %d keys",
-			len(api.tenants), api.submitted, len(api.idempotencyKey),
+			"browser operations = %d tenants, %d tasks, %d keys, %d capacity writes",
+			len(api.tenants), api.submitted, len(api.idempotencyKey), api.capacityWrites,
 		)
 	}
+}
+
+func waitForWorkerCapacity(
+	t *testing.T,
+	ctx context.Context,
+	api *loadLabBrowserAPI,
+	want int,
+	deadline time.Duration,
+) {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	var metric, status string
+	for time.Now().Before(end) {
+		api.mu.Lock()
+		got := api.workerCapacity
+		api.mu.Unlock()
+		err := chromedp.Run(
+			ctx,
+			chromedp.Text("#metric-capacity", &metric, chromedp.ByQuery),
+			chromedp.Text("#worker-capacity-status", &status, chromedp.ByQuery),
+		)
+		if err == nil && got == want && metric == fmt.Sprint(want) &&
+			strings.Contains(status, fmt.Sprintf("Effective %d slots", want)) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf(
+		"Worker capacity UI metric=%q status=%q, want %d",
+		metric, status, want,
+	)
 }
 
 func waitForLoadLabStatus(t *testing.T, ctx context.Context, want string, deadline time.Duration) {
