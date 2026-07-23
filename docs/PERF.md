@@ -856,3 +856,72 @@ HPA-008 最终本地集成阶段 268.588 秒，revision 57 远程集成为 233.3
 HPA-008 Case 启动三 voter、两个 stateless Worker，经 Follower HTTP 先形成实际完成率，
 再用 gated Processor 制造高 arrival/completion 比和 4/40 槽占用，副本保持 2，释放后
 所有任务 exactly-once 排空。
+
+### 7.12 空闲缩容与积压反向扩容复核（2026-07-24）
+
+HPA-009 把远程 workload autoscaler 的长期下限从与静态配置相同的 50 分离为 5；
+HPA-010 让部署验收在每轮重读 StatefulSet Ready 数与 FSM 拓扑，避免并发缩容删除旧
+Pod ordinal 时误报失败；HPA-011 修正演示缩容窗口的 Helm 子路径，并从 live Deployment
+args 反向验证进程确实拿到 60 秒。通用 Chart/CRD 的生产默认仍是连续低负载 300 秒、
+每分钟最多减少 25%，没有改成激进的全量回收，也不支持 scale-to-zero。
+
+环境仍是同一台 ThinkPad L14 Gen 2 单物理故障域、MicroK8s、5 control voter/0
+non-voter、每 Worker Pod 100 Processor 槽。最终 Helm revision 59 运行
+`localhost:32000/sluice:eee4ff6-20260723224224`，digest
+`sha256:e5a722cb21ab22dd55bf2a3d4f8e5258c0f2eeb8b023a7e7566f306f5d1b1f17`。
+部署门禁确认 5/5 control、5/5 Worker、5 voter/0 non-voter；live autoscaler args 是
+`min=5,max=100,scaleDownStabilization=60s,scaleDownPercent=25`。revision 58 已真实把
+50 Worker 缩到 38，却因旧验收缓存 `worker-38` 而报 NotFound；继续运行后最终降到
+5～6，证明原策略可缩，故障确实是静态下限和验收方式，而不是 Worker retire 不工作。
+
+固定形状仍是 `perf-a..d` 四个 tenant，Limit 100/60/30/500，每 tenant 5000 条、
+全局逐条 round-robin；小型 JSON payload 含 run/index/shape 和唯一幂等键，HTTP
+batch=500、concurrency=4，经 Mac `127.0.0.1:19090` 隧道进入远程 Service。开始前四
+tenant unfinished=0、Worker 5/5 Ready；100ms 条件采样，连续两次 unfinished=0 后结束，
+deadline 180 秒。Demo Processor 仍为每条 sleep 50～200ms。
+
+| 版本/拓扑 | accepted | accepted 后排空 | 端到端 | 吞吐 | t50 | t90 | 峰值 unfinished | 请求错误/最终 unfinished |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| revision 57，固定 50 Worker | 2.430s | 12.318s | 14.748s | 1356.1 task/s | 8.342s | 12.650s | 18918 | 0 / 0 |
+| revision 59，动态 5→15 Worker | 1.774s | 10.530s | 12.305s | 1625.4 task/s | 7.521s | 11.335s | 18739 | 0 / 0 |
+
+revision 59 在约 5 秒的首个 workload poll 看到 unfinished/pending/running=
+13416/13171/245，当前 5 Pod、500 槽中 executing=231，execution pressure=46.2%、
+CPU=24.3%。HPA-008 的 50% 门槛因此继续关闭 drain/arrival 外推；queueDesired=33
+成为 dominant signal，扩容速率把 target 从 5 有界提高到 15，而不是直接到 raw 33
+或 max 100。API 观察到实际注册序列为
+`5→6→7→8→10→11→14→15`，Pod 启动期间没有重复把速率候选外推到 max。
+
+任务排空约 60 秒低负载稳定窗口后，live 日志记录 target
+`15→12`，rawDesired=5、unfinished/pending/running=0、15/15 telemetry、CPU=1.8%、
+reason=`sustained spare execution capacity`；之后实际序列和 UTC 时间是
+`15→12@22:50:56`、`12→9@22:51:56`、`9→7@22:53:11`、
+`7→6@22:54:11`、`6→5@22:55:11`，最终 StatefulSet 5 desired/5 Ready、统一快照
+5 instances/500 capacity/5 reporters、unfinished/pending/running=0，相关 Pod
+restart 总数为 0。新 backlog 不等待该窗口，扩容只受五秒 period 和有界步长限制。
+
+本轮任务路径诊断如下：
+
+| 指标 | revision 59 动态 HPA |
+|---|---:|
+| Create Apply/items/平均批次/平均 Apply | 40 / 20000 / 500 / 76.137ms |
+| Claim Apply/items/平均批次/平均 Apply | 279 / 20000 / 71.7 / 30.232ms |
+| Complete Apply/items/平均批次/平均 Apply | 289 / 20000 / 69.2 / 31.059ms |
+| workload 内新增 allocation Apply/items | 15 / 156 |
+| pending scanned/selected | 26633 / 20000（1.33x） |
+| CPU-aware requests/throttled/unavailable/stale | 28948 / 0 / 0 / 0 |
+| 最终 assignment/completion queue | 0 / 0 |
+
+revision 59 比 revision 57 单轮端到端快 2.443 秒，但拓扑从固定 50 改为动态 5→15，
+控制 Pod 也经过不同 rollout，不能把 16.6% 差值宣称为算法吞吐提升。当前可以确认的是：
+500 槽起步仍能在 12.305 秒正确排空固定 2 万形状；队列证据触发扩容、冷启动速率门控
+不误扩到 max、空闲后真实回收；Raft Apply error、HTTP error、最终 unfinished 和两个
+dispatcher queue 都为 0。性能限制仍需结合单 shard Apply 与 tenant Limit 判断，HPA
+主要改善资源弹性，不改变共识上限。
+
+HPA-009 首轮本地完整 `make test` 的 integration 阶段为 274.886 秒；发现 HPA-010
+后为 273.907 秒，HPA-011 最终为 273.113 秒，三轮均以 `-race -count=1` 通过。最终远程
+`go test ./...` integration 阶段为 239.727 秒。新增真实三 voter HPA-009 Case 验证
+Worker target 4→3→9、control 恒为 3、100 条任务 exactly-once；HPA-010/HPA-011
+进程级 Case 执行生产 shell 和真实 Python validator，验证 50/38 瞬时不一致会重试且
+live 60 秒参数缺失时不能通过部署门禁。
