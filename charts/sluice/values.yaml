@@ -20,6 +20,11 @@ worker:
       pollIntervalSeconds: 5
       targetBacklogPerPod: 400
       targetWorkerUtilization: 70
+      targetCPUUtilization: 70
+      targetQueueDrainSeconds: 30
+      targetThroughputUtilization: 80
+      tolerancePercent: 10
+      minTelemetryCoveragePercent: 80
       scaleUpPercent: 100
       scaleUpPods: 10
       scaleDownPercent: 25

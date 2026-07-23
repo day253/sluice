@@ -107,6 +107,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/admin/allocations", h.getAllocations).Methods("GET")
 	r.HandleFunc("/api/v1/admin/raft", h.raftStatus).Methods("GET")
 	r.HandleFunc("/api/v1/admin/performance", h.performance).Methods("GET")
+	r.HandleFunc("/api/v1/admin/autoscaling", h.autoscaling).Methods("GET")
 
 	r.HandleFunc("/api/v1/cluster/join", h.joinCluster).Methods("POST")
 	r.HandleFunc("/api/v1/cluster/workers/register", h.registerWorker).Methods("POST")
@@ -143,6 +144,90 @@ func (h *Handler) performance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.writeJSON(w, http.StatusOK, diagnostics)
+}
+
+// autoscaling returns one documented current-state signal shape. Task,
+// capacity and allocation values come from the replicated FSM; CPU/execution
+// and rate counters are Leader-local soft telemetry and may be unavailable.
+// Missing soft telemetry is represented in-band so queue pressure can still
+// scale up while the autoscaler conservatively blocks scale-down.
+func (h *Handler) autoscaling(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UTC()
+	tasks := h.svc.TaskPressureSnapshot()
+	snapshot := types.AutoscalingSnapshot{
+		ObservedAt:         now,
+		UnfinishedTasks:    tasks.UnfinishedTasks,
+		PendingTasks:       tasks.PendingTasks,
+		RunningTasks:       tasks.RunningTasks,
+		TaskBreakdownValid: true,
+	}
+	if !tasks.OldestPendingAt.IsZero() && now.After(tasks.OldestPendingAt) {
+		snapshot.OldestPendingAgeMillis = now.Sub(tasks.OldestPendingAt).Milliseconds()
+	}
+
+	nodes, _ := h.svc.NodeSnapshot()
+	liveWorkers := make(map[string]struct{}, len(nodes))
+	for nodeID, node := range nodes {
+		if node.Role != types.NodeRoleWorker || node.Status != types.NodeStatusUp {
+			continue
+		}
+		liveWorkers[nodeID] = struct{}{}
+		snapshot.WorkerInstances++
+		snapshot.WorkerCapacity += int64(node.TotalWorkers)
+	}
+	allocations, _ := h.svc.AllocationSnapshot()
+	for nodeID, allocation := range allocations {
+		if _, live := liveWorkers[nodeID]; !live {
+			continue
+		}
+		for _, workers := range allocation.Tenants {
+			snapshot.AllocatedWorkers += int64(workers)
+		}
+	}
+
+	if h.performanceFunc == nil {
+		snapshot.ExecutionSignalsError = "performance diagnostics not configured"
+		h.writeJSON(w, http.StatusOK, snapshot)
+		return
+	}
+	diagnostics, err := h.performanceFunc(r.Context(), false, false)
+	if err != nil {
+		snapshot.ExecutionSignalsError = err.Error()
+		h.writeJSON(w, http.StatusOK, snapshot)
+		return
+	}
+	snapshot.TelemetrySource = diagnostics.NodeID
+	snapshot.TelemetryStartedAt = diagnostics.Current.StartedAt
+	snapshot.RateCountersValid = true
+	for _, operation := range []string{
+		raftpkg.OpCreateTask, raftpkg.OpCreateTaskBatch,
+	} {
+		snapshot.SubmittedTasksTotal +=
+			int64(diagnostics.Current.Raft[operation].Items)
+	}
+	for _, operation := range []string{
+		raftpkg.OpCompleteTask, raftpkg.OpFailTask, raftpkg.OpCompleteBatch,
+	} {
+		snapshot.CompletedTasksTotal +=
+			int64(diagnostics.Current.Raft[operation].Items)
+	}
+	var cpuTotal int64
+	for nodeID, load := range diagnostics.Current.Scheduler.WorkerLoads {
+		if _, live := liveWorkers[nodeID]; !live {
+			continue
+		}
+		snapshot.ReportingWorkers++
+		snapshot.ExecutingTasks += int64(load.RunningTasks)
+		cpuTotal += int64(load.CPUUtilizationMillis)
+		if int64(load.CPUUtilizationMillis) > snapshot.MaxWorkerCPUMillis {
+			snapshot.MaxWorkerCPUMillis = int64(load.CPUUtilizationMillis)
+		}
+	}
+	if snapshot.ReportingWorkers > 0 {
+		snapshot.ExecutionSignalsValid = true
+		snapshot.AverageWorkerCPUMillis = cpuTotal / snapshot.ReportingWorkers
+	}
+	h.writeJSON(w, http.StatusOK, snapshot)
 }
 
 // ---------------------------------------------------------------------------

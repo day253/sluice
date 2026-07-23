@@ -1471,8 +1471,9 @@ func TestAtomicHundredTenantLoadThroughFollowerHTTP(t *testing.T) {
 
 // TestWorkloadAutoscalerReadsRealClusterBacklogAndScalesOnlyWorkers preserves
 // HPA-003 across the real Raft, follower HTTP, allocator, and execution path.
-// A sleeping Processor keeps CPU irrelevant while the current unfinished and
-// allocated-Worker mirrors drive the production autoscaler policy.
+// A gated Processor creates both pending and running work while the production
+// endpoint combines the replicated queue mirror with Leader-local Worker load.
+// The queue candidate scales safely even before rate EWMA has two samples.
 func TestWorkloadAutoscalerReadsRealClusterBacklogAndScalesOnlyWorkers(t *testing.T) {
 	k8slog.SetLogger(logr.Discard())
 	tc := newTestCluster(t, 3, 20)
@@ -1558,15 +1559,23 @@ func TestWorkloadAutoscalerReadsRealClusterBacklogAndScalesOnlyWorkers(t *testin
 	}
 
 	reader := workloadautoscaler.HTTPReader{}
-	signals, err := reader.Read(
-		context.Background(),
-		"http://"+tc.httpAddrs[follower],
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if signals.Backlog != 100 || signals.WorkerCapacity != 40 ||
-		signals.AllocatedWorkers < 1 {
+	var signals workloadautoscaler.Signals
+	tc.waitFor(func() bool {
+		var readErr error
+		signals, readErr = reader.Read(
+			context.Background(),
+			"http://"+tc.httpAddrs[follower],
+		)
+		return readErr == nil && signals.Backlog == 100 &&
+			signals.PendingTasks+signals.RunningTasks == 100 &&
+			signals.RunningTasks > 0 && signals.ReportingWorkers == 2
+	}, 10*time.Second, "follower autoscaling snapshot converges queue and Worker telemetry")
+	if signals.Backlog != 100 || !signals.TaskBreakdownValid ||
+		signals.PendingTasks < 1 || signals.RunningTasks < 1 ||
+		signals.PendingTasks+signals.RunningTasks != 100 ||
+		signals.WorkerCapacity != 40 || signals.WorkerInstances != 2 ||
+		signals.AllocatedWorkers < 1 || !signals.ExecutionSignalsValid ||
+		signals.ReportingWorkers != 2 || !signals.RateCountersValid {
 		t.Fatalf("real cluster workload signals = %+v", signals)
 	}
 
@@ -1607,6 +1616,7 @@ func TestWorkloadAutoscalerReadsRealClusterBacklogAndScalesOnlyWorkers(t *testin
 	config.MinReplicas, config.MaxReplicas = 2, 20
 	config.WorkersPerPod = 20
 	config.TargetBacklogPerPod = 10
+	config.TolerancePercent = 0
 	config.ScaleUpPods = 3
 	runner := &workloadautoscaler.Runner{
 		Client: k8sClient, Namespace: "default", StatefulSet: "sluice-worker",

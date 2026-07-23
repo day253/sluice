@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 	hashicorpraft "github.com/hashicorp/raft"
@@ -221,6 +222,122 @@ func TestPerformanceEndpointCanReturnCurrentSnapshotWithoutHistory(t *testing.T)
 	}
 	if includeHistory {
 		t.Fatal("performance endpoint ignored history=0")
+	}
+}
+
+func TestAutoscalingEndpointSeparatesReplicatedQueueAndLeaderSoftSignals(t *testing.T) {
+	h, fsm, _ := setupHandler(t)
+	applyOp(fsm, raftpkg.OpNodeUp, types.NodeInfo{
+		ID: "worker-live", Role: types.NodeRoleWorker,
+		Status: types.NodeStatusUp, TotalWorkers: 100,
+	})
+	applyOp(fsm, raftpkg.OpNodeUp, types.NodeInfo{
+		ID: "worker-down", Role: types.NodeRoleWorker,
+		Status: types.NodeStatusDown, TotalWorkers: 100,
+	})
+	applyOp(fsm, raftpkg.OpNodeDown, raftpkg.NodeDownData{ID: "worker-down"})
+	applyOp(fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"worker-live": {
+			NodeID: "worker-live", Tenants: map[string]int{"company-a": 30},
+		},
+		"worker-down": {
+			NodeID: "worker-down", Tenants: map[string]int{"company-a": 99},
+		},
+	})
+	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "pending", TenantID: "company-a", Payload: `{}`,
+	})
+	applyOp(fsm, raftpkg.OpClaimTask, raftpkg.ClaimTaskData{
+		TaskID: "running", TenantID: "company-a",
+		NodeID: "worker-live", Payload: `{}`,
+	})
+	startedAt := time.Unix(1000, 0).UTC()
+	h.SetPerformanceFunc(func(
+		_ context.Context, _, history bool,
+	) (metricspkg.PerformanceDiagnostics, error) {
+		if history {
+			t.Fatal("autoscaling endpoint requested bounded performance history")
+		}
+		return metricspkg.PerformanceDiagnostics{
+			NodeID: "leader-0",
+			Current: metricspkg.PerformanceSnapshot{
+				StartedAt: startedAt,
+				Raft: map[string]metricspkg.RaftOperationSnapshot{
+					raftpkg.OpCreateTask:      {Items: 2},
+					raftpkg.OpCreateTaskBatch: {Items: 12},
+					raftpkg.OpFailTask:        {Items: 1},
+					raftpkg.OpCompleteBatch:   {Items: 7},
+				},
+				Scheduler: metricspkg.SchedulerSnapshot{
+					WorkerLoads: map[string]metricspkg.WorkerLoadSnapshot{
+						"worker-live": {
+							CPUUtilizationMillis: 640,
+							RunningTasks:         9, Capacity: 30,
+							ObservedAt: time.Now().UTC(),
+						},
+						"worker-down": {
+							CPUUtilizationMillis: 1000,
+							RunningTasks:         99, Capacity: 100,
+							ObservedAt: time.Now().UTC(),
+						},
+					},
+				},
+			},
+		}, nil
+	})
+
+	recorder := httptest.NewRecorder()
+	newRouter(h).ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/api/v1/admin/autoscaling", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("autoscaling status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var snapshot types.AutoscalingSnapshot
+	if err := json.Unmarshal(recorder.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.TaskBreakdownValid || snapshot.UnfinishedTasks != 2 || snapshot.PendingTasks != 1 ||
+		snapshot.RunningTasks != 1 || snapshot.OldestPendingAgeMillis < 0 {
+		t.Fatalf("task pressure = %+v", snapshot)
+	}
+	if snapshot.WorkerInstances != 1 || snapshot.WorkerCapacity != 100 ||
+		snapshot.AllocatedWorkers != 30 {
+		t.Fatalf("live capacity snapshot included stale Worker: %+v", snapshot)
+	}
+	if !snapshot.ExecutionSignalsValid || snapshot.ReportingWorkers != 1 ||
+		snapshot.ExecutingTasks != 9 || snapshot.AverageWorkerCPUMillis != 640 ||
+		snapshot.MaxWorkerCPUMillis != 640 {
+		t.Fatalf("execution pressure = %+v", snapshot)
+	}
+	if !snapshot.RateCountersValid || snapshot.TelemetrySource != "leader-0" ||
+		!snapshot.TelemetryStartedAt.Equal(startedAt) ||
+		snapshot.SubmittedTasksTotal != 14 || snapshot.CompletedTasksTotal != 8 {
+		t.Fatalf("rate counters = %+v", snapshot)
+	}
+}
+
+func TestAutoscalingEndpointKeepsQueueScaleUpSignalsWhenPerformanceUnavailable(t *testing.T) {
+	h, fsm, _ := setupHandler(t)
+	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "pending", TenantID: "company-a", Payload: `{}`,
+	})
+	recorder := httptest.NewRecorder()
+	newRouter(h).ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/api/v1/admin/autoscaling", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("autoscaling status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var snapshot types.AutoscalingSnapshot
+	if err := json.Unmarshal(recorder.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.TaskBreakdownValid || snapshot.PendingTasks != 1 || snapshot.ExecutionSignalsValid ||
+		snapshot.RateCountersValid || snapshot.ExecutionSignalsError == "" {
+		t.Fatalf("degraded autoscaling snapshot = %+v", snapshot)
 	}
 }
 

@@ -22,9 +22,11 @@ func main() {
 	defaults := autoscaler.DefaultConfig()
 	var (
 		namespace, statefulSet, sluiceURL, sluiceService, probeAddress string
-		interval, scaleDownStabilization                               time.Duration
+		interval, scaleDownStabilization, targetQueueDrain             time.Duration
 		minReplicas, maxReplicas, workersPerPod, sluicePort            int
-		targetWorkerUtilization                                        int
+		targetWorkerUtilization, targetCPUUtilization                  int
+		targetThroughputUtilization, tolerancePercent                  int
+		minTelemetryCoveragePercent                                    int
 		scaleUpPercent, scaleUpPods, scaleDownPercent                  int
 		config                                                         = defaults
 	)
@@ -39,7 +41,12 @@ func main() {
 	flag.IntVar(&maxReplicas, "max-replicas", int(defaults.MaxReplicas), "Maximum Worker replicas")
 	flag.IntVar(&workersPerPod, "workers-per-pod", int(defaults.WorkersPerPod), "Processor slots per Worker Pod")
 	flag.Int64Var(&config.TargetBacklogPerPod, "target-backlog-per-pod", defaults.TargetBacklogPerPod, "Target unfinished tasks per Worker Pod")
-	flag.IntVar(&targetWorkerUtilization, "target-worker-utilization", int(defaults.TargetWorkerUtilization), "Target allocated Worker percentage")
+	flag.IntVar(&targetWorkerUtilization, "target-worker-utilization", int(defaults.TargetWorkerUtilization), "Target executing Processor-slot percentage")
+	flag.IntVar(&targetCPUUtilization, "target-cpu-utilization", int(defaults.TargetCPUUtilization), "Target average Worker process/container CPU percentage")
+	flag.DurationVar(&targetQueueDrain, "target-queue-drain", defaults.TargetQueueDrainTime, "Target time to drain the current pending queue")
+	flag.IntVar(&targetThroughputUtilization, "target-throughput-utilization", int(defaults.TargetThroughputUtilization), "Target fraction of measured completion throughput reserved for steady arrivals")
+	flag.IntVar(&tolerancePercent, "tolerance-percent", int(defaults.TolerancePercent), "Replica recommendation deadband percentage")
+	flag.IntVar(&minTelemetryCoveragePercent, "min-telemetry-coverage-percent", int(defaults.MinTelemetryCoveragePercent), "Minimum reporting Worker percentage required before scale-down")
 	flag.IntVar(&scaleUpPercent, "scale-up-percent", int(defaults.ScaleUpPercent), "Maximum scale-up percentage per interval")
 	flag.IntVar(&scaleUpPods, "scale-up-pods", int(defaults.ScaleUpPods), "Maximum absolute scale-up Pods per interval")
 	flag.IntVar(&scaleDownPercent, "scale-down-percent", int(defaults.ScaleDownPercent), "Maximum scale-down percentage per period")
@@ -50,6 +57,11 @@ func main() {
 	config.MinReplicas, config.MaxReplicas = int32(minReplicas), int32(maxReplicas)
 	config.WorkersPerPod = int32(workersPerPod)
 	config.TargetWorkerUtilization = int32(targetWorkerUtilization)
+	config.TargetCPUUtilization = int32(targetCPUUtilization)
+	config.TargetQueueDrainTime = targetQueueDrain
+	config.TargetThroughputUtilization = int32(targetThroughputUtilization)
+	config.TolerancePercent = int32(tolerancePercent)
+	config.MinTelemetryCoveragePercent = int32(minTelemetryCoveragePercent)
 	config.ScaleUpPercent, config.ScaleUpPods = int32(scaleUpPercent), int32(scaleUpPods)
 	config.ScaleDownPercent = int32(scaleDownPercent)
 	config.ScaleUpPeriod = interval

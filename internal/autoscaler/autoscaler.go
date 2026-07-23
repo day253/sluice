@@ -24,25 +24,47 @@ import (
 // Signals is a process-local snapshot read from the Sluice API. It is neither
 // persisted in Raft nor included in FSM snapshots.
 type Signals struct {
-	Backlog          int64
-	AllocatedWorkers int64
-	WorkerCapacity   int64
-	WorkerInstances  int64
+	ObservedAt         time.Time
+	Backlog            int64
+	PendingTasks       int64
+	RunningTasks       int64
+	OldestPendingAge   time.Duration
+	TaskBreakdownValid bool
+	AllocatedWorkers   int64
+	WorkerCapacity     int64
+	WorkerInstances    int64
+
+	ExecutionSignalsValid  bool
+	ReportingWorkers       int64
+	ExecutingTasks         int64
+	AverageWorkerCPUMillis int64
+	MaxWorkerCPUMillis     int64
+
+	RateCountersValid   bool
+	TelemetrySource     string
+	TelemetryStartedAt  time.Time
+	SubmittedTasksTotal int64
+	CompletedTasksTotal int64
 }
 
 // Config defines workload-aware horizontal scaling bounds.
 type Config struct {
-	MinReplicas             int32
-	MaxReplicas             int32
-	WorkersPerPod           int32
-	TargetBacklogPerPod     int64
-	TargetWorkerUtilization int32
-	ScaleUpPercent          int32
-	ScaleUpPods             int32
-	ScaleUpPeriod           time.Duration
-	ScaleDownPercent        int32
-	ScaleDownPeriod         time.Duration
-	ScaleDownStabilization  time.Duration
+	MinReplicas                 int32
+	MaxReplicas                 int32
+	WorkersPerPod               int32
+	TargetBacklogPerPod         int64
+	TargetWorkerUtilization     int32
+	TargetCPUUtilization        int32
+	TargetQueueDrainTime        time.Duration
+	TargetThroughputUtilization int32
+	TolerancePercent            int32
+	MinTelemetryCoveragePercent int32
+	ScaleUpPercent              int32
+	ScaleUpPods                 int32
+	ScaleUpPeriod               time.Duration
+	ScaleDownPercent            int32
+	ScaleDownPeriod             time.Duration
+	ScaleDownStabilization      time.Duration
 }
 
 // DefaultConfig is intentionally conservative on scale-down and responsive on
@@ -51,7 +73,10 @@ func DefaultConfig() Config {
 	return Config{
 		MinReplicas: 5, MaxReplicas: 100, WorkersPerPod: 100,
 		TargetBacklogPerPod: 400, TargetWorkerUtilization: 70,
-		ScaleUpPercent: 100, ScaleUpPods: 10, ScaleUpPeriod: 5 * time.Second,
+		TargetCPUUtilization: 70, TargetQueueDrainTime: 30 * time.Second,
+		TargetThroughputUtilization: 80, TolerancePercent: 10,
+		MinTelemetryCoveragePercent: 80,
+		ScaleUpPercent:              100, ScaleUpPods: 10, ScaleUpPeriod: 5 * time.Second,
 		ScaleDownPercent: 25, ScaleDownPeriod: time.Minute,
 		ScaleDownStabilization: 5 * time.Minute,
 	}
@@ -66,8 +91,19 @@ func (c Config) Validate() error {
 	if c.WorkersPerPod < 1 || c.TargetBacklogPerPod < 1 {
 		return fmt.Errorf("workersPerPod and targetBacklogPerPod must be positive")
 	}
-	if c.TargetWorkerUtilization < 1 || c.TargetWorkerUtilization > 100 {
-		return fmt.Errorf("targetWorkerUtilization must be between 1 and 100")
+	if c.TargetWorkerUtilization < 1 || c.TargetWorkerUtilization > 100 ||
+		c.TargetCPUUtilization < 1 || c.TargetCPUUtilization > 100 ||
+		c.TargetThroughputUtilization < 1 || c.TargetThroughputUtilization > 100 {
+		return fmt.Errorf("utilization targets must be between 1 and 100")
+	}
+	if c.TargetQueueDrainTime <= 0 {
+		return fmt.Errorf("targetQueueDrainTime must be positive")
+	}
+	if c.TolerancePercent < 0 || c.TolerancePercent > 100 {
+		return fmt.Errorf("tolerancePercent must be between 0 and 100")
+	}
+	if c.MinTelemetryCoveragePercent < 1 || c.MinTelemetryCoveragePercent > 100 {
+		return fmt.Errorf("minTelemetryCoveragePercent must be between 1 and 100")
 	}
 	if c.ScaleUpPercent < 1 || c.ScaleUpPods < 1 || c.ScaleUpPeriod <= 0 {
 		return fmt.Errorf("scale-up bounds must be positive")
@@ -85,8 +121,19 @@ type Recommendation struct {
 	Desired            int32
 	RawDesired         int32
 	BacklogDesired     int32
+	QueueDesired       int32
 	UtilizationDesired int32
+	CPUDesired         int32
+	DrainDesired       int32
+	ArrivalDesired     int32
 	UtilizationPercent float64
+	CPUPercent         float64
+	ArrivalRate        float64
+	CompletionRate     float64
+	RatesValid         bool
+	TelemetryCoverage  float64
+	ScaleDownBlocked   bool
+	DominantSignal     string
 	Reason             string
 }
 
@@ -94,6 +141,14 @@ type Recommendation struct {
 type State struct {
 	BelowSince time.Time
 	LastScale  time.Time
+
+	telemetryEpoch string
+	lastObservedAt time.Time
+	lastSubmitted  int64
+	lastCompleted  int64
+	arrivalRate    float64
+	completionRate float64
+	ratesValid     bool
 }
 
 // StateStore keeps bounded process-local stabilization state per scale target.
@@ -142,37 +197,94 @@ type Policy struct {
 func (p Policy) Recommend(current int32, signals Signals, now time.Time, state *State) Recommendation {
 	config := p.Config
 	current = clamp(current, config.MinReplicas, config.MaxReplicas)
-	backlogDesired := int32(0)
-	if signals.Backlog > 0 {
-		backlogDesired = ceilDiv(signals.Backlog, config.TargetBacklogPerPod)
+	state.observeRates(signals)
+
+	pending := signals.Backlog
+	if signals.TaskBreakdownValid {
+		pending = signals.PendingTasks
+	}
+	queueDesired := int32(0)
+	if pending > 0 {
+		queueDesired = ceilDiv(pending, config.TargetBacklogPerPod)
 	}
 
 	utilization := float64(0)
 	utilizationDesired := int32(0)
-	if signals.Backlog > 0 && signals.WorkerCapacity > 0 {
-		utilization = float64(signals.AllocatedWorkers) / float64(signals.WorkerCapacity) * 100
-		registeredPods := signals.WorkerInstances
-		// Keep compatibility with externally supplied signal readers while the
-		// production reader always reports the exact heterogeneous instance
-		// count.
-		if registeredPods == 0 {
-			registeredPods = int64(ceilDiv(
-				signals.WorkerCapacity,
-				int64(config.WorkersPerPod),
-			))
-		}
+	registeredPods := signals.WorkerInstances
+	if registeredPods == 0 && signals.WorkerCapacity > 0 {
+		registeredPods = int64(ceilDiv(signals.WorkerCapacity, int64(config.WorkersPerPod)))
+	}
+	if signals.ExecutionSignalsValid && signals.WorkerCapacity > 0 && registeredPods > 0 {
+		utilization = float64(signals.ExecutingTasks) / float64(signals.WorkerCapacity) * 100
 		utilizationDesired = int32(math.Ceil(
 			float64(registeredPods) * utilization / float64(config.TargetWorkerUtilization),
 		))
 	}
 
-	raw := max32(config.MinReplicas, backlogDesired, utilizationDesired)
+	cpuPercent := float64(0)
+	cpuDesired := int32(0)
+	if signals.ExecutionSignalsValid && signals.ReportingWorkers > 0 {
+		cpuPercent = float64(signals.AverageWorkerCPUMillis) / 10
+		cpuDesired = int32(math.Ceil(
+			float64(signals.ReportingWorkers) * cpuPercent /
+				float64(config.TargetCPUUtilization),
+		))
+	}
+
+	drainDesired, arrivalDesired := int32(0), int32(0)
+	// Rate projection uses only Pods that produced the measured completion
+	// rate. While StatefulSet desired is still above registered Pods, those
+	// already-starting Pods satisfy the current rate recommendation; wait for
+	// them before projecting another rate-driven increase.
+	if state.ratesValid && registeredPods >= int64(current) &&
+		registeredPods > 0 && state.completionRate > 0 {
+		perPodCompletionRate := state.completionRate / float64(registeredPods)
+		if pending > 0 {
+			drainDesired = ceilFloat(
+				float64(pending) /
+					(config.TargetQueueDrainTime.Seconds() * perPodCompletionRate),
+			)
+		}
+		if state.arrivalRate > 0 {
+			arrivalDesired = ceilFloat(
+				state.arrivalRate /
+					(perPodCompletionRate * float64(config.TargetThroughputUtilization) / 100),
+			)
+		}
+	}
+
+	raw := max32(
+		config.MinReplicas, queueDesired, utilizationDesired,
+		cpuDesired, drainDesired, arrivalDesired,
+	)
 	raw = clamp(raw, config.MinReplicas, config.MaxReplicas)
 	desired := raw
 	reason := "within target"
+	telemetryCoverage := float64(0)
+	telemetryCoverageComplete := false
+	if registeredPods == 0 {
+		// No execution instances is a coherent complete snapshot. The minimum
+		// replica bound still prevents removal of all execution capacity.
+		telemetryCoverageComplete = signals.ExecutionSignalsValid
+	} else {
+		telemetryCoverage = float64(signals.ReportingWorkers) / float64(registeredPods) * 100
+		telemetryCoverageComplete = signals.ExecutionSignalsValid &&
+			signals.ReportingWorkers <= registeredPods &&
+			telemetryCoverage >= float64(config.MinTelemetryCoveragePercent)
+	}
+	dominant := dominantSignal(
+		raw, queueDesired, utilizationDesired, cpuDesired, drainDesired, arrivalDesired,
+	)
+
+	relativeChangePercent := float64(abs32(raw-current)) / float64(current) * 100
+	if raw != current && relativeChangePercent <= float64(config.TolerancePercent) {
+		desired = current
+		reason = "within scaling tolerance"
+		state.BelowSince = time.Time{}
+	}
 
 	switch {
-	case raw > current:
+	case desired > current:
 		state.BelowSince = time.Time{}
 		if !state.LastScale.IsZero() && now.Sub(state.LastScale) < config.ScaleUpPeriod {
 			desired = current
@@ -181,8 +293,15 @@ func (p Policy) Recommend(current int32, signals Signals, now time.Time, state *
 		}
 		increase := max32(config.ScaleUpPods, int32(math.Ceil(float64(current)*float64(config.ScaleUpPercent)/100)))
 		desired = min32(raw, current+increase)
-		reason = "backlog or Worker allocation utilization above target"
-	case raw < current:
+		reason = "scale-up: " + dominant
+	case desired < current:
+		if !signals.TaskBreakdownValid || !telemetryCoverageComplete ||
+			!state.ratesValid {
+			desired = current
+			reason = "scale-down blocked by incomplete signals"
+			state.BelowSince = time.Time{}
+			break
+		}
 		if state.BelowSince.IsZero() {
 			state.BelowSince = now
 		}
@@ -205,9 +324,80 @@ func (p Policy) Recommend(current int32, signals Signals, now time.Time, state *
 
 	return Recommendation{
 		Current: current, Desired: desired, RawDesired: raw,
-		BacklogDesired: backlogDesired, UtilizationDesired: utilizationDesired,
-		UtilizationPercent: utilization, Reason: reason,
+		BacklogDesired: queueDesired, QueueDesired: queueDesired,
+		UtilizationDesired: utilizationDesired, CPUDesired: cpuDesired,
+		DrainDesired: drainDesired, ArrivalDesired: arrivalDesired,
+		UtilizationPercent: utilization, CPUPercent: cpuPercent,
+		ArrivalRate: state.arrivalRate, CompletionRate: state.completionRate,
+		RatesValid: state.ratesValid, TelemetryCoverage: telemetryCoverage,
+		ScaleDownBlocked: raw < current &&
+			(!signals.TaskBreakdownValid || !telemetryCoverageComplete ||
+				!state.ratesValid),
+		DominantSignal: dominant, Reason: reason,
 	}
+}
+
+const rateEWMAAlpha = 0.5
+
+func (s *State) observeRates(signals Signals) {
+	if !signals.RateCountersValid || signals.ObservedAt.IsZero() {
+		s.ratesValid = false
+		return
+	}
+	epoch := signals.TelemetrySource + "/" + signals.TelemetryStartedAt.UTC().Format(time.RFC3339Nano)
+	if epoch == "/" || epoch != s.telemetryEpoch ||
+		signals.SubmittedTasksTotal < s.lastSubmitted ||
+		signals.CompletedTasksTotal < s.lastCompleted {
+		s.telemetryEpoch = epoch
+		s.lastObservedAt = signals.ObservedAt
+		s.lastSubmitted = signals.SubmittedTasksTotal
+		s.lastCompleted = signals.CompletedTasksTotal
+		s.arrivalRate = 0
+		s.completionRate = 0
+		s.ratesValid = false
+		return
+	}
+	elapsed := signals.ObservedAt.Sub(s.lastObservedAt).Seconds()
+	if elapsed <= 0 {
+		return
+	}
+	arrival := float64(signals.SubmittedTasksTotal-s.lastSubmitted) / elapsed
+	completion := float64(signals.CompletedTasksTotal-s.lastCompleted) / elapsed
+	if !s.ratesValid {
+		s.arrivalRate, s.completionRate = arrival, completion
+		s.ratesValid = true
+	} else {
+		s.arrivalRate = rateEWMAAlpha*arrival + (1-rateEWMAAlpha)*s.arrivalRate
+		s.completionRate = rateEWMAAlpha*completion + (1-rateEWMAAlpha)*s.completionRate
+	}
+	s.lastObservedAt = signals.ObservedAt
+	s.lastSubmitted = signals.SubmittedTasksTotal
+	s.lastCompleted = signals.CompletedTasksTotal
+}
+
+func dominantSignal(
+	raw, queue, utilization, cpu, drain, arrival int32,
+) string {
+	dominantName := "minimum replica floor"
+	dominantValue := int32(0)
+	for _, candidate := range []struct {
+		name  string
+		value int32
+	}{
+		{"queue depth", queue},
+		{"running-slot utilization", utilization},
+		{"CPU utilization", cpu},
+		{"queue drain SLO", drain},
+		{"arrival rate", arrival},
+	} {
+		if candidate.value > dominantValue {
+			dominantName, dominantValue = candidate.name, candidate.value
+		}
+	}
+	if dominantValue == 0 || raw > dominantValue {
+		return "minimum replica floor"
+	}
+	return dominantName
 }
 
 // RecordApplied starts the next rate-limit interval only after the Kubernetes
@@ -233,54 +423,53 @@ func (r HTTPReader) Read(ctx context.Context, baseURL string) (Signals, error) {
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
 
-	var tenants map[string]struct {
-		Inflight int64 `json:"inflight"`
+	var snapshot struct {
+		ObservedAt             time.Time `json:"observed_at"`
+		UnfinishedTasks        int64     `json:"unfinished_tasks"`
+		PendingTasks           int64     `json:"pending_tasks"`
+		RunningTasks           int64     `json:"running_tasks"`
+		OldestPendingAgeMillis int64     `json:"oldest_pending_age_ms"`
+		TaskBreakdownValid     bool      `json:"task_breakdown_valid"`
+		AllocatedWorkers       int64     `json:"allocated_workers"`
+		WorkerCapacity         int64     `json:"worker_capacity"`
+		WorkerInstances        int64     `json:"worker_instances"`
+		ExecutionSignalsValid  bool      `json:"execution_signals_valid"`
+		ReportingWorkers       int64     `json:"reporting_workers"`
+		ExecutingTasks         int64     `json:"executing_tasks"`
+		AverageWorkerCPUMillis int64     `json:"average_worker_cpu_millis"`
+		MaxWorkerCPUMillis     int64     `json:"max_worker_cpu_millis"`
+		RateCountersValid      bool      `json:"rate_counters_valid"`
+		TelemetrySource        string    `json:"telemetry_source"`
+		TelemetryStartedAt     time.Time `json:"telemetry_started_at"`
+		SubmittedTasksTotal    int64     `json:"submitted_tasks_total"`
+		CompletedTasksTotal    int64     `json:"completed_tasks_total"`
 	}
-	if err := readJSON(ctx, httpClient, baseURL+"/api/v1/admin/tenants", &tenants); err != nil {
-		return Signals{}, fmt.Errorf("read tenants: %w", err)
+	if err := readJSON(
+		ctx, httpClient, baseURL+"/api/v1/admin/autoscaling", &snapshot,
+	); err != nil {
+		return Signals{}, fmt.Errorf("read autoscaling snapshot: %w", err)
 	}
-	var nodes struct {
-		Nodes []struct {
-			NodeID       string `json:"node_id"`
-			Role         string `json:"role"`
-			Status       string `json:"status"`
-			TotalWorkers int64  `json:"total_workers"`
-		} `json:"nodes"`
-	}
-	if err := readJSON(ctx, httpClient, baseURL+"/api/v1/admin/nodes", &nodes); err != nil {
-		return Signals{}, fmt.Errorf("read nodes: %w", err)
-	}
-	var allocations struct {
-		Nodes []struct {
-			NodeID  string           `json:"node_id"`
-			Tenants map[string]int64 `json:"tenants"`
-		} `json:"nodes"`
-	}
-	if err := readJSON(ctx, httpClient, baseURL+"/api/v1/admin/allocations", &allocations); err != nil {
-		return Signals{}, fmt.Errorf("read allocations: %w", err)
-	}
-
-	var signals Signals
-	liveWorkers := make(map[string]struct{}, len(nodes.Nodes))
-	for _, tenant := range tenants {
-		signals.Backlog += tenant.Inflight
-	}
-	for _, node := range nodes.Nodes {
-		if node.Role == "worker" && node.Status == "up" {
-			liveWorkers[node.NodeID] = struct{}{}
-			signals.WorkerCapacity += node.TotalWorkers
-			signals.WorkerInstances++
-		}
-	}
-	for _, allocation := range allocations.Nodes {
-		if _, live := liveWorkers[allocation.NodeID]; !live {
-			continue
-		}
-		for _, workers := range allocation.Tenants {
-			signals.AllocatedWorkers += workers
-		}
-	}
-	return signals, nil
+	return Signals{
+		ObservedAt:             snapshot.ObservedAt,
+		Backlog:                snapshot.UnfinishedTasks,
+		PendingTasks:           snapshot.PendingTasks,
+		RunningTasks:           snapshot.RunningTasks,
+		OldestPendingAge:       time.Duration(snapshot.OldestPendingAgeMillis) * time.Millisecond,
+		TaskBreakdownValid:     snapshot.TaskBreakdownValid,
+		AllocatedWorkers:       snapshot.AllocatedWorkers,
+		WorkerCapacity:         snapshot.WorkerCapacity,
+		WorkerInstances:        snapshot.WorkerInstances,
+		ExecutionSignalsValid:  snapshot.ExecutionSignalsValid,
+		ReportingWorkers:       snapshot.ReportingWorkers,
+		ExecutingTasks:         snapshot.ExecutingTasks,
+		AverageWorkerCPUMillis: snapshot.AverageWorkerCPUMillis,
+		MaxWorkerCPUMillis:     snapshot.MaxWorkerCPUMillis,
+		RateCountersValid:      snapshot.RateCountersValid,
+		TelemetrySource:        snapshot.TelemetrySource,
+		TelemetryStartedAt:     snapshot.TelemetryStartedAt,
+		SubmittedTasksTotal:    snapshot.SubmittedTasksTotal,
+		CompletedTasksTotal:    snapshot.CompletedTasksTotal,
+	}, nil
 }
 
 // newDirectHTTPClient deliberately ignores HTTP_PROXY/HTTPS_PROXY. The Sluice
@@ -402,10 +591,27 @@ func (r *Runner) ReconcileOnce(ctx context.Context) error {
 		r.mu.Unlock()
 		if signals.Backlog > 0 {
 			log.FromContext(ctx).Info("workload autoscaler observed pressure",
-				"backlog", signals.Backlog, "allocatedWorkers", signals.AllocatedWorkers,
+				"unfinished", signals.Backlog, "pending", signals.PendingTasks,
+				"running", signals.RunningTasks,
+				"oldestPendingAge", signals.OldestPendingAge,
+				"executingTasks", signals.ExecutingTasks,
+				"averageWorkerCPUPercent", float64(signals.AverageWorkerCPUMillis)/10,
+				"allocatedWorkers", signals.AllocatedWorkers,
 				"workerCapacity", signals.WorkerCapacity,
 				"workerInstances", signals.WorkerInstances, "replicas", current,
-				"rawDesired", recommendation.RawDesired, "reason", recommendation.Reason)
+				"reportingWorkers", signals.ReportingWorkers,
+				"queueDesired", recommendation.QueueDesired,
+				"runningDesired", recommendation.UtilizationDesired,
+				"cpuDesired", recommendation.CPUDesired,
+				"drainDesired", recommendation.DrainDesired,
+				"arrivalDesired", recommendation.ArrivalDesired,
+				"arrivalRate", recommendation.ArrivalRate,
+				"completionRate", recommendation.CompletionRate,
+				"telemetryCoveragePercent", recommendation.TelemetryCoverage,
+				"scaleDownBlocked", recommendation.ScaleDownBlocked,
+				"rawDesired", recommendation.RawDesired,
+				"dominantSignal", recommendation.DominantSignal,
+				"reason", recommendation.Reason)
 		}
 		return nil
 	}
@@ -419,9 +625,24 @@ func (r *Runner) ReconcileOnce(ctx context.Context) error {
 	r.mu.Unlock()
 	log.FromContext(ctx).Info("workload autoscaler changed Worker replicas",
 		"from", current, "to", recommendation.Desired, "rawDesired", recommendation.RawDesired,
-		"backlog", signals.Backlog, "allocatedWorkers", signals.AllocatedWorkers,
+		"unfinished", signals.Backlog, "pending", signals.PendingTasks,
+		"running", signals.RunningTasks, "oldestPendingAge", signals.OldestPendingAge,
+		"executingTasks", signals.ExecutingTasks,
+		"allocatedWorkers", signals.AllocatedWorkers,
 		"workerCapacity", signals.WorkerCapacity, "workerInstances", signals.WorkerInstances,
-		"utilizationPercent", recommendation.UtilizationPercent,
+		"reportingWorkers", signals.ReportingWorkers,
+		"runningUtilizationPercent", recommendation.UtilizationPercent,
+		"cpuPercent", recommendation.CPUPercent,
+		"queueDesired", recommendation.QueueDesired,
+		"runningDesired", recommendation.UtilizationDesired,
+		"cpuDesired", recommendation.CPUDesired,
+		"drainDesired", recommendation.DrainDesired,
+		"arrivalDesired", recommendation.ArrivalDesired,
+		"arrivalRate", recommendation.ArrivalRate,
+		"completionRate", recommendation.CompletionRate,
+		"telemetryCoveragePercent", recommendation.TelemetryCoverage,
+		"scaleDownBlocked", recommendation.ScaleDownBlocked,
+		"dominantSignal", recommendation.DominantSignal,
 		"reason", recommendation.Reason)
 	return nil
 }
@@ -453,6 +674,23 @@ func ceilDiv(value, divisor int64) int32 {
 		return 0
 	}
 	return int32((value + divisor - 1) / divisor)
+}
+
+func ceilFloat(value float64) int32 {
+	if value <= 0 {
+		return 0
+	}
+	if value >= float64(math.MaxInt32) {
+		return math.MaxInt32
+	}
+	return int32(math.Ceil(value))
+}
+
+func abs32(value int32) int32 {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func clamp(value, low, high int32) int32 { return min32(high, max32(low, value)) }

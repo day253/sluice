@@ -72,6 +72,18 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}})
 	case r.URL.Path == "/api/v1/metrics":
 		writeBrowserJSON(w, []any{})
+	case r.URL.Path == "/api/v1/admin/autoscaling":
+		writeBrowserJSON(w, map[string]any{
+			"observed_at": time.Now().UTC(), "unfinished_tasks": 12,
+			"pending_tasks": 7, "running_tasks": 5,
+			"oldest_pending_age_ms": 2500, "task_breakdown_valid": true,
+			"worker_capacity": 100, "worker_instances": 1,
+			"execution_signals_valid": true, "reporting_workers": 1,
+			"executing_tasks": 5, "average_worker_cpu_millis": 420,
+			"max_worker_cpu_millis": 720, "rate_counters_valid": true,
+			"telemetry_source":      "control-0",
+			"submitted_tasks_total": 120, "completed_tasks_total": 108,
+		})
 	case r.URL.Path == "/api/v1/admin/performance":
 		writeBrowserJSON(w, map[string]any{
 			"node_id": "control-0", "collected_at": time.Now().UTC(),
@@ -211,6 +223,7 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 		t.Fatal(err)
 	}
 	var capacity, allocated, nodeSummary, workerLegend, cpuAdmission, cpuNote string
+	var queuePressure, executionPressure, cpuPressure, telemetryCoverage string
 	if err := chromedp.Run(ctx,
 		chromedp.Text("#metric-capacity", &capacity, chromedp.ByQuery),
 		chromedp.Text("#metric-allocated", &allocated, chromedp.ByQuery),
@@ -218,15 +231,22 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 		chromedp.Text("#worker-chart-legend", &workerLegend, chromedp.ByQuery),
 		chromedp.Text("#performance-cpu-admission", &cpuAdmission, chromedp.ByQuery),
 		chromedp.Text("#performance-cpu-note", &cpuNote, chromedp.ByQuery),
+		chromedp.Text("#autoscaling-queue", &queuePressure, chromedp.ByQuery),
+		chromedp.Text("#autoscaling-execution", &executionPressure, chromedp.ByQuery),
+		chromedp.Text("#autoscaling-cpu", &cpuPressure, chromedp.ByQuery),
+		chromedp.Text("#autoscaling-telemetry-note", &telemetryCoverage, chromedp.ByQuery),
 	); err != nil {
 		t.Fatal(err)
 	}
 	if capacity != "100" || allocated != "0" || nodeSummary != "2" ||
 		strings.Contains(workerLegend, "worker-retained") ||
-		cpuAdmission != "3 / 12" || !strings.Contains(cpuNote, "max 72% CPU") {
+		cpuAdmission != "3 / 12" || !strings.Contains(cpuNote, "max 72% CPU") ||
+		queuePressure != "7 / 5" || executionPressure != "5 / 100" ||
+		cpuPressure != "42% / 72%" || telemetryCoverage != "100% reporting coverage" {
 		t.Fatalf(
-			"live Worker UI capacity=%q allocated=%q nodes=%q legend=%q CPU=%q note=%q",
+			"live Worker UI capacity=%q allocated=%q nodes=%q legend=%q CPU=%q note=%q autoscaling=%q %q %q %q",
 			capacity, allocated, nodeSummary, workerLegend, cpuAdmission, cpuNote,
+			queuePressure, executionPressure, cpuPressure, telemetryCoverage,
 		)
 	}
 	if err := chromedp.Run(ctx,

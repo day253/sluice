@@ -475,6 +475,24 @@ func normalizeClusterSpec(in sluicev1.SluiceClusterSpec) (normalizedSpec, error)
 				if configured.TargetWorkerUtilization > 0 {
 					workload.TargetWorkerUtilization = configured.TargetWorkerUtilization
 				}
+				if configured.TargetCPUUtilization > 0 {
+					workload.TargetCPUUtilization = configured.TargetCPUUtilization
+				}
+				if configured.TargetQueueDrainSeconds > 0 {
+					workload.TargetQueueDrainTime =
+						time.Duration(configured.TargetQueueDrainSeconds) * time.Second
+				}
+				if configured.TargetThroughputUtilization > 0 {
+					workload.TargetThroughputUtilization =
+						configured.TargetThroughputUtilization
+				}
+				if configured.TolerancePercent != nil {
+					workload.TolerancePercent = *configured.TolerancePercent
+				}
+				if configured.MinTelemetryCoveragePercent > 0 {
+					workload.MinTelemetryCoveragePercent =
+						configured.MinTelemetryCoveragePercent
+				}
 				if configured.ScaleUpPercent > 0 {
 					workload.ScaleUpPercent = configured.ScaleUpPercent
 				}

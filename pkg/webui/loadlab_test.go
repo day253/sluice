@@ -117,6 +117,9 @@ func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
 		`/capacity`, `body:JSON.stringify({total_workers:totalWorkers})`,
 		`id="performance-cpu-admission"`, `CPU admission`,
 		`load_throttled_requests`, `worker_loads`,
+		`id="autoscaling-title"`, `Autoscaling pressure`,
+		`id="autoscaling-queue"`, `id="autoscaling-execution"`,
+		`id="autoscaling-telemetry"`, `/api/v1/admin/autoscaling`,
 		`idempotency_key:`, `buildRoundRobinJobs`,
 		`<script src="/assets/loadlab.js"></script>`,
 	} {

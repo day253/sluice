@@ -69,6 +69,42 @@ type WorkerLoadSnapshot struct {
 	WorkerCapacity       int
 }
 
+// TaskPressureSnapshot is one coherent read of the replicated unfinished-task
+// mirror. It is current state, not a historical series.
+type TaskPressureSnapshot struct {
+	UnfinishedTasks int64
+	PendingTasks    int64
+	RunningTasks    int64
+	OldestPendingAt time.Time
+}
+
+// AutoscalingSnapshot is the read-only control-plane signal consumed by the
+// Worker autoscaler. Replicated task/allocation fields and Leader-local
+// execution telemetry are intentionally identified separately so missing soft
+// metrics can block scale-down without blocking queue-driven scale-up.
+type AutoscalingSnapshot struct {
+	ObservedAt             time.Time `json:"observed_at"`
+	UnfinishedTasks        int64     `json:"unfinished_tasks"`
+	PendingTasks           int64     `json:"pending_tasks"`
+	RunningTasks           int64     `json:"running_tasks"`
+	OldestPendingAgeMillis int64     `json:"oldest_pending_age_ms"`
+	TaskBreakdownValid     bool      `json:"task_breakdown_valid"`
+	AllocatedWorkers       int64     `json:"allocated_workers"`
+	WorkerCapacity         int64     `json:"worker_capacity"`
+	WorkerInstances        int64     `json:"worker_instances"`
+	ExecutionSignalsValid  bool      `json:"execution_signals_valid"`
+	ReportingWorkers       int64     `json:"reporting_workers"`
+	ExecutingTasks         int64     `json:"executing_tasks"`
+	AverageWorkerCPUMillis int64     `json:"average_worker_cpu_millis"`
+	MaxWorkerCPUMillis     int64     `json:"max_worker_cpu_millis"`
+	RateCountersValid      bool      `json:"rate_counters_valid"`
+	TelemetrySource        string    `json:"telemetry_source,omitempty"`
+	TelemetryStartedAt     time.Time `json:"telemetry_started_at,omitempty"`
+	SubmittedTasksTotal    int64     `json:"submitted_tasks_total"`
+	CompletedTasksTotal    int64     `json:"completed_tasks_total"`
+	ExecutionSignalsError  string    `json:"execution_signals_error,omitempty"`
+}
+
 // ---------------------------------------------------------------------------
 // Tenant
 // ---------------------------------------------------------------------------

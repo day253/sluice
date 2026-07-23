@@ -57,6 +57,10 @@ func (in *WorkerAutoscalingSpec) DeepCopyInto(out *WorkerAutoscalingSpec) {
 	*out = *in
 	if in.Workload != nil {
 		clone := *in.Workload
+		if in.Workload.TolerancePercent != nil {
+			value := *in.Workload.TolerancePercent
+			clone.TolerancePercent = &value
+		}
 		if in.Workload.ScaleDownStabilizationSeconds != nil {
 			value := *in.Workload.ScaleDownStabilizationSeconds
 			clone.ScaleDownStabilizationSeconds = &value

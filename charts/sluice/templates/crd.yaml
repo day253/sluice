@@ -93,6 +93,30 @@ spec:
                           minimum: 1
                           maximum: 100
                           default: 70
+                        targetCPUUtilization:
+                          type: integer
+                          minimum: 1
+                          maximum: 100
+                          default: 70
+                        targetQueueDrainSeconds:
+                          type: integer
+                          minimum: 1
+                          default: 30
+                        targetThroughputUtilization:
+                          type: integer
+                          minimum: 1
+                          maximum: 100
+                          default: 80
+                        tolerancePercent:
+                          type: integer
+                          minimum: 0
+                          maximum: 100
+                          default: 10
+                        minTelemetryCoveragePercent:
+                          type: integer
+                          minimum: 1
+                          maximum: 100
+                          default: 80
                         scaleUpPercent:
                           type: integer
                           minimum: 1

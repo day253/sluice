@@ -884,6 +884,28 @@ func (f *FSM) CountPendingPerTenant() map[string]int {
 	return out
 }
 
+// TaskPressureSnapshot reads O(1) current gauges from the rebuildable pending
+// index and unfinished task map under one FSM read lock. It deliberately does
+// not rescan every task on each autoscaler/WebUI poll.
+func (f *FSM) TaskPressureSnapshot() types.TaskPressureSnapshot {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	unfinished := int64(len(f.state.Tasks))
+	pending := int64(f.pending.count)
+	running := unfinished - pending
+	if running < 0 {
+		// A derived-index invariant violation must not publish a negative
+		// running count. Restore rebuilds this index from durable task state.
+		running = 0
+	}
+	return types.TaskPressureSnapshot{
+		UnfinishedTasks: unfinished,
+		PendingTasks:    pending,
+		RunningTasks:    running,
+		OldestPendingAt: f.pending.oldestCreatedAt(f.state),
+	}
+}
+
 // OldestPendingCreatedAtByTenant returns the creation time of the oldest
 // pending task for each tenant. It is a current scheduling signal only; the
 // task history remains in the bounded task/result stores.

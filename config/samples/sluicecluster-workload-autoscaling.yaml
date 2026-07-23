@@ -16,11 +16,20 @@ spec:
     maxReplicas: 100
     workload:
       pollIntervalSeconds: 5
-      # Scale toward enough Pods for current unfinished tasks. This is not a
+      # Scale toward enough Pods for current pending tasks. This is not a
       # queue admission limit; tenant limits and Leader allocation still apply.
       targetBacklogPerPod: 400
-      # Also scale when registered Worker execution slots are heavily allocated.
+      # Independent running-slot and CPU candidates are combined by max().
       targetWorkerUtilization: 70
+      targetCPUUtilization: 70
+      # Measured completion throughput also projects capacity required to
+      # drain pending work within this SLO and retain steady-arrival headroom.
+      targetQueueDrainSeconds: 30
+      targetThroughputUtilization: 80
+      tolerancePercent: 10
+      # Missing execution telemetry may still cause scale-up, but at least
+      # this percentage must report before any scale-down is allowed.
+      minTelemetryCoveragePercent: 80
       scaleUpPercent: 100
       scaleUpPods: 10
       scaleDownPercent: 25

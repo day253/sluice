@@ -169,6 +169,21 @@ func (p *pendingIndex) remove(task *types.TaskRecord) {
 	}
 }
 
+func (p *pendingIndex) oldestCreatedAt(state *types.FSMState) time.Time {
+	node := p.all
+	for node != nil && node.left != nil {
+		node = node.left
+	}
+	if node == nil {
+		return time.Time{}
+	}
+	task := state.Tasks[node.key.taskID]
+	if task == nil || task.Status != types.TaskStatusPending {
+		return time.Time{}
+	}
+	return task.CreatedAt
+}
+
 type pendingIterator struct {
 	stack         []*pendingTreeNode
 	createdBefore int64

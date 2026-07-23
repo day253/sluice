@@ -13,6 +13,21 @@
 {{- if or (lt (int $workload.targetWorkerUtilization) 1) (gt (int $workload.targetWorkerUtilization) 100) -}}
 {{- fail "worker.autoscaling.workload.targetWorkerUtilization must be between 1 and 100" -}}
 {{- end -}}
+{{- if or (lt (int $workload.targetCPUUtilization) 1) (gt (int $workload.targetCPUUtilization) 100) -}}
+{{- fail "worker.autoscaling.workload.targetCPUUtilization must be between 1 and 100" -}}
+{{- end -}}
+{{- if lt (int $workload.targetQueueDrainSeconds) 1 -}}
+{{- fail "worker.autoscaling.workload.targetQueueDrainSeconds must be positive" -}}
+{{- end -}}
+{{- if or (lt (int $workload.targetThroughputUtilization) 1) (gt (int $workload.targetThroughputUtilization) 100) -}}
+{{- fail "worker.autoscaling.workload.targetThroughputUtilization must be between 1 and 100" -}}
+{{- end -}}
+{{- if or (lt (int $workload.tolerancePercent) 0) (gt (int $workload.tolerancePercent) 100) -}}
+{{- fail "worker.autoscaling.workload.tolerancePercent must be between 0 and 100" -}}
+{{- end -}}
+{{- if or (lt (int $workload.minTelemetryCoveragePercent) 1) (gt (int $workload.minTelemetryCoveragePercent) 100) -}}
+{{- fail "worker.autoscaling.workload.minTelemetryCoveragePercent must be between 1 and 100" -}}
+{{- end -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -90,6 +105,11 @@ spec:
             - "--workers-per-pod={{ .Values.workersPerNode }}"
             - "--target-backlog-per-pod={{ $workload.targetBacklogPerPod }}"
             - "--target-worker-utilization={{ $workload.targetWorkerUtilization }}"
+            - "--target-cpu-utilization={{ $workload.targetCPUUtilization }}"
+            - "--target-queue-drain={{ $workload.targetQueueDrainSeconds }}s"
+            - "--target-throughput-utilization={{ $workload.targetThroughputUtilization }}"
+            - "--tolerance-percent={{ $workload.tolerancePercent }}"
+            - "--min-telemetry-coverage-percent={{ $workload.minTelemetryCoveragePercent }}"
             - "--scale-up-percent={{ $workload.scaleUpPercent }}"
             - "--scale-up-pods={{ $workload.scaleUpPods }}"
             - "--scale-down-percent={{ $workload.scaleDownPercent }}"

@@ -51,6 +51,11 @@ type WorkloadAutoscalingSpec struct {
 	PollIntervalSeconds           int32  `json:"pollIntervalSeconds,omitempty"`
 	TargetBacklogPerPod           int64  `json:"targetBacklogPerPod,omitempty"`
 	TargetWorkerUtilization       int32  `json:"targetWorkerUtilization,omitempty"`
+	TargetCPUUtilization          int32  `json:"targetCPUUtilization,omitempty"`
+	TargetQueueDrainSeconds       int32  `json:"targetQueueDrainSeconds,omitempty"`
+	TargetThroughputUtilization   int32  `json:"targetThroughputUtilization,omitempty"`
+	TolerancePercent              *int32 `json:"tolerancePercent,omitempty"`
+	MinTelemetryCoveragePercent   int32  `json:"minTelemetryCoveragePercent,omitempty"`
 	ScaleUpPercent                int32  `json:"scaleUpPercent,omitempty"`
 	ScaleUpPods                   int32  `json:"scaleUpPods,omitempty"`
 	ScaleDownPercent              int32  `json:"scaleDownPercent,omitempty"`

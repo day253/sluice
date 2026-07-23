@@ -338,8 +338,24 @@ func TestNormalizeClusterSpecDefaultsAndHonorsWorkloadScaleDownWindow(t *testing
 	if got := defaulted.workloadAutoscaling.ScaleDownStabilization; got != 5*time.Minute {
 		t.Fatalf("default scale-down stabilization = %s, want 5m", got)
 	}
+	if got := defaulted.workloadAutoscaling.TargetCPUUtilization; got != 70 {
+		t.Fatalf("default CPU target = %d, want 70", got)
+	}
+	if got := defaulted.workloadAutoscaling.TargetQueueDrainTime; got != 30*time.Second {
+		t.Fatalf("default queue drain target = %s, want 30s", got)
+	}
+	if got := defaulted.workloadAutoscaling.TargetThroughputUtilization; got != 80 {
+		t.Fatalf("default throughput target = %d, want 80", got)
+	}
+	if got := defaulted.workloadAutoscaling.TolerancePercent; got != 10 {
+		t.Fatalf("default tolerance = %d, want 10", got)
+	}
+	if got := defaulted.workloadAutoscaling.MinTelemetryCoveragePercent; got != 80 {
+		t.Fatalf("default telemetry coverage = %d, want 80", got)
+	}
 	base.Autoscaling.Workload = &sluicev1.WorkloadAutoscalingSpec{
 		ScaleDownStabilizationSeconds: ptr(int32(0)),
+		TolerancePercent:              ptr(int32(0)),
 	}
 	explicitZero, err := normalizeClusterSpec(base)
 	if err != nil {
@@ -347,5 +363,8 @@ func TestNormalizeClusterSpecDefaultsAndHonorsWorkloadScaleDownWindow(t *testing
 	}
 	if got := explicitZero.workloadAutoscaling.ScaleDownStabilization; got != 0 {
 		t.Fatalf("explicit scale-down stabilization = %s, want 0", got)
+	}
+	if got := explicitZero.workloadAutoscaling.TolerancePercent; got != 0 {
+		t.Fatalf("explicit tolerance = %d, want 0", got)
 	}
 }

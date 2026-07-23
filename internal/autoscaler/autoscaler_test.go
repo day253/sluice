@@ -23,7 +23,10 @@ func TestPolicyScalesUpFromBacklogWithoutWaitingForCPU(t *testing.T) {
 	policy := Policy{Config: config}
 	state := &State{}
 	start := time.Unix(1000, 0)
-	signals := Signals{Backlog: 20_000, AllocatedWorkers: 500, WorkerCapacity: 500}
+	signals := Signals{
+		Backlog: 20_000, PendingTasks: 20_000, TaskBreakdownValid: true,
+		AllocatedWorkers: 500, WorkerCapacity: 500,
+	}
 
 	first := policy.Recommend(5, signals, start, state)
 	if first.BacklogDesired != 50 || first.Desired != 15 {
@@ -41,11 +44,15 @@ func TestPolicyScalesUpFromBacklogWithoutWaitingForCPU(t *testing.T) {
 	}
 }
 
-func TestPolicyUsesAllocatedWorkerUtilizationForSmallBacklog(t *testing.T) {
+func TestPolicyUsesActualExecutionSlotUtilizationForSmallBacklog(t *testing.T) {
 	config := DefaultConfig()
 	recommendation := (Policy{Config: config}).Recommend(
 		5,
-		Signals{Backlog: 1, AllocatedWorkers: 500, WorkerCapacity: 500},
+		Signals{
+			Backlog: 1, PendingTasks: 1, TaskBreakdownValid: true,
+			ExecutionSignalsValid: true, ExecutingTasks: 500,
+			WorkerCapacity: 500, WorkerInstances: 5, ReportingWorkers: 5,
+		},
 		time.Unix(1000, 0),
 		&State{},
 	)
@@ -58,11 +65,13 @@ func TestPolicyUsesAllocatedWorkerUtilizationForSmallBacklog(t *testing.T) {
 func TestPolicyUsesActualHeterogeneousWorkerInstanceCount(t *testing.T) {
 	config := DefaultConfig()
 	config.MinReplicas = 1
+	config.TolerancePercent = 0
 	recommendation := (Policy{Config: config}).Recommend(
 		2,
 		Signals{
-			Backlog: 1, AllocatedWorkers: 300, WorkerCapacity: 300,
-			WorkerInstances: 2,
+			Backlog: 1, PendingTasks: 1, TaskBreakdownValid: true,
+			AllocatedWorkers: 300, WorkerCapacity: 300, WorkerInstances: 2,
+			ExecutionSignalsValid: true, ExecutingTasks: 300, ReportingWorkers: 2,
 		},
 		time.Unix(1000, 0),
 		&State{},
@@ -80,42 +89,49 @@ func TestPolicyRequiresSustainedSpareCapacityBeforeBoundedScaleDown(t *testing.T
 	policy := Policy{Config: config}
 	state := &State{}
 	start := time.Unix(1000, 0)
-	signals := Signals{}
+	signals := Signals{
+		TaskBreakdownValid: true, ExecutionSignalsValid: true,
+		RateCountersValid: true, ObservedAt: start,
+		TelemetrySource: "leader-0", TelemetryStartedAt: start.Add(-time.Minute),
+	}
 
 	if got := policy.Recommend(20, signals, start, state); got.Desired != 20 {
-		t.Fatalf("initial low-load recommendation = %+v, want stabilization", got)
+		t.Fatalf("initial low-load recommendation = %+v, want rate baseline", got)
 	}
-	if got := policy.Recommend(20, signals, start.Add(299*time.Second), state); got.Desired != 20 {
+	signals.ObservedAt = start.Add(time.Second)
+	if got := policy.Recommend(20, signals, start.Add(time.Second), state); got.Desired != 20 {
+		t.Fatalf("second low-load recommendation = %+v, want stabilization", got)
+	}
+	if got := policy.Recommend(20, signals, start.Add(300*time.Second), state); got.Desired != 20 {
 		t.Fatalf("early scale-down recommendation = %+v, want 20", got)
 	}
-	first := policy.Recommend(20, signals, start.Add(300*time.Second), state)
+	first := policy.Recommend(20, signals, start.Add(301*time.Second), state)
 	if first.Desired != 15 {
 		t.Fatalf("first scale-down recommendation = %+v, want 15", first)
 	}
-	state.RecordApplied(start.Add(300 * time.Second))
-	if got := policy.Recommend(15, signals, start.Add(359*time.Second), state); got.Desired != 15 {
+	state.RecordApplied(start.Add(301 * time.Second))
+	if got := policy.Recommend(15, signals, start.Add(360*time.Second), state); got.Desired != 15 {
 		t.Fatalf("rate-limited scale-down recommendation = %+v, want 15", got)
 	}
-	if got := policy.Recommend(15, signals, start.Add(360*time.Second), state); got.Desired != 12 {
+	if got := policy.Recommend(15, signals, start.Add(361*time.Second), state); got.Desired != 12 {
 		t.Fatalf("second scale-down recommendation = %+v, want 12", got)
 	}
 }
 
 func TestHTTPReaderCombinesBacklogAndOnlyLiveWorkerCapacity(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/admin/tenants", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"a":{"inflight":17},"b":{"inflight":5}}`))
-	})
-	mux.HandleFunc("/api/v1/admin/nodes", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"nodes":[` +
-			`{"node_id":"control-0","role":"control","status":"up","total_workers":0},` +
-			`{"node_id":"worker-0","role":"worker","status":"up","total_workers":100},` +
-			`{"node_id":"worker-1","role":"worker","status":"down","total_workers":100}]}`))
-	})
-	mux.HandleFunc("/api/v1/admin/allocations", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"nodes":[` +
-			`{"node_id":"worker-0","tenants":{"a":60,"b":25}},` +
-			`{"node_id":"worker-1","tenants":{"a":100}}]}`))
+	mux.HandleFunc("/api/v1/admin/autoscaling", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"observed_at":"2026-07-24T00:00:00Z",
+			"unfinished_tasks":22,"pending_tasks":17,"running_tasks":5,
+			"oldest_pending_age_ms":2500,"task_breakdown_valid":true,
+			"allocated_workers":85,"worker_capacity":100,"worker_instances":1,
+			"execution_signals_valid":true,"reporting_workers":1,
+			"executing_tasks":5,"average_worker_cpu_millis":420,
+			"max_worker_cpu_millis":420,"rate_counters_valid":true,
+			"telemetry_source":"leader-0","telemetry_started_at":"2026-07-23T23:00:00Z",
+			"submitted_tasks_total":120,"completed_tasks_total":98
+		}`))
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()
@@ -124,9 +140,13 @@ func TestHTTPReaderCombinesBacklogAndOnlyLiveWorkerCapacity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if signals != (Signals{
-		Backlog: 22, AllocatedWorkers: 85, WorkerCapacity: 100, WorkerInstances: 1,
-	}) {
+	if signals.Backlog != 22 || signals.PendingTasks != 17 || signals.RunningTasks != 5 ||
+		signals.OldestPendingAge != 2500*time.Millisecond ||
+		signals.AllocatedWorkers != 85 || signals.WorkerCapacity != 100 ||
+		signals.WorkerInstances != 1 || !signals.ExecutionSignalsValid ||
+		signals.ExecutingTasks != 5 || signals.AverageWorkerCPUMillis != 420 ||
+		!signals.RateCountersValid || signals.SubmittedTasksTotal != 120 ||
+		signals.CompletedTasksTotal != 98 {
 		t.Fatalf("signals = %+v", signals)
 	}
 }
@@ -143,16 +163,13 @@ func TestHTTPReaderDefaultClientIgnoresEnvironmentProxy(t *testing.T) {
 	t.Setenv("NO_PROXY", "")
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/admin/tenants", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"direct":{"inflight":3}}`))
-	})
-	mux.HandleFunc("/api/v1/admin/nodes", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/api/v1/admin/autoscaling", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(
-			`{"nodes":[{"node_id":"worker-0","role":"worker","status":"up","total_workers":10}]}`,
+			`{"observed_at":"2026-07-24T00:00:00Z","unfinished_tasks":3,` +
+				`"pending_tasks":3,"task_breakdown_valid":true,` +
+				`"allocated_workers":4,"worker_capacity":10,` +
+				`"worker_instances":1}`,
 		))
-	})
-	mux.HandleFunc("/api/v1/admin/allocations", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"nodes":[{"node_id":"worker-0","tenants":{"direct":4}}]}`))
 	})
 	target := httptest.NewServer(mux)
 	defer target.Close()
@@ -166,9 +183,9 @@ func TestHTTPReaderDefaultClientIgnoresEnvironmentProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if signals != (Signals{
-		Backlog: 3, AllocatedWorkers: 4, WorkerCapacity: 10, WorkerInstances: 1,
-	}) {
+	if signals.Backlog != 3 || signals.PendingTasks != 3 ||
+		signals.AllocatedWorkers != 4 || signals.WorkerCapacity != 10 ||
+		signals.WorkerInstances != 1 {
 		t.Fatalf("signals = %+v", signals)
 	}
 	if got := proxyRequests.Load(); got != 0 {
@@ -176,20 +193,14 @@ func TestHTTPReaderDefaultClientIgnoresEnvironmentProxy(t *testing.T) {
 	}
 }
 
-func TestHTTPReaderExcludesStaleAllocationFromRollingDownWorker(t *testing.T) {
+func TestHTTPReaderDoesNotRecombineConsistentServerSnapshot(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/admin/tenants", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"rolling":{"inflight":1}}`))
-	})
-	mux.HandleFunc("/api/v1/admin/nodes", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"nodes":[` +
-			`{"node_id":"worker-live","role":"worker","status":"up","total_workers":100},` +
-			`{"node_id":"worker-old","role":"worker","status":"down","total_workers":100}]}`))
-	})
-	mux.HandleFunc("/api/v1/admin/allocations", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"nodes":[` +
-			`{"node_id":"worker-live","tenants":{"rolling":50}},` +
-			`{"node_id":"worker-old","tenants":{"rolling":100}}]}`))
+	mux.HandleFunc("/api/v1/admin/autoscaling", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"observed_at":"2026-07-24T00:00:00Z","unfinished_tasks":1,
+			"pending_tasks":1,"task_breakdown_valid":true,"allocated_workers":50,
+			"worker_capacity":100,"worker_instances":1
+		}`))
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()
@@ -198,10 +209,255 @@ func TestHTTPReaderExcludesStaleAllocationFromRollingDownWorker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if signals != (Signals{
-		Backlog: 1, AllocatedWorkers: 50, WorkerCapacity: 100, WorkerInstances: 1,
-	}) {
-		t.Fatalf("rolling signals = %+v, want only live Worker allocation", signals)
+	if signals.Backlog != 1 || signals.PendingTasks != 1 ||
+		signals.AllocatedWorkers != 50 || signals.WorkerCapacity != 100 ||
+		signals.WorkerInstances != 1 {
+		t.Fatalf("consistent signals = %+v", signals)
+	}
+}
+
+func TestPolicyTakesMaxOfCPUQueueDrainAndArrivalCandidates(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	config.MaxReplicas = 100
+	config.TargetBacklogPerPod = 10_000
+	config.TolerancePercent = 0
+	policy := Policy{Config: config}
+	state := &State{}
+	start := time.Unix(1000, 0)
+	base := Signals{
+		ObservedAt: start, Backlog: 600, PendingTasks: 600,
+		TaskBreakdownValid: true,
+		WorkerCapacity:     500, WorkerInstances: 5,
+		ExecutionSignalsValid: true, ReportingWorkers: 5,
+		ExecutingTasks: 350, AverageWorkerCPUMillis: 900,
+		RateCountersValid: true, TelemetrySource: "leader-0",
+		TelemetryStartedAt:  start.Add(-time.Minute),
+		SubmittedTasksTotal: 1_000, CompletedTasksTotal: 500,
+	}
+	first := policy.Recommend(5, base, start, state)
+	if first.CPUDesired != 7 || first.RatesValid {
+		t.Fatalf("first recommendation = %+v, want CPU desired 7 and rate baseline", first)
+	}
+
+	nextSignals := base
+	nextSignals.ObservedAt = start.Add(10 * time.Second)
+	nextSignals.SubmittedTasksTotal += 1_000
+	nextSignals.CompletedTasksTotal += 500
+	next := policy.Recommend(5, nextSignals, start.Add(10*time.Second), state)
+	if next.DrainDesired != 2 || next.ArrivalDesired != 13 ||
+		next.RawDesired != 13 || next.Desired != 13 ||
+		next.DominantSignal != "arrival rate" {
+		t.Fatalf("multi-signal recommendation = %+v, want arrival-driven 13", next)
+	}
+}
+
+func TestPolicyResetsRatesAcrossLeaderTelemetryEpoch(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	config.TolerancePercent = 0
+	policy := Policy{Config: config}
+	state := &State{}
+	start := time.Unix(1000, 0)
+	signals := Signals{
+		ObservedAt: start, TaskBreakdownValid: true,
+		ExecutionSignalsValid: true, RateCountersValid: true,
+		WorkerInstances: 2, WorkerCapacity: 200,
+		TelemetrySource: "leader-a", TelemetryStartedAt: start.Add(-time.Minute),
+	}
+	_ = policy.Recommend(2, signals, start, state)
+	signals.ObservedAt = start.Add(10 * time.Second)
+	signals.SubmittedTasksTotal = 100
+	signals.CompletedTasksTotal = 50
+	if got := policy.Recommend(2, signals, signals.ObservedAt, state); !got.RatesValid {
+		t.Fatalf("same-epoch rates are invalid: %+v", got)
+	}
+	signals.ObservedAt = start.Add(20 * time.Second)
+	signals.TelemetrySource = "leader-b"
+	signals.TelemetryStartedAt = start.Add(15 * time.Second)
+	signals.SubmittedTasksTotal = 1
+	signals.CompletedTasksTotal = 0
+	got := policy.Recommend(2, signals, signals.ObservedAt, state)
+	if got.RatesValid || got.ArrivalDesired != 0 || got.DrainDesired != 0 {
+		t.Fatalf("leader epoch did not reset rate candidates: %+v", got)
+	}
+}
+
+func TestPolicyAllowsQueueScaleUpButBlocksScaleDownWithMissingSoftMetrics(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	config.TolerancePercent = 0
+	policy := Policy{Config: config}
+	up := policy.Recommend(
+		2,
+		Signals{Backlog: 10_000, PendingTasks: 10_000, TaskBreakdownValid: true},
+		time.Unix(1000, 0),
+		&State{},
+	)
+	if up.Desired <= 2 {
+		t.Fatalf("missing execution metrics blocked safe queue scale-up: %+v", up)
+	}
+	down := policy.Recommend(
+		10,
+		Signals{TaskBreakdownValid: true},
+		time.Unix(1000, 0),
+		&State{},
+	)
+	if down.Desired != 10 || !down.ScaleDownBlocked {
+		t.Fatalf("missing execution metrics allowed scale-down: %+v", down)
+	}
+}
+
+func TestPolicyRequiresTelemetryCoverageOnlyForScaleDown(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	config.TolerancePercent = 0
+	config.ScaleDownStabilization = 0
+	policy := Policy{Config: config}
+	now := time.Unix(1000, 0)
+	signals := Signals{
+		TaskBreakdownValid: true, RateCountersValid: true,
+		ExecutionSignalsValid: true, WorkerInstances: 10,
+		WorkerCapacity: 1_000, ReportingWorkers: 7,
+		ObservedAt: now, TelemetrySource: "leader-0",
+		TelemetryStartedAt: now.Add(-time.Minute),
+	}
+	state := &State{}
+	_ = policy.Recommend(10, signals, now, state)
+	signals.ObservedAt = now.Add(time.Second)
+	partial := policy.Recommend(10, signals, signals.ObservedAt, state)
+	if partial.Desired != 10 || !partial.ScaleDownBlocked ||
+		partial.TelemetryCoverage != 70 {
+		t.Fatalf("partial telemetry allowed scale-down: %+v", partial)
+	}
+
+	signals.ReportingWorkers = 8
+	signals.ObservedAt = now.Add(2 * time.Second)
+	complete := policy.Recommend(10, signals, signals.ObservedAt, state)
+	if complete.Desired != 8 || complete.ScaleDownBlocked ||
+		complete.TelemetryCoverage != 80 {
+		t.Fatalf("complete telemetry did not allow bounded scale-down: %+v", complete)
+	}
+}
+
+func TestPolicyDoesNotExtrapolateOneCPUReporterAcrossMissingWorkers(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	config.TolerancePercent = 0
+	policy := Policy{Config: config}
+	state := &State{}
+	now := time.Unix(1000, 0)
+	signals := Signals{
+		TaskBreakdownValid: true, RateCountersValid: true,
+		ExecutionSignalsValid: true, WorkerInstances: 10,
+		WorkerCapacity: 1_000, ReportingWorkers: 1,
+		AverageWorkerCPUMillis: 900, ObservedAt: now,
+		TelemetrySource: "leader-0", TelemetryStartedAt: now.Add(-time.Minute),
+	}
+	_ = policy.Recommend(10, signals, now, state)
+	signals.ObservedAt = now.Add(time.Second)
+	recommendation := policy.Recommend(
+		10,
+		signals,
+		signals.ObservedAt,
+		state,
+	)
+	if recommendation.CPUDesired != 2 || recommendation.Desired != 10 ||
+		!recommendation.ScaleDownBlocked {
+		t.Fatalf("partial CPU telemetry was extrapolated to all Workers: %+v", recommendation)
+	}
+}
+
+func TestPolicyToleranceUsesRelativeChangeWithoutRoundingUp(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	recommendation := (Policy{Config: config}).Recommend(
+		5,
+		Signals{
+			Backlog: 2_400, PendingTasks: 2_400, TaskBreakdownValid: true,
+		},
+		time.Unix(1000, 0),
+		&State{},
+	)
+	if recommendation.QueueDesired != 6 || recommendation.Desired != 6 {
+		t.Fatalf("20%% change was incorrectly hidden by 10%% tolerance: %+v", recommendation)
+	}
+}
+
+func TestPolicyDominantSignalSurvivesMaxReplicaClamp(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	config.MaxReplicas = 100
+	config.TolerancePercent = 0
+	recommendation := (Policy{Config: config}).Recommend(
+		50,
+		Signals{
+			Backlog: 100_000, PendingTasks: 100_000, TaskBreakdownValid: true,
+		},
+		time.Unix(1000, 0),
+		&State{},
+	)
+	if recommendation.QueueDesired != 250 || recommendation.RawDesired != 100 ||
+		recommendation.DominantSignal != "queue depth" {
+		t.Fatalf("max clamp hid the dominant pressure signal: %+v", recommendation)
+	}
+}
+
+func TestPolicyDoesNotChaseRateCandidateWhilePodsAreStarting(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	config.TargetBacklogPerPod = 10_000
+	config.TolerancePercent = 0
+	policy := Policy{Config: config}
+	state := &State{}
+	start := time.Unix(1000, 0)
+	signals := Signals{
+		ObservedAt: start, Backlog: 600, PendingTasks: 600,
+		TaskBreakdownValid: true, WorkerInstances: 5, WorkerCapacity: 500,
+		ExecutionSignalsValid: true, ReportingWorkers: 5,
+		RateCountersValid: true, TelemetrySource: "leader-0",
+		TelemetryStartedAt:  start.Add(-time.Minute),
+		SubmittedTasksTotal: 1_000, CompletedTasksTotal: 500,
+	}
+	_ = policy.Recommend(10, signals, start, state)
+	signals.ObservedAt = start.Add(10 * time.Second)
+	signals.SubmittedTasksTotal += 1_000
+	signals.CompletedTasksTotal += 500
+	recommendation := policy.Recommend(10, signals, signals.ObservedAt, state)
+	if !recommendation.RatesValid || recommendation.ArrivalDesired != 0 ||
+		recommendation.DrainDesired != 0 || recommendation.Desired != 10 {
+		t.Fatalf("rate candidate chased Pods already starting: %+v", recommendation)
+	}
+}
+
+func TestPolicyLeaderEpochResetBlocksScaleDownUntilRatesRecover(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	config.TolerancePercent = 0
+	config.ScaleDownStabilization = 0
+	policy := Policy{Config: config}
+	state := &State{}
+	start := time.Unix(1000, 0)
+	signals := Signals{
+		ObservedAt: start, TaskBreakdownValid: true,
+		ExecutionSignalsValid: true, WorkerInstances: 10,
+		ReportingWorkers: 10, WorkerCapacity: 1_000,
+		RateCountersValid: true, TelemetrySource: "leader-a",
+		TelemetryStartedAt: start.Add(-time.Minute),
+	}
+	if got := policy.Recommend(10, signals, start, state); !got.ScaleDownBlocked {
+		t.Fatalf("first rate sample did not block scale-down: %+v", got)
+	}
+	signals.ObservedAt = start.Add(time.Second)
+	if got := policy.Recommend(10, signals, signals.ObservedAt, state); got.Desired != 8 {
+		t.Fatalf("same-epoch rates did not allow bounded scale-down: %+v", got)
+	}
+	signals.ObservedAt = start.Add(2 * time.Second)
+	signals.TelemetrySource = "leader-b"
+	signals.TelemetryStartedAt = signals.ObservedAt
+	if got := policy.Recommend(10, signals, signals.ObservedAt, state); !got.ScaleDownBlocked ||
+		got.Desired != 10 {
+		t.Fatalf("new Leader epoch did not block scale-down: %+v", got)
 	}
 }
 

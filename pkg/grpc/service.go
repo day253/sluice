@@ -347,6 +347,12 @@ func (s *Service) AllocationSnapshot() (map[string]*types.NodeAllocation, map[st
 	return s.fsm.GetAllAllocations(), s.fsm.GetAllTenants()
 }
 
+// TaskPressureSnapshot exposes one coherent read-only FSM task snapshot for
+// the HTTP autoscaling signal endpoint.
+func (s *Service) TaskPressureSnapshot() types.TaskPressureSnapshot {
+	return s.fsm.TaskPressureSnapshot()
+}
+
 // NodeSnapshot exposes the replicated role-aware node mirror to the REST UI.
 func (s *Service) NodeSnapshot() (map[string]*types.NodeInfo, string) {
 	return s.fsm.GetAllNodes(), s.raft.LeaderAddr()

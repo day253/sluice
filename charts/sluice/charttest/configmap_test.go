@@ -138,6 +138,16 @@ func TestWorkloadAutoscalingTargetsOnlyStatelessStatefulSet(t *testing.T) {
 		`--sluice-service={{ include "sluice.fullname" . }}`,
 		`--target-backlog-per-pod=`,
 		`--target-worker-utilization=`,
+		`--target-cpu-utilization=`,
+		`--target-queue-drain=`,
+		`--target-throughput-utilization=`,
+		`--tolerance-percent=`,
+		`--min-telemetry-coverage-percent=`,
+		`targetCPUUtilization must be between 1 and 100`,
+		`targetQueueDrainSeconds must be positive`,
+		`targetThroughputUtilization must be between 1 and 100`,
+		`tolerancePercent must be between 0 and 100`,
+		`minTelemetryCoveragePercent must be between 1 and 100`,
 		`resources: ["statefulsets"]`,
 		`verbs: ["get", "list", "watch", "patch", "update"]`,
 		`resources: ["services"]`,
@@ -236,7 +246,9 @@ func TestAutoscalingDefaultsProtectWorkerDrainAndReactToBacklog(t *testing.T) {
 	for _, required := range []string{
 		"autoscaling:", "enabled: false", "minReplicas: 5", "maxReplicas: 100",
 		"mode: workload", "targetBacklogPerPod: 400", "targetWorkerUtilization: 70",
-		"scaleUpPods: 10",
+		"targetCPUUtilization: 70", "targetQueueDrainSeconds: 30",
+		"targetThroughputUtilization: 80", "tolerancePercent: 10",
+		"minTelemetryCoveragePercent: 80", "scaleUpPods: 10",
 		"averageUtilization: 70", "stabilizationWindowSeconds: 300",
 	} {
 		if !strings.Contains(values, required) {
@@ -255,7 +267,10 @@ func TestChartAndStandaloneCRDsExposeWorkerAutoscaling(t *testing.T) {
 		for _, required := range []string{
 			"workerReplicas:", "autoscaling:", "minReplicas:", "maxReplicas:",
 			"enum: [hpa, workload]", "targetBacklogPerPod:",
-			"targetWorkerUtilization:", "scaleDownStabilizationSeconds:",
+			"targetWorkerUtilization:", "targetCPUUtilization:",
+			"targetQueueDrainSeconds:", "targetThroughputUtilization:",
+			"tolerancePercent:", "minTelemetryCoveragePercent:",
+			"scaleDownStabilizationSeconds:",
 			"x-kubernetes-preserve-unknown-fields: true", "desiredWorkerReplicas:",
 		} {
 			if !strings.Contains(source, required) {

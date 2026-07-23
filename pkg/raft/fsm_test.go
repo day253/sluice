@@ -71,6 +71,33 @@ func TestApplyUpsertTenant_Update(t *testing.T) {
 	}
 }
 
+func TestTaskPressureSnapshotSeparatesPendingAndRunningUnderOneRead(t *testing.T) {
+	fsm := newTestFSM(t)
+	applyCmd(t, fsm, OpUpsertTenant, types.TenantConfig{
+		ID: "tenant-a", MaxWorkers: 10,
+	})
+	applyCmd(t, fsm, OpCreateTask, CreateTaskData{
+		TaskID: "pending", TenantID: "tenant-a", Payload: `{}`,
+	})
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "running", TenantID: "tenant-a", NodeID: "worker-0", Payload: `{}`,
+	})
+	snapshot := fsm.TaskPressureSnapshot()
+	if snapshot.UnfinishedTasks != 2 || snapshot.PendingTasks != 1 ||
+		snapshot.RunningTasks != 1 || snapshot.OldestPendingAt.IsZero() {
+		t.Fatalf("task pressure snapshot = %+v", snapshot)
+	}
+
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "pending", TenantID: "tenant-a", NodeID: "worker-0", Payload: `{}`,
+	})
+	snapshot = fsm.TaskPressureSnapshot()
+	if snapshot.UnfinishedTasks != 2 || snapshot.PendingTasks != 0 ||
+		snapshot.RunningTasks != 2 || !snapshot.OldestPendingAt.IsZero() {
+		t.Fatalf("claimed task pressure snapshot = %+v", snapshot)
+	}
+}
+
 func TestApplyUpsertTenant_RejectsZeroWorkers(t *testing.T) {
 	fsm := newTestFSM(t)
 	cmd := MustMarshalCommand(OpUpsertTenant, types.TenantConfig{ID: "t1", MaxWorkers: 0})

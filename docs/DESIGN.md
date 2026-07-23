@@ -865,6 +865,82 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   读取，但不显示为当前容量或不可用集群成员。真实浏览器回归固定 up/down 各一个 Worker
   时只显示 100 slots、0 stale allocation 和一个 Worker 图例。
 
+### HPA-007：队列、执行资源和吞吐闭环的多信号扩缩容
+
+- **需求与替代关系**：HPA-003 的 `unfinished/400` 能响应突发，但把 running 和 pending
+  混在一起，也把 allocation 配额误当成实际执行负载。HPA-007 保留它作为历史兼容输入，
+  新决策优先使用同一 FSM 读锁下得到的 pending、running 和 oldest pending 当前快照，
+  以及 Leader 最近收到的真实 Worker running/CPU 反馈。allocation 仍用于展示和容量安全，
+  不再作为执行利用率候选。
+- **数据分类**：
+  - task status、`CreatedAt` 和 live Worker 容量是 Raft/FSM 已有的 durable current
+    state；API 从随 Apply 增量维护、Restore 可重建的 pending index 读取 O(1) count/oldest，
+    用 unfinished map 长度推导 running，不在每秒 WebUI/HPA poll 重扫 task map，也不新增
+    HPA 历史或共识字段；
+  - 每节点 CPU/running 是 Leader 进程内有 TTL 的 current mirror；提交/完成总数是
+    Leader process epoch 内的单调诊断计数。Leader 来源、启动时间或计数回退任一变化都
+    重置速率基线；
+  - 到达率、完成率、缩容稳定时间和最终 recommendation 只存在 autoscaler 进程内，重启
+    后重新学习。它们不写 Raft、不进 FSM snapshot，也不反馈 task→node 分配；
+  - WebUI 的 `/api/v1/admin/autoscaling` 是一秒刷新、可打开原始 JSON 的当前诊断；
+    unfinished 和 Worker allocation 仍各自保留既有 174 点历史。当前不伪造 recommendation
+    历史。
+- **候选公式**：每轮独立计算并取最大值，再约束到 `minReplicas..maxReplicas`：
+  - queue：`ceil(pending / targetBacklogPerPod)`；
+  - execution：`ceil(livePods × executingTasks/liveCapacity /
+    targetWorkerUtilization)`；
+  - CPU：`ceil(reportingPods × averageReportedCPU / targetCPUUtilization)`；缺失节点按 0%
+    dampen 扩容，不把一个热点样本外推到整个集群；
+  - drain：有两个同 epoch 样本后，按 EWMA 完成率估算每 Pod 吞吐，
+    `ceil(pending / (targetQueueDrainTime × completionRatePerPod))`；
+  - arrival：`ceil(arrivalRate / (completionRatePerPod ×
+    targetThroughputUtilization))`，默认保留 20% 吞吐余量。
+  默认 queue=400 task/Pod、execution=70%、CPU=70%、drain=30 秒、
+  throughput=80%。EWMA `alpha=0.5`，避免只凭一个短采样尖峰反复抖动。
+- **正在启动的 Pod 与抖动**：候选是绝对副本数，并与 StatefulSet 当前 desired
+  replicas 比较；未 Ready 但已在 desired 中的 Pod 已计入当前目标，不会每轮重复追增。
+  当已注册 Worker 少于 desired 时暂不继续放大 drain/arrival 速率候选，先等待已经创建的
+  Pod 上报；queue 绝对候选仍可在超大 backlog 下按扩容速率边界继续增加。
+  默认 10% deadband，扩容每 5 秒最多增加 `max(当前的 100%, 10 Pods)`，缩容继续要求
+  连续 300 秒低负载且每分钟最多减少 25%。
+- **缺失指标原则**：任何可用候选都可以触发扩容；缺失执行反馈或速率计数不能把真实
+  pending 当作零。缩容必须同时具备 task breakdown、rate counters 和足够的 Worker
+  telemetry，并且 Leader epoch 内至少形成两个有时间差的 rate counter 样本。Leader
+  切换或计数回退会重新阻断缩容并重启稳定窗口。默认至少 80% live Worker 上报；低于
+  该覆盖率只禁止缩容，不阻止 queue/CPU 等已有证据驱动扩容。该门槛可由
+  `minTelemetryCoveragePercent`/`--min-telemetry-coverage-percent` 配置。
+- **队列型系统的边界**：pending 表示尚未被 claim 的可排队工作，running 表示已有唯一
+  owner 的任务；扩缩 Pod 不取消 running。oldest pending 用于诊断饥饿与 drain SLO，
+  第一阶段不直接作为额外副本公式，避免在缺少任务成本分布时让一个长等待异常值触发
+  max。arrival/completion 使用累计计数差而非重复扫描任务历史。
+- **GPU/模型服务映射与明确非目标**：通用结构仍是“队列压力候选、执行资源候选、吞吐/
+  drain 候选取最大值”。GPU workload 后续必须由独立 telemetry provider 提供 GPU
+  utilization、显存/KV-cache 压力、模型/批处理队列和可调度 accelerator 数；不能拿
+  process CPU 冒充 GPU 利用率，也不能仅凭 GPU utilization 忽略已有请求队列。本阶段
+  不安装 DCGM/KEDA/metrics adapter，不做 GPU Pod placement、MIG 切分、模型装载、
+  scale-to-zero、预测扩容或按 tenant 建 Pod 池。
+- **正确性边界**：唯一 scale owner 仍只修改 stateless Worker StatefulSet。control/Raft
+  数量、tenant Limit、单实例并发、allocator、Leader-only assignment、claim lease 和
+  final-state commit 均不改变。扩大执行面不能突破单 Raft shard 的 Create/Claim/Complete
+  Apply 上限；pressure 面板必须与 Performance 面板一起判断限制阶段。
+- **近阶段迭代顺序**：
+  1. 本阶段完成统一 current snapshot、多候选 policy、Leader epoch 速率、缺失指标缩容
+     门禁、CRD/Helm 参数和 WebUI 原始信号；
+  2. 下一阶段把 recommendation、dominant signal、限速/稳定窗口和 Kubernetes
+     desired/ready/current replicas 暴露为 controller status/Prometheus 指标，并用固定
+     burst、steady arrival、drain、指标丢失和 Pod 启动延迟负载校准默认值；
+  3. 再抽象 resource provider，先接 GPU utilization/显存/模型队列的真实来源，验证
+     heterogeneous GPU、冷启动和缺失指标，再讨论 KEDA External Metrics 或原生 HPA
+     adapter；没有可复现实测前不宣称 GPU 自动扩缩已支持。
+- **回归覆盖**：FSM/API 单测固定 pending/running/oldest 与 live capacity 的统一快照；
+  policy 单测固定 queue、actual execution、CPU、drain、arrival 取最大、Leader epoch
+  reset、10% tolerance、缺失指标允许扩容但禁止缩容及 80% telemetry 边界；Chart/CRD/
+  controller 单测固定参数和唯一 Worker target；真实
+  `TestWorkloadAutoscalerReadsRealClusterBacklogAndScalesOnlyWorkers` 经三 voter、
+  Follower HTTP、生产 Assignment/Result、阻塞 Processor 和统一 snapshot 验证 queue 与
+  execution telemetry 后只扩 Worker，最终每条任务恰好完成一次。真实 Chrome 回归验证
+  pressure 面板使用生产 JSON 且 down Worker 不污染当前容量。
+
 ### UI-LOAD-001：用原子页面操作组合复杂业务负载
 
 - **操作模型**：页面只组合已有生产 API：批量创建/更新最多 100 个稳定
