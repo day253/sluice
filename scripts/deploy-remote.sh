@@ -102,7 +102,7 @@ microk8s helm3 template "${RELEASE}" ./charts/sluice \
   --set worker.autoscaling.mode=workload \
   --set worker.autoscaling.minReplicas="${WORKER_MIN_REPLICAS}" \
   --set worker.autoscaling.maxReplicas="${WORKER_MAX_REPLICAS}" \
-  --set worker.autoscaling.scaleDownStabilizationSeconds="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}" \
+  --set worker.autoscaling.workload.scaleDownStabilizationSeconds="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}" \
   >/tmp/sluice-workload-autoscaling-rendered.yaml
 microk8s kubectl apply --dry-run=server --namespace "${NAMESPACE}" \
   -f /tmp/sluice-workload-autoscaling-rendered.yaml >/dev/null
@@ -235,7 +235,7 @@ microk8s helm3 upgrade --install "${RELEASE}" ./charts/sluice \
   --set worker.autoscaling.mode=workload \
   --set worker.autoscaling.minReplicas="${WORKER_MIN_REPLICAS}" \
   --set worker.autoscaling.maxReplicas="${WORKER_MAX_REPLICAS}" \
-  --set worker.autoscaling.scaleDownStabilizationSeconds="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}" \
+  --set worker.autoscaling.workload.scaleDownStabilizationSeconds="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}" \
   --set raftVoters=5 \
   --set affinity.enabled=false \
   --wait \
@@ -276,7 +276,8 @@ fi
 printf '\n==> Verifying control and Worker topology\n'
 ./scripts/verify-deployed-topology.sh \
   "${RELEASE}" "${NAMESPACE}" 5 \
-  "${WORKER_MIN_REPLICAS}" "${WORKER_MAX_REPLICAS}" 100
+  "${WORKER_MIN_REPLICAS}" "${WORKER_MAX_REPLICAS}" 100 \
+  "${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}"
 
 printf '\nDeployed %s\n' "${IMAGE}"
 microk8s kubectl get pods \

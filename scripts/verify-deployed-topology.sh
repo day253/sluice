@@ -8,6 +8,7 @@ EXPECTED_CONTROLS="${3:?expected control replicas are required}"
 MIN_WORKERS="${4:?minimum Worker replicas are required}"
 MAX_WORKERS="${5:?maximum Worker replicas are required}"
 WORKERS_PER_POD="${6:-100}"
+EXPECTED_SCALE_DOWN_STABILIZATION_SECONDS="${7:?expected scale-down stabilization is required}"
 MICROK8S_BIN="${MICROK8S_BIN:-microk8s}"
 VERIFY_ATTEMPTS="${TOPOLOGY_VERIFY_ATTEMPTS:-60}"
 VERIFY_INTERVAL_SECONDS="${TOPOLOGY_VERIFY_INTERVAL_SECONDS:-1}"
@@ -22,6 +23,7 @@ last_worker_ready=0
 last_nodes_json=
 last_allocations_json=
 last_raft_status=
+last_autoscaler_args=
 
 # Worker scale-down is allowed to overlap deployment verification. Never cache
 # a list of Worker Pod names: an ordinal may disappear between list and exec.
@@ -34,10 +36,16 @@ for _ in $(seq 1 "${VERIFY_ATTEMPTS}"); do
     --namespace "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
   last_control_ready="${last_control_ready:-0}"
   last_worker_ready="${last_worker_ready:-0}"
+  last_autoscaler_args="$("${MICROK8S_BIN}" kubectl get \
+    "deployment/${RELEASE}-sluice-worker-autoscaler" \
+    --namespace "${NAMESPACE}" \
+    -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null || true)"
 
   if [ "${last_control_ready}" = "${EXPECTED_CONTROLS}" ] &&
     [ "${last_worker_ready}" -ge "${MIN_WORKERS}" ] &&
-    [ "${last_worker_ready}" -le "${MAX_WORKERS}" ]; then
+    [ "${last_worker_ready}" -le "${MAX_WORKERS}" ] &&
+    printf '%s' "${last_autoscaler_args}" |
+      grep -q -- "--scale-down-stabilization=${EXPECTED_SCALE_DOWN_STABILIZATION_SECONDS}s"; then
     probe_control="$("${MICROK8S_BIN}" kubectl get pods \
       --namespace "${NAMESPACE}" \
       -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control" \
@@ -97,8 +105,9 @@ for _ in $(seq 1 "${VERIFY_ATTEMPTS}"); do
   fi
 done
 
-printf 'Topology did not converge: controls=%s workers=%s nodes=%s allocations=%s Raft=%s\n' \
+printf 'Topology did not converge: controls=%s workers=%s autoscaler_args=%s nodes=%s allocations=%s Raft=%s\n' \
   "${last_control_ready}" "${last_worker_ready}" \
+  "${last_autoscaler_args}" \
   "${last_nodes_json}" "${last_allocations_json}" "${last_raft_status}" >&2
 if [ -s "${validation_log}" ]; then
   cat "${validation_log}" >&2

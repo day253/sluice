@@ -187,7 +187,7 @@ func TestRemoteDeployWaitsForWorkloadAutoscalerMinimum(t *testing.T) {
 		`WORKER_MIN_REPLICAS="${WORKER_MIN_REPLICAS:-5}"`,
 		`WORKER_SCALE_DOWN_STABILIZATION_SECONDS="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS:-60}"`,
 		`--set worker.autoscaling.minReplicas="${WORKER_MIN_REPLICAS}"`,
-		`--set worker.autoscaling.scaleDownStabilizationSeconds="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}"`,
+		`--set worker.autoscaling.workload.scaleDownStabilizationSeconds="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}"`,
 		`worker_desired="$(microk8s kubectl get`,
 		`worker_ready="$(microk8s kubectl get`,
 		`if [ "${worker_desired}" -ge "${WORKER_MIN_REPLICAS}" ] &&`,
@@ -204,6 +204,12 @@ func TestRemoteDeployWaitsForWorkloadAutoscalerMinimum(t *testing.T) {
 		strings.Contains(source, `worker_desired}" -ge 50`) {
 		t.Fatal("remote deployment still pins an idle Worker pool to its 50-Pod rollout size")
 	}
+	if strings.Contains(
+		source,
+		`--set worker.autoscaling.scaleDownStabilizationSeconds=`,
+	) {
+		t.Fatal("remote deployment writes scale-down stabilization outside the workload config")
+	}
 }
 
 func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
@@ -218,6 +224,7 @@ func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
 		`worker_capacity="$((last_worker_ready * WORKERS_PER_POD))"`,
 		`--workers "${last_worker_ready}"`,
 		`--worker-capacity "${worker_capacity}"`,
+		`--scale-down-stabilization=${EXPECTED_SCALE_DOWN_STABILIZATION_SECONDS}s`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("remote topology gate is not autoscaling-aware: missing %q", required)

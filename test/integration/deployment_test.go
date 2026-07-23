@@ -37,6 +37,7 @@ case "${args}" in
     if [ "${reads}" -eq 1 ]; then printf '50'; else printf '38'; fi
     ;;
   *"get statefulset/sluice-sluice "*"status.readyReplicas"*) printf '5' ;;
+  *"get deployment/sluice-sluice-worker-autoscaler "*) printf '["--scale-down-stabilization=60s"]' ;;
   *"get pods "*"component=control"*) printf 'sluice-sluice-0\n' ;;
   *"get pods "*"component=worker"*) printf 'sluice-sluice-worker-0\n' ;;
   *"/api/v1/admin/nodes"*) printf '%s' "${FAKE_NODES_JSON}" ;;
@@ -76,7 +77,7 @@ esac
 
 	command := exec.Command(
 		filepath.Join(repositoryRoot, "scripts/verify-deployed-topology.sh"),
-		"sluice", "default", "5", "5", "100", "100",
+		"sluice", "default", "5", "5", "100", "100", "60",
 	)
 	command.Dir = repositoryRoot
 	command.Env = append(os.Environ(),

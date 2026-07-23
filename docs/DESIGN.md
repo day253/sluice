@@ -1033,6 +1033,22 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   真实 `validate-topology.py`：首轮模拟 K8s=50/FSM=38 必须失败重试，第二轮重新读取
   K8s=38 后通过 5 control、3800 capacity、5/0 Raft 门禁。
 
+### HPA-011：Helm override 必须写入 workload 子配置并核对 live 参数
+
+- **已复现故障**：revision 58 的部署命令写入
+  `worker.autoscaling.scaleDownStabilizationSeconds=60`，Helm 因允许额外 values 而接受，
+  `helm get values` 也显示 60；但 workload 模板读取的是
+  `worker.autoscaling.workload.scaleDownStabilizationSeconds`，autoscaler Deployment 的
+  live 参数仍是默认 `--scale-down-stabilization=300s`。因此“values 中存在配置”不能
+  证明进程实际采用了配置。
+- **修复与边界**：远程 workload-mode render 和实际 upgrade 均写正确的 workload 子路径。
+  拓扑 verifier 还读取 live autoscaler Deployment args，只有精确包含部署期望的
+  stabilization 秒数才允许验收成功。该检查只验证本次显式覆盖的关键演示参数，不把所有
+  Chart values 复制成第二套配置系统，也不改变通用 Chart/CRD 的生产默认 300 秒。
+- **回归覆盖**：Chart/脚本单测要求正确嵌套路径并明确拒绝旧顶层路径；进程级 HPA-010
+  verifier 集成同时提供并验证 live `--scale-down-stabilization=60s`。真实远程 Helm
+  验收必须看到 Deployment args 为 60 秒，且缩容、拓扑、Raft 门禁同时通过。
+
 ### UI-LOAD-001：用原子页面操作组合复杂业务负载
 
 - **操作模型**：页面只组合已有生产 API：批量创建/更新最多 100 个稳定
