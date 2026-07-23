@@ -118,6 +118,53 @@ func TestPolicyRequiresSustainedSpareCapacityBeforeBoundedScaleDown(t *testing.T
 	}
 }
 
+func TestPolicyScalesIdleRolloutToMinimumAndBackUpForNewBacklog(t *testing.T) {
+	config := DefaultConfig()
+	config.ScaleDownStabilization = 0
+	config.ScaleDownPercent = 50
+	config.TolerancePercent = 0
+	policy := Policy{Config: config}
+	state := &State{}
+	start := time.Unix(1000, 0)
+	signals := Signals{
+		TaskBreakdownValid: true, ExecutionSignalsValid: true,
+		RateCountersValid: true, ObservedAt: start,
+		TelemetrySource: "leader-0", TelemetryStartedAt: start.Add(-time.Minute),
+		ReportingWorkers: 50, WorkerInstances: 50, WorkerCapacity: 5_000,
+	}
+
+	if got := policy.Recommend(50, signals, start, state); got.Desired != 50 ||
+		!got.ScaleDownBlocked {
+		t.Fatalf("initial idle recommendation = %+v, want rate-baseline hold at 50", got)
+	}
+	signals.ObservedAt = start.Add(time.Second)
+	first := policy.Recommend(50, signals, start.Add(time.Second), state)
+	if first.Desired != 25 || first.Reason != "sustained spare execution capacity" {
+		t.Fatalf("first idle scale-down = %+v, want 50 -> 25", first)
+	}
+	state.RecordApplied(start.Add(time.Second))
+
+	current := int32(25)
+	for step, want := range []int32{13, 7, 5} {
+		now := start.Add(time.Duration(step+1)*time.Minute + time.Second)
+		signals.ObservedAt = now
+		got := policy.Recommend(current, signals, now, state)
+		if got.Desired != want {
+			t.Fatalf("idle scale-down step %d = %+v, want %d", step, got, want)
+		}
+		state.RecordApplied(now)
+		current = want
+	}
+	signals.PendingTasks = 40_000
+	signals.Backlog = 40_000
+	signals.ObservedAt = start.Add(4*time.Minute + 2*time.Second)
+	scaleUp := policy.Recommend(current, signals, signals.ObservedAt, state)
+	if scaleUp.RawDesired != 100 || scaleUp.Desired != 15 ||
+		scaleUp.Reason != "scale-up: queue depth" {
+		t.Fatalf("new backlog recommendation = %+v, want bounded 5 -> 15 scale-up", scaleUp)
+	}
+}
+
 func TestHTTPReaderCombinesBacklogAndOnlyLiveWorkerCapacity(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/admin/autoscaling", func(w http.ResponseWriter, _ *http.Request) {

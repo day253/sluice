@@ -8,9 +8,19 @@ DEPLOY_DIR="${DEPLOY_DIR:-/home/tiger/Documents/distributed-rate-limiting}"
 RELEASE="${RELEASE:-sluice}"
 NAMESPACE="${NAMESPACE:-default}"
 REGISTRY="${REGISTRY:-localhost:32000}"
-# The five control replicas roll in order; 50 stateless Workers start in
-# parallel. Keep enough time for the one-time 50-member Raft migration.
+# The five control replicas roll in order; stateless Workers roll in parallel.
+# Keep enough time for the one-time legacy 50-member Raft migration.
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-15m}"
+# Keep a warm five-Pod execution floor, but do not pin an idle demo cluster at
+# the 50-Pod static fallback. In autoscaling mode Helm intentionally leaves
+# spec.replicas to the scale owner. The chart's production default remains a
+# conservative five-minute scale-down window; this remote demo uses one minute
+# so the protected scale-down behavior is observable during an interactive
+# session.
+WORKER_STATIC_REPLICAS="${WORKER_STATIC_REPLICAS:-50}"
+WORKER_MIN_REPLICAS="${WORKER_MIN_REPLICAS:-5}"
+WORKER_MAX_REPLICAS="${WORKER_MAX_REPLICAS:-100}"
+WORKER_SCALE_DOWN_STABILIZATION_SECONDS="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS:-60}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${DEPLOY_USER}@${DEPLOY_HOST}"
@@ -28,7 +38,9 @@ rsync -az \
 
 printf 'Building and deploying image %s/sluice:%s\n' "${REGISTRY}" "${TAG}"
 ssh "${TARGET}" bash -s -- \
-  "${DEPLOY_DIR}" "${REGISTRY}" "${TAG}" "${RELEASE}" "${NAMESPACE}" "${ROLLOUT_TIMEOUT}" <<'REMOTE'
+  "${DEPLOY_DIR}" "${REGISTRY}" "${TAG}" "${RELEASE}" "${NAMESPACE}" "${ROLLOUT_TIMEOUT}" \
+  "${WORKER_STATIC_REPLICAS}" "${WORKER_MIN_REPLICAS}" "${WORKER_MAX_REPLICAS}" \
+  "${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}" <<'REMOTE'
 set -Eeuo pipefail
 
 DEPLOY_DIR="$1"
@@ -37,11 +49,35 @@ TAG="$3"
 RELEASE="$4"
 NAMESPACE="$5"
 ROLLOUT_TIMEOUT="$6"
+WORKER_STATIC_REPLICAS="$7"
+WORKER_MIN_REPLICAS="$8"
+WORKER_MAX_REPLICAS="$9"
+WORKER_SCALE_DOWN_STABILIZATION_SECONDS="${10}"
 IMAGE="${REGISTRY}/sluice:${TAG}"
 STATEFULSET="${RELEASE}-sluice"
 WORKER_STATEFULSET="${RELEASE}-sluice-worker"
 
 cd "${DEPLOY_DIR}"
+
+for value in \
+  "${WORKER_STATIC_REPLICAS}" \
+  "${WORKER_MIN_REPLICAS}" \
+  "${WORKER_MAX_REPLICAS}" \
+  "${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}"; do
+  case "${value}" in
+    ''|*[!0-9]*)
+      printf 'Worker scaling values must be non-negative integers: %s\n' "${value}" >&2
+      exit 1
+      ;;
+  esac
+done
+if [ "${WORKER_STATIC_REPLICAS}" -lt 1 ] ||
+  [ "${WORKER_MIN_REPLICAS}" -lt 1 ] ||
+  [ "${WORKER_MAX_REPLICAS}" -lt "${WORKER_MIN_REPLICAS}" ]; then
+  printf 'Invalid Worker configuration: static=%s min=%s max=%s\n' \
+    "${WORKER_STATIC_REPLICAS}" "${WORKER_MIN_REPLICAS}" "${WORKER_MAX_REPLICAS}" >&2
+  exit 1
+fi
 
 for command in go docker microk8s; do
   if ! command -v "${command}" >/dev/null 2>&1; then
@@ -58,14 +94,15 @@ microk8s helm3 lint ./charts/sluice
 microk8s helm3 template "${RELEASE}" ./charts/sluice \
   --namespace "${NAMESPACE}" \
   --set control.replicas=5 \
-  --set worker.replicas=50 >/tmp/sluice-rendered.yaml
+  --set worker.replicas="${WORKER_STATIC_REPLICAS}" >/tmp/sluice-rendered.yaml
 microk8s helm3 template "${RELEASE}" ./charts/sluice \
   --namespace "${NAMESPACE}" \
   --set control.replicas=5 \
   --set worker.autoscaling.enabled=true \
   --set worker.autoscaling.mode=workload \
-  --set worker.autoscaling.minReplicas=50 \
-  --set worker.autoscaling.maxReplicas=100 \
+  --set worker.autoscaling.minReplicas="${WORKER_MIN_REPLICAS}" \
+  --set worker.autoscaling.maxReplicas="${WORKER_MAX_REPLICAS}" \
+  --set worker.autoscaling.scaleDownStabilizationSeconds="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}" \
   >/tmp/sluice-workload-autoscaling-rendered.yaml
 microk8s kubectl apply --dry-run=server --namespace "${NAMESPACE}" \
   -f /tmp/sluice-workload-autoscaling-rendered.yaml >/dev/null
@@ -74,8 +111,8 @@ microk8s helm3 template "${RELEASE}" ./charts/sluice \
   --set control.replicas=5 \
   --set worker.autoscaling.enabled=true \
   --set worker.autoscaling.mode=hpa \
-  --set worker.autoscaling.minReplicas=50 \
-  --set worker.autoscaling.maxReplicas=100 \
+  --set worker.autoscaling.minReplicas="${WORKER_MIN_REPLICAS}" \
+  --set worker.autoscaling.maxReplicas="${WORKER_MAX_REPLICAS}" \
   --set operator.enabled=true >/tmp/sluice-hpa-autoscaling-rendered.yaml
 microk8s kubectl apply --dry-run=server --namespace "${NAMESPACE}" \
   -f /tmp/sluice-hpa-autoscaling-rendered.yaml >/dev/null
@@ -193,11 +230,12 @@ microk8s helm3 upgrade --install "${RELEASE}" ./charts/sluice \
   --set-string image.tag="${TAG}" \
   --set image.pullPolicy=Always \
   --set control.replicas=5 \
-  --set worker.replicas=50 \
+  --set worker.replicas="${WORKER_STATIC_REPLICAS}" \
   --set worker.autoscaling.enabled=true \
   --set worker.autoscaling.mode=workload \
-  --set worker.autoscaling.minReplicas=50 \
-  --set worker.autoscaling.maxReplicas=100 \
+  --set worker.autoscaling.minReplicas="${WORKER_MIN_REPLICAS}" \
+  --set worker.autoscaling.maxReplicas="${WORKER_MAX_REPLICAS}" \
+  --set worker.autoscaling.scaleDownStabilizationSeconds="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}" \
   --set raftVoters=5 \
   --set affinity.enabled=false \
   --wait \
@@ -222,7 +260,8 @@ for _ in $(seq 1 180); do
   worker_ready="$(microk8s kubectl get "statefulset/${WORKER_STATEFULSET}" \
     --namespace "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}')"
   worker_ready="${worker_ready:-0}"
-  if [ "${worker_desired}" -ge 50 ] && [ "${worker_ready}" -ge 50 ]; then
+  if [ "${worker_desired}" -ge "${WORKER_MIN_REPLICAS}" ] &&
+    [ "${worker_ready}" -ge "${WORKER_MIN_REPLICAS}" ]; then
     worker_min_ready=true
     break
   fi
@@ -259,8 +298,12 @@ control_count="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
 worker_count="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
   -l "app.kubernetes.io/name=sluice-worker,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=worker" \
   --field-selector=status.phase=Running --no-headers | wc -l | tr -d ' ')"
-if [ "${control_count}" != "5" ] || [ "${worker_count}" -lt 50 ] || [ "${worker_count}" -gt 100 ]; then
-  printf 'Unexpected topology: controls=%s workers=%s\n' "${control_count}" "${worker_count}" >&2
+if [ "${control_count}" != "5" ] ||
+  [ "${worker_count}" -lt "${WORKER_MIN_REPLICAS}" ] ||
+  [ "${worker_count}" -gt "${WORKER_MAX_REPLICAS}" ]; then
+  printf 'Unexpected topology: controls=%s workers=%s (expected %s..%s)\n' \
+    "${control_count}" "${worker_count}" \
+    "${WORKER_MIN_REPLICAS}" "${WORKER_MAX_REPLICAS}" >&2
   exit 1
 fi
 worker_capacity="$((worker_count * 100))"

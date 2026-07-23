@@ -1842,6 +1842,198 @@ func TestWorkloadAutoscalerDoesNotProjectColdBurstAcrossIdleWorkers(t *testing.T
 	}, 30*time.Second, "cold-rate burst drains exactly once")
 }
 
+// TestWorkloadAutoscalerScalesIdleWorkersDownAndBackUp preserves HPA-009 at
+// the production boundary. A real three-voter cluster and real stateless
+// Workers provide complete idle telemetry, so the autoscaler may reduce only
+// the fake Kubernetes Worker target after a valid rate baseline. A subsequent
+// real follower submission must immediately reverse the decision from queue
+// pressure; the control/Raft target remains unchanged and every task finishes
+// exactly once.
+func TestWorkloadAutoscalerScalesIdleWorkersDownAndBackUp(t *testing.T) {
+	k8slog.SetLogger(logr.Discard())
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	executionWorkers := make([]*node.StatelessWorker, 0, 2)
+	for index := 0; index < 2; index++ {
+		execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+			NodeID:     fmt.Sprintf("idle-scale-worker-%d", index),
+			APIAddress: "127.0.0.1:0", ControllerAddress: tc.httpAddrs[0],
+			TotalWorkers: 20,
+		}, tc.proc, zap.NewNop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		executionWorkers = append(executionWorkers, execution)
+		go func() { _ = execution.Start() }()
+	}
+	defer func() {
+		for _, execution := range executionWorkers {
+			_ = execution.Shutdown(5 * time.Second)
+		}
+	}()
+	tc.waitFor(func() bool {
+		nodes := tc.fsms().GetAllNodes()
+		for index := range executionWorkers {
+			info := nodes[fmt.Sprintf("idle-scale-worker-%d", index)]
+			if info == nil || info.Role != types.NodeRoleWorker ||
+				info.Status != types.NodeStatusUp {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "idle-scale Workers register")
+
+	const tenantID = "idle-scale-rebound"
+	tc.addTenant(tenantID, 10)
+	tc.waitAllocation(10 * time.Second)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	reader := workloadautoscaler.HTTPReader{}
+	tc.waitFor(func() bool {
+		signals, err := reader.Read(
+			context.Background(),
+			"http://"+tc.httpAddrs[follower],
+		)
+		return err == nil && signals.Backlog == 0 &&
+			signals.TaskBreakdownValid && signals.ExecutionSignalsValid &&
+			signals.RateCountersValid && signals.ReportingWorkers == 2 &&
+			signals.WorkerInstances == 2
+	}, 10*time.Second, "complete idle workload telemetry")
+
+	scheme := k8sruntime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	control := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "sluice", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: integrationPtr(int32(3))},
+	}
+	worker := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "sluice-worker", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: integrationPtr(int32(4))},
+	}
+	serviceHost, servicePortText, err := net.SplitHostPort(tc.httpAddrs[follower])
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicePort, err := strconv.Atoi(servicePortText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "sluice-api", Namespace: "default"},
+		Spec:       corev1.ServiceSpec{ClusterIP: serviceHost},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(control, worker, service).Build()
+	config := workloadautoscaler.DefaultConfig()
+	config.MinReplicas, config.MaxReplicas = 2, 20
+	config.WorkersPerPod = 20
+	config.TargetBacklogPerPod = 10
+	config.TolerancePercent = 0
+	config.ScaleDownStabilization = 0
+	now := time.Unix(1000, 0)
+	runner := &workloadautoscaler.Runner{
+		Client: k8sClient, Namespace: "default", StatefulSet: "sluice-worker",
+		SluiceService: "sluice-api", SluicePort: int32(servicePort),
+		Policy: workloadautoscaler.Policy{Config: config},
+		Now:    func() time.Time { return now },
+	}
+	if err := runner.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if err := runner.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertReplicas := func(name string, want int32) {
+		t.Helper()
+		var target appsv1.StatefulSet
+		if err := k8sClient.Get(
+			context.Background(),
+			k8stypes.NamespacedName{Name: name, Namespace: "default"},
+			&target,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if target.Spec.Replicas == nil || *target.Spec.Replicas != want {
+			t.Fatalf("%s replicas = %v, want %d", name, target.Spec.Replicas, want)
+		}
+	}
+	assertReplicas("sluice", 3)
+	assertReplicas("sluice-worker", 3)
+
+	started, release := tc.proc.gate(tenantID)
+	defer release()
+	submission := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, 100)}
+	for index := range submission.Tasks {
+		submission.Tasks[index] = types.TaskSubmitRequest{
+			TenantID:       tenantID,
+			Payload:        json.RawMessage(fmt.Sprintf(`{"index":%d}`, index)),
+			IdempotencyKey: fmt.Sprintf("hpa-009:%d", index),
+		}
+	}
+	body, err := json.Marshal(submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := (&http.Client{Timeout: 10 * time.Second}).Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		payload, _ := io.ReadAll(response.Body)
+		t.Fatalf("submit status=%s body=%s", response.Status, payload)
+	}
+	var accepted types.BatchTaskResponse
+	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("idle-scale rebound workload did not start")
+	}
+	tc.waitFor(func() bool {
+		signals, readErr := reader.Read(
+			context.Background(),
+			"http://"+tc.httpAddrs[follower],
+		)
+		return readErr == nil && signals.Backlog == 100 &&
+			signals.PendingTasks >= 80 && signals.RunningTasks > 0
+	}, 10*time.Second, "new queue pressure after scale-down")
+	now = now.Add(config.ScaleUpPeriod)
+	if err := runner.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertReplicas("sluice", 3)
+	assertReplicas("sluice-worker", 9)
+
+	release()
+	tc.waitFor(func() bool {
+		for _, task := range accepted.Tasks {
+			if result := tc.fsms().GetResult(task.TaskID); result == nil ||
+				result.Status != types.TaskStatusDone ||
+				tc.proc.processedTaskCount(task.TaskID) != 1 {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, "idle-scale rebound drains exactly once")
+}
+
 // TestWorkloadAutoscalerIgnoresAllocationForDownWorker preserves HPA-006
 // through real Raft replication and follower HTTP. A rolling replacement can
 // make a Worker down before the next allocation plan commits; its stale

@@ -184,9 +184,14 @@ func TestRemoteDeployWaitsForWorkloadAutoscalerMinimum(t *testing.T) {
 	wait := strings.Index(source, "Waiting for workload autoscaler minimum Worker capacity")
 	verify := strings.Index(source, "Verifying control and Worker topology")
 	for _, required := range []string{
+		`WORKER_MIN_REPLICAS="${WORKER_MIN_REPLICAS:-5}"`,
+		`WORKER_SCALE_DOWN_STABILIZATION_SECONDS="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS:-60}"`,
+		`--set worker.autoscaling.minReplicas="${WORKER_MIN_REPLICAS}"`,
+		`--set worker.autoscaling.scaleDownStabilizationSeconds="${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}"`,
 		`worker_desired="$(microk8s kubectl get`,
 		`worker_ready="$(microk8s kubectl get`,
-		`if [ "${worker_desired}" -ge 50 ] && [ "${worker_ready}" -ge 50 ]`,
+		`if [ "${worker_desired}" -ge "${WORKER_MIN_REPLICAS}" ] &&`,
+		`[ "${worker_ready}" -ge "${WORKER_MIN_REPLICAS}" ]`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("remote deployment is missing autoscaler convergence check %q", required)
@@ -194,6 +199,10 @@ func TestRemoteDeployWaitsForWorkloadAutoscalerMinimum(t *testing.T) {
 	}
 	if wait < 0 || verify < 0 || wait >= verify {
 		t.Fatal("minimum Worker capacity must converge before topology verification")
+	}
+	if strings.Contains(source, `--set worker.autoscaling.minReplicas=50`) ||
+		strings.Contains(source, `worker_desired}" -ge 50`) {
+		t.Fatal("remote deployment still pins an idle Worker pool to its 50-Pod rollout size")
 	}
 }
 
@@ -204,8 +213,8 @@ func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
 	}
 	source := string(data)
 	for _, required := range []string{
-		`[ "${worker_count}" -lt 50 ]`,
-		`[ "${worker_count}" -gt 100 ]`,
+		`[ "${worker_count}" -lt "${WORKER_MIN_REPLICAS}" ]`,
+		`[ "${worker_count}" -gt "${WORKER_MAX_REPLICAS}" ]`,
 		`worker_capacity="$((worker_count * 100))"`,
 		`--controls 5 --workers "${worker_count}" --worker-capacity "${worker_capacity}"`,
 	} {

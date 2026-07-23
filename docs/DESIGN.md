@@ -824,9 +824,11 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   先 patch Worker 边界且不读取业务信号；边界内仍保持 HPA-003 的“信号失败不扩不缩”。
   control、Raft membership、task ownership、每 Pod 并发和租户 Limit 均不改变。
 - **部署验收**：远程脚本在 autoscaler Deployment Ready 后，以一秒条件轮询、180 秒硬
-  截止等待 Worker desired/ready 都达到 50，再按当前 50～100 个 Running Worker 及其实际
-  capacity 进行 FSM allocation 拓扑检查；不能把调谐前的瞬时 1 副本误报为最终失败，也
-  不能在合法压力扩容到 72/100 时仍强制门禁等于 50。
+  截止等待 Worker desired/ready 都达到配置的 `minReplicas`，再按当前
+  `minReplicas..maxReplicas` 个 Running Worker 及其实际 capacity 进行 FSM allocation
+  拓扑检查；不能把调谐前的瞬时 1 副本误报为最终失败，也不能把合法动态规模强制成某个
+  固定值。关闭 autoscaling 时的静态副本和启用 autoscaling 时的持续保温下限必须是两个
+  独立参数；启用时 Helm 不写 `spec.replicas`，避免每次 upgrade 与 scale owner 争抢。
 - **回归覆盖**：单测固定 Service DNS 与 ClusterIP 不同时必须使用后者、`HTTP_PROXY`
   存在时默认 reader 的 Transport 无 Proxy，并固定信号不可用时只把 Worker 1→min、control
   不变；进程级集成测试在启动环境预置失效 Proxy，经非 loopback 入口访问真实三 voter
@@ -972,6 +974,39 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   Follower HTTP、两个 stateless Worker 和真实完成率基线，再用 gated Processor 制造
   高 arrival/completion 比且只占 4/40 槽，断言 StatefulSet 保持 2，释放后每任务只完成
   一次。远程必须用同一固定形状复测 50→100 不再发生，并把结果保留在 PERF。
+
+### HPA-009：空闲执行面必须从 rollout 规模缩回保温下限
+
+- **已确认故障**：workload policy 已有“完整信号 + 有效速率基线 + 连续低负载窗口 +
+  每分钟最多减少 25%”的缩容逻辑，但远程 Helm 把 `minReplicas=50` 写死为与初始
+  rollout 相同的 50。policy 的 raw desired 即使是 5，也会先被静态下限 clamp 成 50，
+  因而空闲集群从不释放 Worker。
+- **配置与语义边界**：`WORKER_STATIC_REPLICAS` 只表达关闭 autoscaling 时的副本数，
+  `WORKER_MIN_REPLICAS`/`WORKER_MAX_REPLICAS` 表达 workload autoscaler 的长期边界，
+  两种模式不能混为同一个下限。远程交互演示默认
+  `static=50,min=5,max=100,scaleDownStabilization=60s`，便于从当前 50 Pod 观察真实
+  缩容；通用 Helm Chart 和 CRD 的生产默认仍是 `min=5`、连续低负载 300 秒、每分钟最多
+  减少 25%。autoscaling mode 下 Helm 故意不写 StatefulSet `spec.replicas`，upgrade
+  保留 scale owner 的当前 desired；首次安装由 autoscaler 恢复到 min。操作者可通过同名
+  部署环境变量覆盖远程值。
+- **允许缩容的证据**：只有 task breakdown、同 Leader epoch 的两个有时间差 rate
+  counter 样本，以及至少配置比例的 live Worker telemetry 都完整时，空 backlog/低
+  execution/低 CPU 才开始稳定计时。信号未知、Leader 切换、计数回退或覆盖率不足都清空
+  窗口并保持副本；不把“没看到负载”解释为“负载为零”。
+- **任务与恢复边界**：autoscaler 只 patch stateless Worker StatefulSet。被删除 Pod
+  进入既有 drain/retire 路径，已开始 Processor 不取消；control/Raft 副本、membership、
+  tenant Limit、task owner 和 final commit 不变。新 backlog 不等待缩容稳定窗口，仍按
+  queue/execution/CPU 候选和五秒扩容速率立即回升。保留至少 5 Pod，不做 scale-to-zero，
+  也不自动修改单 Pod Worker 并发。
+- **部署门禁**：渲染、server dry-run、实际 Helm upgrade、最小 Ready 等待及拓扑验证
+  必须使用同一组参数；拓扑允许任何 `min..max` 的当前 Worker 数，并用实际 Running
+  数量计算总容量，不能再次写死 50。
+- **回归覆盖**：policy 单测从 rollout 50 确定性缩到 min=5，再以 40,000 pending 验证
+  立即有界回升；Chart/脚本测试固定远程 min=5、演示窗口 60 秒、参数贯穿和无硬编码 50。
+  `TestWorkloadAutoscalerScalesIdleWorkersDownAndBackUp` 启动真实三 voter、两个 stateless
+  Worker，经 Follower 统一快照形成完整空闲信号和速率基线，只把 Worker target 从 4→3；
+  随后经真实 Follower batch 提交 100 条任务，queue pressure 把 target 3→9，control
+  保持 3，释放 Processor 后每条任务 exactly-once 完成。
 
 ### UI-LOAD-001：用原子页面操作组合复杂业务负载
 
