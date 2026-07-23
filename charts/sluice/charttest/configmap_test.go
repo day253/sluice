@@ -207,16 +207,17 @@ func TestRemoteDeployWaitsForWorkloadAutoscalerMinimum(t *testing.T) {
 }
 
 func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
-	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	data, err := os.ReadFile("../../../scripts/verify-deployed-topology.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	source := string(data)
 	for _, required := range []string{
-		`[ "${worker_count}" -lt "${WORKER_MIN_REPLICAS}" ]`,
-		`[ "${worker_count}" -gt "${WORKER_MAX_REPLICAS}" ]`,
-		`worker_capacity="$((worker_count * 100))"`,
-		`--controls 5 --workers "${worker_count}" --worker-capacity "${worker_capacity}"`,
+		`[ "${last_worker_ready}" -ge "${MIN_WORKERS}" ]`,
+		`[ "${last_worker_ready}" -le "${MAX_WORKERS}" ]`,
+		`worker_capacity="$((last_worker_ready * WORKERS_PER_POD))"`,
+		`--workers "${last_worker_ready}"`,
+		`--worker-capacity "${worker_capacity}"`,
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("remote topology gate is not autoscaling-aware: missing %q", required)
@@ -224,6 +225,42 @@ func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
 	}
 	if strings.Contains(source, `--controls 5 --workers 50 --worker-capacity 5000`) {
 		t.Fatal("remote topology gate still requires the autoscaler to remain at its minimum")
+	}
+}
+
+func TestRemoteTopologyValidationRetriesConcurrentScaleDown(t *testing.T) {
+	data, err := os.ReadFile("../../../scripts/verify-deployed-topology.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	loop := strings.Index(source, `for _ in $(seq 1 "${VERIFY_ATTEMPTS}")`)
+	workerRead := strings.Index(source, `last_worker_ready="$("${MICROK8S_BIN}" kubectl get`)
+	topologyRead := strings.Index(source, `last_nodes_json="$("${MICROK8S_BIN}" kubectl exec`)
+	for _, required := range []string{
+		"Never cache", "statefulset/${WORKER_STATEFULSET}",
+		`Topology not yet converged`, `python3 "$(dirname "$0")/validate-topology.py"`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("concurrent scale-down verification is missing %q", required)
+		}
+	}
+	if loop < 0 || workerRead < loop || topologyRead < workerRead {
+		t.Fatal("each topology retry must re-read Worker Ready count before the FSM snapshot")
+	}
+	if strings.Contains(source, `for pod in ${pods}`) {
+		t.Fatal("topology verification still iterates a stale autoscaled Pod list")
+	}
+
+	deployData, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(
+		string(deployData),
+		`./scripts/verify-deployed-topology.sh`,
+	) {
+		t.Fatal("remote deployment does not use the scale-safe topology verifier")
 	}
 }
 

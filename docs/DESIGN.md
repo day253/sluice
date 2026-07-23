@@ -1008,6 +1008,31 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   随后经真实 Follower batch 提交 100 条任务，queue pressure 把 target 3→9，control
   保持 3，释放 Processor 后每条任务 exactly-once 完成。
 
+### HPA-010：部署验收必须容忍并发 Worker 缩容
+
+- **已复现故障**：远程 revision 58 已把 workload min 从 50 改为 5；Helm rollout
+  完成后 autoscaler 正常开始 50→38 缩容。旧验收先缓存当时 50 个 control/Worker Pod
+  名，再逐个 `kubectl exec`；执行到 `sluice-sluice-worker-38` 时该 ordinal 已被
+  StatefulSet 删除，于是以 NotFound 把健康的 revision 58 误报为部署失败。
+- **验收一致性边界**：autoscaler 的 Worker `spec.replicas` 是合法并发状态，验收不能
+  要求一次长循环中的 Pod 名单保持不变。每轮必须先重新读取 control/Worker StatefulSet
+  当前 Ready 数，在同一轮读取一个当前 Ready control 的 FSM nodes/allocation 和 Raft
+  membership；如果 K8s Ready 数与 FSM live Worker 数尚未收敛，就按明确次数和间隔重试
+  整轮，而不是沿用旧数量或旧 Pod ordinal。
+- **健康与正确性门禁**：Kubernetes readiness 已逐 Pod 检查进程健康，脚本额外探测本轮
+  一个 Ready control 和一个 Ready Worker，再验证 control=5、Worker 位于 min..max、
+  live Worker 容量与 allocation owner 一致、Raft=5 voter/0 non-voter。缩容过程中
+  K8s/FSM 短暂不一致只允许重试，最终仍必须同时满足全部门禁；不能为避免竞态而跳过
+  topology、capacity、owner 或 membership 校验。
+- **非目标**：不冻结 autoscaler、不把验收改成写操作、不改变缩容策略、任务 drain 或
+  Raft 协议；也不保证任意两个独立 API 是线性一致快照，只要求在有界重试内观察到同一
+  收敛状态。
+- **回归覆盖**：Chart/脚本单测固定“重试内重新读 Worker Ready、随后读 FSM”、禁止
+  `for pod in` 遍历缓存列表，并固定远程部署调用独立 verifier。进程级
+  `TestRemoteTopologyVerificationRetriesConcurrentWorkerScaleDown` 执行生产 shell 和
+  真实 `validate-topology.py`：首轮模拟 K8s=50/FSM=38 必须失败重试，第二轮重新读取
+  K8s=38 后通过 5 control、3800 capacity、5/0 Raft 门禁。
+
 ### UI-LOAD-001：用原子页面操作组合复杂业务负载
 
 - **操作模型**：页面只组合已有生产 API：批量创建/更新最多 100 个稳定

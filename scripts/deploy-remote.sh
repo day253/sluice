@@ -274,79 +274,9 @@ if [ "${worker_min_ready}" != "true" ]; then
 fi
 
 printf '\n==> Verifying control and Worker topology\n'
-pods="$(microk8s kubectl get pods \
-  --namespace "${NAMESPACE}" \
-  -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component in (control,worker)" \
-  -o name)"
-
-if [ -z "${pods}" ]; then
-  printf 'No Sluice pods found after deployment\n' >&2
-  exit 1
-fi
-
-for pod in ${pods}; do
-  pod_ip="$(microk8s kubectl get --namespace "${NAMESPACE}" "${pod}" -o jsonpath='{.status.podIP}')"
-  printf '%s: ' "${pod#pod/}"
-  microk8s kubectl exec --namespace "${NAMESPACE}" "${pod}" -- \
-    wget -qO- "http://${pod_ip}:9090/api/v1/health"
-  printf '\n'
-done
-
-control_count="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
-  -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control" \
-  --field-selector=status.phase=Running --no-headers | wc -l | tr -d ' ')"
-worker_count="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
-  -l "app.kubernetes.io/name=sluice-worker,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=worker" \
-  --field-selector=status.phase=Running --no-headers | wc -l | tr -d ' ')"
-if [ "${control_count}" != "5" ] ||
-  [ "${worker_count}" -lt "${WORKER_MIN_REPLICAS}" ] ||
-  [ "${worker_count}" -gt "${WORKER_MAX_REPLICAS}" ]; then
-  printf 'Unexpected topology: controls=%s workers=%s (expected %s..%s)\n' \
-    "${control_count}" "${worker_count}" \
-    "${WORKER_MIN_REPLICAS}" "${WORKER_MAX_REPLICAS}" >&2
-  exit 1
-fi
-worker_capacity="$((worker_count * 100))"
-
-probe_control="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
-  -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control" \
-  -o jsonpath='{.items[0].metadata.name}')"
-topology_ready=false
-for _ in $(seq 1 60); do
-  nodes_json="$(microk8s kubectl exec --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
-    wget -qO- 'http://127.0.0.1:9090/api/v1/admin/nodes')"
-  allocations_json="$(microk8s kubectl exec --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
-    wget -qO- 'http://127.0.0.1:9090/api/v1/admin/allocations')"
-  if NODES_JSON="${nodes_json}" ALLOCATIONS_JSON="${allocations_json}" \
-    python3 scripts/validate-topology.py \
-      --controls 5 --workers "${worker_count}" --worker-capacity "${worker_capacity}"; then
-    topology_ready=true
-    break
-  fi
-  sleep 1
-done
-if [ "${topology_ready}" != "true" ]; then
-  printf 'FSM role/allocation topology did not converge: nodes=%s allocations=%s\n' \
-    "${nodes_json}" "${allocations_json}" >&2
-  exit 1
-fi
-
-raft_status="$(microk8s kubectl exec --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
-  wget -qO- 'http://127.0.0.1:9090/api/v1/admin/raft')"
-voter_count="$(printf '%s' "${raft_status}" | sed -n 's/.*"voters":\[\([^]]*\)\].*/\1/p' | \
-  awk -F, '{ if (length($0) == 0) print 0; else print NF }')"
-if printf '%s' "${raft_status}" | grep -q '"nonvoters":null'; then
-  nonvoter_count=0
-else
-  nonvoter_count="$(printf '%s' "${raft_status}" | sed -n 's/.*"nonvoters":\[\([^]]*\)\].*/\1/p' | \
-    awk -F, '{ if (length($0) == 0) print 0; else print NF }')"
-fi
-if [ "${voter_count}" != "5" ] || [ "${nonvoter_count}" != "0" ]; then
-  printf 'Unexpected Raft membership: %s\n' "${raft_status}" >&2
-  exit 1
-fi
-printf 'Topology verified: controls=%s workers=%s, Raft=%s voter/%s nonvoter\n' \
-  "${control_count}" "${worker_count}" "${voter_count}" "${nonvoter_count}"
+./scripts/verify-deployed-topology.sh \
+  "${RELEASE}" "${NAMESPACE}" 5 \
+  "${WORKER_MIN_REPLICAS}" "${WORKER_MAX_REPLICAS}" 100
 
 printf '\nDeployed %s\n' "${IMAGE}"
 microk8s kubectl get pods \
