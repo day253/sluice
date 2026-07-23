@@ -33,6 +33,9 @@ type StatelessWorkerConfig struct {
 	APIAddress        string
 	ControllerAddress string
 	TotalWorkers      int
+	// LoadSampler is optional test/integration injection. Production uses the
+	// process/container CPU sampler when it is nil.
+	LoadSampler worker.CPULoadSampler
 }
 
 // StatelessWorker is the execution-plane process. Its only durable state is
@@ -74,6 +77,20 @@ func NewStatelessWorker(cfg StatelessWorkerConfig, processor worker.Processor, l
 	pool.DisableLegacyScheduling()
 	pool.SetClaimer(claimClient)
 	pool.SetCompleter(claimClient)
+	loadSampler := cfg.LoadSampler
+	if loadSampler == nil {
+		loadSampler = worker.NewProcessCPULoadSampler()
+	}
+	claimClient.SetLoadProvider(func() types.WorkerLoadSnapshot {
+		cpuMillis, valid := loadSampler.Sample()
+		running, capacity := pool.ExecutionSnapshot()
+		return types.WorkerLoadSnapshot{
+			CPUUtilizationMillis: cpuMillis,
+			CPUValid:             valid,
+			RunningTasks:         running,
+			WorkerCapacity:       capacity,
+		}
+	})
 
 	w := &StatelessWorker{
 		cfg: cfg, logger: logger, pool: pool, claimClient: claimClient,

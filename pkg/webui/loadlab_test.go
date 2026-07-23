@@ -115,6 +115,8 @@ func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
 		`id="worker-capacity-node"`, `id="worker-capacity-value"`,
 		`id="worker-capacity-apply"`, `Processor slots`,
 		`/capacity`, `body:JSON.stringify({total_workers:totalWorkers})`,
+		`id="performance-cpu-admission"`, `CPU admission`,
+		`load_throttled_requests`, `worker_loads`,
 		`idempotency_key:`, `buildRoundRobinJobs`,
 		`<script src="/assets/loadlab.js"></script>`,
 	} {

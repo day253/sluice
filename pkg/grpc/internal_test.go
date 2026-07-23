@@ -44,12 +44,23 @@ func (r internalTestApplyResult) Error() error          { return nil }
 func (r internalTestApplyResult) Response() interface{} { return r.response }
 
 type recordingPerformanceObserver struct {
-	mu         sync.Mutex
-	selections int
-	scanned    int
-	selected   int
-	assignment int
-	completion int
+	mu          sync.Mutex
+	selections  int
+	scanned     int
+	selected    int
+	assignment  int
+	completion  int
+	loadAware   int
+	throttled   int
+	unavailable int
+	stale       int
+	workerLoads map[string]metricsWorkerLoad
+}
+
+type metricsWorkerLoad struct {
+	cpu      int
+	running  int
+	capacity int
 }
 
 func (o *recordingPerformanceObserver) ObservePendingSelection(scanned, selected int, _ time.Duration) {
@@ -64,6 +75,32 @@ func (o *recordingPerformanceObserver) SetDispatcherQueueDepths(assignment, comp
 	o.mu.Lock()
 	o.assignment = assignment
 	o.completion = completion
+	o.mu.Unlock()
+}
+
+func (o *recordingPerformanceObserver) ObserveWorkerLoad(
+	nodeID string,
+	cpuMillis, runningTasks, capacity int,
+	_ time.Time,
+) {
+	o.mu.Lock()
+	if o.workerLoads == nil {
+		o.workerLoads = make(map[string]metricsWorkerLoad)
+	}
+	o.workerLoads[nodeID] = metricsWorkerLoad{
+		cpu: cpuMillis, running: runningTasks, capacity: capacity,
+	}
+	o.mu.Unlock()
+}
+
+func (o *recordingPerformanceObserver) ObserveLoadAdmission(
+	loadAware, throttled, unavailable, stale int,
+) {
+	o.mu.Lock()
+	o.loadAware += loadAware
+	o.throttled += throttled
+	o.unavailable += unavailable
+	o.stale += stale
 	o.mu.Unlock()
 }
 
@@ -204,6 +241,14 @@ func TestClaimClientBoundsPerNodeRaftRequests(t *testing.T) {
 	})
 
 	client := NewClaimClient("worker-node", zap.NewNop())
+	client.SetLoadProvider(func() types.WorkerLoadSnapshot {
+		return types.WorkerLoadSnapshot{
+			CPUUtilizationMillis: 730,
+			CPUValid:             true,
+			RunningTasks:         5,
+			WorkerCapacity:       12,
+		}
+	})
 	client.SetLeader(listener.Addr().String())
 	t.Cleanup(client.Close)
 
@@ -226,6 +271,10 @@ func TestClaimClientBoundsPerNodeRaftRequests(t *testing.T) {
 		for len(ids) < workerRequestCredits {
 			select {
 			case request := <-service.assignments:
+				if request.CpuUtilizationMillis != 730 || !request.CpuLoadValid ||
+					request.RunningTasks != 5 || request.WorkerCapacity != 12 {
+					t.Fatalf("assignment load feedback = %+v", request)
+				}
 				ids = append(ids, request.RequestId)
 			case <-time.After(2 * time.Second):
 				t.Fatalf("assignment wave %d received %d requests, want %d", wave, len(ids), workerRequestCredits)
@@ -575,6 +624,160 @@ func TestDispatchAssignmentsReadsOnlyIndexedCandidatesBeforeRaftApply(t *testing
 	}
 	if got := raft.applyCount.Load(); got != 1 {
 		t.Fatalf("Raft applies = %d, want one ClaimBatch", got)
+	}
+}
+
+func TestDispatchAssignmentsPrioritizesLowCPUAndThrottlesOverloadedNode(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	for _, nodeID := range []string{"worker-high", "worker-low"} {
+		applyInternalTestCommand(fsm, raftpkg.OpNodeUp, types.NodeInfo{
+			ID: nodeID, Role: types.NodeRoleWorker,
+			Status: types.NodeStatusUp, TotalWorkers: 4,
+		})
+	}
+	applyInternalTestCommand(fsm, raftpkg.OpUpsertTenant,
+		types.TenantConfig{ID: "tenant-a", MaxWorkers: 8})
+	applyInternalTestCommand(fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"worker-high": {NodeID: "worker-high", Tenants: map[string]int{"tenant-a": 4}},
+		"worker-low":  {NodeID: "worker-low", Tenants: map[string]int{"tenant-a": 4}},
+	})
+	tasks := make([]raftpkg.CreateTaskData, 5)
+	for index := range tasks {
+		tasks[index] = raftpkg.CreateTaskData{
+			TaskID: fmt.Sprintf("cpu-task-%d", index), TenantID: "tenant-a",
+		}
+	}
+	applyInternalTestCommand(fsm, raftpkg.OpCreateTaskBatch,
+		raftpkg.CreateTaskBatchData{Tasks: tasks})
+
+	raft := &internalTestRaft{fsm: fsm}
+	raft.leader.Store(true)
+	service := NewInternalService("leader", fsm, raft, zap.NewNop())
+	observer := &recordingPerformanceObserver{}
+	service.SetPerformanceObserver(observer)
+
+	now := time.Now().UTC()
+	outcomes := make(chan assignmentOutcome, 6)
+	jobs := make([]assignmentJob, 0, 6)
+	for index := 0; index < 4; index++ {
+		jobs = append(jobs, assignmentJob{
+			ctx: context.Background(), receivedAt: now, outcome: outcomes,
+			request: &grpcv1.AssignmentRequest{
+				RequestId: fmt.Sprintf("high-%d", index), NodeId: "worker-high",
+				PreferredTenantId: "tenant-a", CpuLoadValid: true,
+				CpuUtilizationMillis: 950, RunningTasks: 3, WorkerCapacity: 4,
+			},
+		})
+	}
+	for index := 0; index < 2; index++ {
+		jobs = append(jobs, assignmentJob{
+			ctx: context.Background(), receivedAt: now, outcome: outcomes,
+			request: &grpcv1.AssignmentRequest{
+				RequestId: fmt.Sprintf("low-%d", index), NodeId: "worker-low",
+				PreferredTenantId: "tenant-a", CpuLoadValid: true,
+				CpuUtilizationMillis: 100, RunningTasks: 0, WorkerCapacity: 4,
+			},
+		})
+	}
+	service.dispatchAssignments(jobs)
+
+	assignedByNode := map[string]int{}
+	empty := 0
+	for range jobs {
+		outcome := <-outcomes
+		if outcome.err != nil {
+			t.Fatal(outcome.err)
+		}
+		if outcome.task == nil {
+			empty++
+			continue
+		}
+		record := fsm.GetTask(outcome.task.TaskId)
+		assignedByNode[record.NodeID]++
+	}
+	if assignedByNode["worker-low"] != 2 || assignedByNode["worker-high"] != 1 || empty != 3 {
+		t.Fatalf("CPU-aware assignments = %v empty=%d, want low=2 high=1 empty=3",
+			assignedByNode, empty)
+	}
+	if got := raft.applyCount.Load(); got != 1 {
+		t.Fatalf("CPU-aware assignment wrote %d Raft entries, want one batch", got)
+	}
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	if observer.loadAware != 6 || observer.throttled != 3 ||
+		observer.unavailable != 0 || observer.stale != 0 {
+		t.Fatalf(
+			"load admission observation = aware:%d throttled:%d unavailable:%d stale:%d",
+			observer.loadAware, observer.throttled, observer.unavailable, observer.stale,
+		)
+	}
+	if observer.workerLoads["worker-low"].cpu != 100 ||
+		observer.workerLoads["worker-high"].cpu != 950 {
+		t.Fatalf("worker load observations = %+v", observer.workerLoads)
+	}
+}
+
+func TestDispatchAssignmentsFailsOpenForStaleCPULoad(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"worker-1": {NodeID: "worker-1", Tenants: map[string]int{"tenant-a": 1}},
+	})
+	applyInternalTestCommand(fsm, raftpkg.OpCreateTask,
+		raftpkg.CreateTaskData{TaskID: "stale-load-task", TenantID: "tenant-a"})
+	raft := &internalTestRaft{fsm: fsm}
+	raft.leader.Store(true)
+	service := NewInternalService("leader", fsm, raft, zap.NewNop())
+	observer := &recordingPerformanceObserver{}
+	service.SetPerformanceObserver(observer)
+	outcomes := make(chan assignmentOutcome, 1)
+	service.dispatchAssignments([]assignmentJob{{
+		ctx: context.Background(), receivedAt: time.Now().Add(-3 * time.Second),
+		outcome: outcomes,
+		request: &grpcv1.AssignmentRequest{
+			RequestId: "stale", NodeId: "worker-1", PreferredTenantId: "tenant-a",
+			CpuLoadValid: true, CpuUtilizationMillis: 1000,
+		},
+	}})
+	if outcome := <-outcomes; outcome.err != nil || outcome.task == nil {
+		t.Fatalf("stale CPU fail-open outcome = %+v", outcome)
+	}
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	if observer.loadAware != 0 || observer.throttled != 0 || observer.stale != 1 {
+		t.Fatalf("stale CPU observation = %+v", observer)
+	}
+}
+
+func TestCPUAssignmentBudgetUsesReplicatedCapacityHeadroom(t *testing.T) {
+	tests := []struct {
+		cpu, capacity, want int
+	}{
+		{cpu: 0, capacity: 100, want: 100},
+		{cpu: 425, capacity: 100, want: 50},
+		{cpu: 800, capacity: 100, want: 6},
+		{cpu: 849, capacity: 100, want: 1},
+		{cpu: 850, capacity: 100, want: 0},
+		{cpu: 1000, capacity: 100, want: 0},
+		{cpu: 100, capacity: 0, want: 0},
+	}
+	for _, test := range tests {
+		if got := cpuAssignmentBudget(test.cpu, test.capacity); got != test.want {
+			t.Errorf("cpuAssignmentBudget(%d,%d)=%d, want %d",
+				test.cpu, test.capacity, got, test.want)
+		}
+	}
+	service := NewInternalService(
+		"leader", raftpkg.NewFSM(zap.NewNop()),
+		&internalTestRaft{fsm: raftpkg.NewFSM(zap.NewNop())}, zap.NewNop(),
+	)
+	now := time.Now()
+	if !service.allowOverloadProbe("worker-0", now) ||
+		service.allowOverloadProbe("worker-0", now) {
+		t.Fatal("overload probe was not bounded before leadership reset")
+	}
+	service.SetLeader(true)
+	if !service.allowOverloadProbe("worker-0", now) {
+		t.Fatal("new leadership did not reset ephemeral overload probe state")
 	}
 }
 

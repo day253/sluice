@@ -17,6 +17,9 @@ func TestPerformanceRecordsRaftBatchAndSchedulerWindows(t *testing.T) {
 	performance.ObserveRaftApply(claim, 18*time.Millisecond, errors.New("commit failed"))
 	performance.ObservePendingSelection(20_000, 128, 4*time.Millisecond)
 	performance.SetDispatcherQueueDepths(7, 9)
+	performance.ObserveWorkerLoad("worker-a", 720, 5, 10, time.Now())
+	performance.ObserveWorkerLoad("worker-b", 910, 8, 10, time.Now())
+	performance.ObserveLoadAdmission(12, 3, 2, 1)
 
 	snapshot := performance.Snapshot()
 	operation := snapshot.Raft[raftpkg.OpClaimBatch]
@@ -29,7 +32,10 @@ func TestPerformanceRecordsRaftBatchAndSchedulerWindows(t *testing.T) {
 	}
 	if got := snapshot.Scheduler; got.Selections != 1 || got.PendingScanned != 20_000 ||
 		got.TasksSelected != 128 || got.AverageSelectMicros != 4_000 ||
-		got.AssignmentQueueDepth != 7 || got.CompletionQueueDepth != 9 {
+		got.AssignmentQueueDepth != 7 || got.CompletionQueueDepth != 9 ||
+		got.LoadAwareRequests != 12 || got.LoadThrottledRequests != 3 ||
+		got.LoadUnavailableRequests != 2 || got.StaleLoadRequests != 1 ||
+		got.MaxWorkerCPUMillis != 910 || len(got.WorkerLoads) != 2 {
 		t.Fatalf("scheduler snapshot = %+v", got)
 	}
 
@@ -39,7 +45,10 @@ func TestPerformanceRecordsRaftBatchAndSchedulerWindows(t *testing.T) {
 		t.Fatalf("claim window = %+v", got)
 	}
 	if got := performance.sample(); got.Raft[raftpkg.OpClaimBatch].Applies != 0 ||
-		got.Scheduler.Selections != 0 || got.Scheduler.AssignmentQueueDepth != 7 {
+		got.Scheduler.Selections != 0 || got.Scheduler.AssignmentQueueDepth != 7 ||
+		got.Scheduler.LoadAwareRequests != 0 ||
+		got.Scheduler.MaxWorkerCPUMillis != 910 ||
+		got.Scheduler.ReportingWorkers != 2 {
 		t.Fatalf("second window must reset events but retain gauges: %+v", got)
 	}
 	if got := performance.Snapshot().Raft[raftpkg.OpClaimBatch].Applies; got != 2 {

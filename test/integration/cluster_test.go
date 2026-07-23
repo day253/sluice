@@ -525,6 +525,63 @@ type processedRecord struct {
 	NodeID   string
 }
 
+type adjustableCPULoadSampler struct {
+	cpu atomic.Int32
+}
+
+func newAdjustableCPULoadSampler(cpuMillis int32) *adjustableCPULoadSampler {
+	sampler := &adjustableCPULoadSampler{}
+	sampler.cpu.Store(cpuMillis)
+	return sampler
+}
+
+func (s *adjustableCPULoadSampler) Sample() (int32, bool) {
+	return s.cpu.Load(), true
+}
+
+type gatedWorkerProcessor struct {
+	nodeID  string
+	release chan struct{}
+	once    sync.Once
+	started atomic.Int32
+
+	mu        sync.Mutex
+	processed map[string]int
+}
+
+func newGatedWorkerProcessor(nodeID string) *gatedWorkerProcessor {
+	return &gatedWorkerProcessor{
+		nodeID: nodeID, release: make(chan struct{}), processed: make(map[string]int),
+	}
+}
+
+func (p *gatedWorkerProcessor) Process(
+	ctx context.Context,
+	taskID, _ string,
+	_ json.RawMessage,
+) (string, error) {
+	p.mu.Lock()
+	p.processed[taskID]++
+	p.mu.Unlock()
+	p.started.Add(1)
+	select {
+	case <-p.release:
+		return `{"ok":true}`, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (p *gatedWorkerProcessor) Release() {
+	p.once.Do(func() { close(p.release) })
+}
+
+func (p *gatedWorkerProcessor) Processed(taskID string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.processed[taskID]
+}
+
 func newRecordingProcessor() *recordingProcessor {
 	return &recordingProcessor{}
 }
@@ -3300,6 +3357,161 @@ func TestWorkerInstanceCapacityAPIConvergesRuntimeAndSurvivesRestart(t *testing.
 		}
 		return true
 	}, 10*time.Second, "replacement process preserves Raft capacity override")
+}
+
+// TestLeaderAssignmentUsesWorkerCPULoadFeedback preserves SCHED-006 at the
+// production boundary: real follower HTTP submission, three-voter Raft,
+// stateless Worker assignment streams, Leader-local CPU admission, Processor
+// execution and final-state commit.
+func TestLeaderAssignmentUsesWorkerCPULoadFeedback(t *testing.T) {
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no Raft leader")
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(
+			raftpkg.OpSetControlNodes,
+			raftpkg.SetControlNodesData{NodeIDs: []string{"node-0", "node-1", "node-2"}},
+		),
+		5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("migrate voters to control-only role: %v", err)
+	}
+
+	highSampler := newAdjustableCPULoadSampler(950)
+	lowSampler := newAdjustableCPULoadSampler(100)
+	highProcessor := newGatedWorkerProcessor("cpu-worker-high")
+	lowProcessor := newGatedWorkerProcessor("cpu-worker-low")
+	defer highProcessor.Release()
+	defer lowProcessor.Release()
+
+	workers := []*node.StatelessWorker{}
+	for _, config := range []struct {
+		id        string
+		sampler   *adjustableCPULoadSampler
+		processor *gatedWorkerProcessor
+	}{
+		{id: "cpu-worker-high", sampler: highSampler, processor: highProcessor},
+		{id: "cpu-worker-low", sampler: lowSampler, processor: lowProcessor},
+	} {
+		execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+			NodeID: config.id, APIAddress: "127.0.0.1:0",
+			ControllerAddress: tc.httpAddrs[(leader+1)%len(tc.nodes)],
+			TotalWorkers:      2, LoadSampler: config.sampler,
+		}, config.processor, zap.NewNop())
+		if err != nil {
+			t.Fatalf("create %s: %v", config.id, err)
+		}
+		workers = append(workers, execution)
+		go func() { _ = execution.Start() }()
+	}
+	defer func() {
+		for _, execution := range workers {
+			_ = execution.Shutdown(5 * time.Second)
+		}
+	}()
+
+	const tenantID = "cpu-aware"
+	tc.addTenant(tenantID, 4)
+	tc.waitFor(func() bool {
+		for _, workerID := range []string{"cpu-worker-high", "cpu-worker-low"} {
+			nodeInfo := tc.fsms().GetAllNodes()[workerID]
+			allocation, ok := tc.fsms().GetAllocation(workerID)
+			if nodeInfo == nil || nodeInfo.Status != types.NodeStatusUp ||
+				nodeInfo.TotalWorkers != 2 || !ok ||
+				allocation.Tenants[tenantID] != 2 {
+				return false
+			}
+		}
+		return true
+	}, 15*time.Second, "CPU-aware Workers register with two slots each")
+
+	submission := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, 4)}
+	for index := range submission.Tasks {
+		submission.Tasks[index] = types.TaskSubmitRequest{
+			TenantID: tenantID, Payload: json.RawMessage(`{"cpu":"mixed"}`),
+			IdempotencyKey: fmt.Sprintf("sched-006:%d", index),
+		}
+	}
+	body, err := json.Marshal(submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	response, err := (&http.Client{Timeout: 10 * time.Second}).Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusAccepted {
+		payload, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		t.Fatalf("CPU workload submission status=%s body=%s", response.Status, payload)
+	}
+	var accepted types.BatchTaskResponse
+	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(accepted.Tasks) != 4 {
+		t.Fatalf("accepted CPU tasks = %d, want 4", len(accepted.Tasks))
+	}
+
+	tc.waitFor(func() bool {
+		return lowProcessor.started.Load() == 2 && highProcessor.started.Load() >= 1
+	}, 2*time.Second, "low-CPU Worker fills before overloaded Worker")
+	if got := highProcessor.started.Load(); got != 1 {
+		t.Fatalf("overloaded Worker started %d tasks before feedback changed, want one probe", got)
+	}
+	if pending := tc.fsms().CountPendingPerTenant()[tenantID]; pending != 1 {
+		t.Fatalf("pending tasks under overload = %d, want one held for CPU headroom", pending)
+	}
+
+	var diagnostics metricspkg.PerformanceDiagnostics
+	tc.waitFor(func() bool {
+		result, getErr := (&http.Client{Timeout: 2 * time.Second}).Get(
+			"http://" + tc.httpAddrs[follower] + "/api/v1/admin/performance?history=0",
+		)
+		if getErr != nil {
+			return false
+		}
+		defer result.Body.Close()
+		if result.StatusCode != http.StatusOK ||
+			json.NewDecoder(result.Body).Decode(&diagnostics) != nil {
+			return false
+		}
+		scheduler := diagnostics.Current.Scheduler
+		return scheduler.LoadThrottledRequests > 0 &&
+			scheduler.WorkerLoads["cpu-worker-high"].CPUUtilizationMillis == 950 &&
+			scheduler.WorkerLoads["cpu-worker-low"].CPUUtilizationMillis == 100
+	}, 5*time.Second, "Leader exposes CPU admission diagnostics")
+
+	highSampler.cpu.Store(100)
+	tc.waitFor(func() bool {
+		return highProcessor.started.Load() == 2
+	}, 3*time.Second, "new CPU headroom admits the remaining task")
+	if pending := tc.fsms().CountPendingPerTenant()[tenantID]; pending != 0 {
+		t.Fatalf("pending tasks after CPU recovery = %d, want 0", pending)
+	}
+
+	highProcessor.Release()
+	lowProcessor.Release()
+	tc.waitFor(func() bool {
+		return tc.fsms().CountUnfinishedPerTenant()[tenantID] == 0
+	}, 15*time.Second, "CPU-aware workload commits every final state")
+	for _, task := range accepted.Tasks {
+		processed := highProcessor.Processed(task.TaskID) + lowProcessor.Processed(task.TaskID)
+		if processed != 1 {
+			t.Fatalf("CPU-aware task %s processed %d times, want exactly once", task.TaskID, processed)
+		}
+	}
 }
 
 func sumIntegrationWorkers(workers map[string]int) int {

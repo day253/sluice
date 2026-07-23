@@ -34,20 +34,29 @@ type operationAggregate struct {
 }
 
 type schedulerAggregate struct {
-	SelectionCount       uint64
-	PendingScanned       uint64
-	TasksSelected        uint64
-	TotalSelectMicros    int64
-	MaxSelectMicros      int64
-	LastSelectMicros     int64
-	AssignmentQueueDepth int64
-	CompletionQueueDepth int64
+	SelectionCount          uint64
+	PendingScanned          uint64
+	TasksSelected           uint64
+	LoadAwareRequests       uint64
+	LoadThrottledRequests   uint64
+	LoadUnavailableRequests uint64
+	StaleLoadRequests       uint64
+	TotalSelectMicros       int64
+	MaxSelectMicros         int64
+	LastSelectMicros        int64
+	AssignmentQueueDepth    int64
+	CompletionQueueDepth    int64
+	WorkerLoads             map[string]WorkerLoadSnapshot
 
-	windowSelectionCount    uint64
-	windowPendingScanned    uint64
-	windowTasksSelected     uint64
-	windowTotalSelectMicros int64
-	windowMaxSelectMicros   int64
+	windowSelectionCount          uint64
+	windowPendingScanned          uint64
+	windowTasksSelected           uint64
+	windowLoadAwareRequests       uint64
+	windowLoadThrottledRequests   uint64
+	windowLoadUnavailableRequests uint64
+	windowStaleLoadRequests       uint64
+	windowTotalSelectMicros       int64
+	windowMaxSelectMicros         int64
 }
 
 type RaftOperationSnapshot struct {
@@ -61,14 +70,29 @@ type RaftOperationSnapshot struct {
 }
 
 type SchedulerSnapshot struct {
-	Selections           uint64 `json:"selections"`
-	PendingScanned       uint64 `json:"pending_scanned"`
-	TasksSelected        uint64 `json:"tasks_selected"`
-	AverageSelectMicros  int64  `json:"average_select_us"`
-	MaxSelectMicros      int64  `json:"max_select_us"`
-	LastSelectMicros     int64  `json:"last_select_us"`
-	AssignmentQueueDepth int64  `json:"assignment_queue_depth"`
-	CompletionQueueDepth int64  `json:"completion_queue_depth"`
+	Selections              uint64                        `json:"selections"`
+	PendingScanned          uint64                        `json:"pending_scanned"`
+	TasksSelected           uint64                        `json:"tasks_selected"`
+	LoadAwareRequests       uint64                        `json:"load_aware_requests"`
+	LoadThrottledRequests   uint64                        `json:"load_throttled_requests"`
+	LoadUnavailableRequests uint64                        `json:"load_unavailable_requests"`
+	StaleLoadRequests       uint64                        `json:"stale_load_requests"`
+	AverageSelectMicros     int64                         `json:"average_select_us"`
+	MaxSelectMicros         int64                         `json:"max_select_us"`
+	LastSelectMicros        int64                         `json:"last_select_us"`
+	AssignmentQueueDepth    int64                         `json:"assignment_queue_depth"`
+	CompletionQueueDepth    int64                         `json:"completion_queue_depth"`
+	MaxWorkerCPUMillis      int64                         `json:"max_worker_cpu_millis"`
+	WorkerLoads             map[string]WorkerLoadSnapshot `json:"worker_loads"`
+}
+
+// WorkerLoadSnapshot is a recent Leader-local observation. It is intentionally
+// absent from the Raft FSM and from per-node historical series.
+type WorkerLoadSnapshot struct {
+	CPUUtilizationMillis int       `json:"cpu_utilization_millis"`
+	RunningTasks         int       `json:"running_tasks"`
+	Capacity             int       `json:"capacity"`
+	ObservedAt           time.Time `json:"observed_at"`
 }
 
 type PerformanceSnapshot struct {
@@ -96,13 +120,19 @@ type operationWindow struct {
 }
 
 type schedulerWindow struct {
-	Selections           uint64
-	PendingScanned       uint64
-	TasksSelected        uint64
-	TotalSelectMicros    int64
-	MaxSelectMicros      int64
-	AssignmentQueueDepth int64
-	CompletionQueueDepth int64
+	Selections              uint64
+	PendingScanned          uint64
+	TasksSelected           uint64
+	LoadAwareRequests       uint64
+	LoadThrottledRequests   uint64
+	LoadUnavailableRequests uint64
+	StaleLoadRequests       uint64
+	TotalSelectMicros       int64
+	MaxSelectMicros         int64
+	AssignmentQueueDepth    int64
+	CompletionQueueDepth    int64
+	MaxWorkerCPUMillis      int64
+	ReportingWorkers        int64
 }
 
 type performanceWindow struct {
@@ -114,6 +144,7 @@ func NewPerformance() *Performance {
 	return &Performance{
 		startedAt: time.Now().UTC(),
 		raft:      make(map[string]*operationAggregate),
+		scheduler: schedulerAggregate{WorkerLoads: make(map[string]WorkerLoadSnapshot)},
 	}
 }
 
@@ -191,6 +222,38 @@ func (p *Performance) SetDispatcherQueueDepths(assignment, completion int) {
 	p.mu.Unlock()
 }
 
+func (p *Performance) ObserveWorkerLoad(
+	nodeID string,
+	cpuMillis, runningTasks, capacity int,
+	observedAt time.Time,
+) {
+	if nodeID == "" {
+		return
+	}
+	p.mu.Lock()
+	p.scheduler.WorkerLoads[nodeID] = WorkerLoadSnapshot{
+		CPUUtilizationMillis: max(cpuMillis, 0),
+		RunningTasks:         max(runningTasks, 0),
+		Capacity:             max(capacity, 0),
+		ObservedAt:           observedAt.UTC(),
+	}
+	p.mu.Unlock()
+}
+
+func (p *Performance) ObserveLoadAdmission(loadAware, throttled, unavailable, stale int) {
+	p.mu.Lock()
+	s := &p.scheduler
+	s.LoadAwareRequests += uint64(max(loadAware, 0))
+	s.LoadThrottledRequests += uint64(max(throttled, 0))
+	s.LoadUnavailableRequests += uint64(max(unavailable, 0))
+	s.StaleLoadRequests += uint64(max(stale, 0))
+	s.windowLoadAwareRequests += uint64(max(loadAware, 0))
+	s.windowLoadThrottledRequests += uint64(max(throttled, 0))
+	s.windowLoadUnavailableRequests += uint64(max(unavailable, 0))
+	s.windowStaleLoadRequests += uint64(max(stale, 0))
+	p.mu.Unlock()
+}
+
 func (p *Performance) Snapshot() PerformanceSnapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -214,16 +277,27 @@ func (p *Performance) sample() performanceWindow {
 		aggregate.windowMaxMicros = 0
 	}
 	s := &p.scheduler
+	workerLoads, maxCPU := p.freshWorkerLoadsLocked(time.Now().UTC())
 	window.Scheduler = schedulerWindow{
 		Selections: s.windowSelectionCount, PendingScanned: s.windowPendingScanned,
 		TasksSelected: s.windowTasksSelected, TotalSelectMicros: s.windowTotalSelectMicros,
-		MaxSelectMicros:      s.windowMaxSelectMicros,
-		AssignmentQueueDepth: s.AssignmentQueueDepth,
-		CompletionQueueDepth: s.CompletionQueueDepth,
+		LoadAwareRequests:       s.windowLoadAwareRequests,
+		LoadThrottledRequests:   s.windowLoadThrottledRequests,
+		LoadUnavailableRequests: s.windowLoadUnavailableRequests,
+		StaleLoadRequests:       s.windowStaleLoadRequests,
+		MaxSelectMicros:         s.windowMaxSelectMicros,
+		AssignmentQueueDepth:    s.AssignmentQueueDepth,
+		CompletionQueueDepth:    s.CompletionQueueDepth,
+		MaxWorkerCPUMillis:      int64(maxCPU),
+		ReportingWorkers:        int64(len(workerLoads)),
 	}
 	s.windowSelectionCount = 0
 	s.windowPendingScanned = 0
 	s.windowTasksSelected = 0
+	s.windowLoadAwareRequests = 0
+	s.windowLoadThrottledRequests = 0
+	s.windowLoadUnavailableRequests = 0
+	s.windowStaleLoadRequests = 0
 	s.windowTotalSelectMicros = 0
 	s.windowMaxSelectMicros = 0
 	return window
@@ -243,15 +317,40 @@ func (p *Performance) snapshotLocked() PerformanceSnapshot {
 		}
 	}
 	s := p.scheduler
+	workerLoads, maxCPU := p.freshWorkerLoadsLocked(time.Now().UTC())
 	snapshot.Scheduler = SchedulerSnapshot{
 		Selections: s.SelectionCount, PendingScanned: s.PendingScanned,
-		TasksSelected:       s.TasksSelected,
-		AverageSelectMicros: divideInt64(s.TotalSelectMicros, s.SelectionCount),
-		MaxSelectMicros:     s.MaxSelectMicros, LastSelectMicros: s.LastSelectMicros,
+		TasksSelected:           s.TasksSelected,
+		LoadAwareRequests:       s.LoadAwareRequests,
+		LoadThrottledRequests:   s.LoadThrottledRequests,
+		LoadUnavailableRequests: s.LoadUnavailableRequests,
+		StaleLoadRequests:       s.StaleLoadRequests,
+		AverageSelectMicros:     divideInt64(s.TotalSelectMicros, s.SelectionCount),
+		MaxSelectMicros:         s.MaxSelectMicros, LastSelectMicros: s.LastSelectMicros,
 		AssignmentQueueDepth: s.AssignmentQueueDepth,
 		CompletionQueueDepth: s.CompletionQueueDepth,
+		MaxWorkerCPUMillis:   int64(maxCPU),
+		WorkerLoads:          workerLoads,
 	}
 	return snapshot
+}
+
+const workerLoadRetention = 5 * time.Second
+
+func (p *Performance) freshWorkerLoadsLocked(now time.Time) (map[string]WorkerLoadSnapshot, int) {
+	out := make(map[string]WorkerLoadSnapshot, len(p.scheduler.WorkerLoads))
+	maxCPU := 0
+	for nodeID, load := range p.scheduler.WorkerLoads {
+		if load.ObservedAt.IsZero() || now.Sub(load.ObservedAt) > workerLoadRetention {
+			delete(p.scheduler.WorkerLoads, nodeID)
+			continue
+		}
+		out[nodeID] = load
+		if load.CPUUtilizationMillis > maxCPU {
+			maxCPU = load.CPUUtilizationMillis
+		}
+	}
+	return out, maxCPU
 }
 
 func divideInt64(total int64, count uint64) int64 {

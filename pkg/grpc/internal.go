@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"io"
+	"sort"
 	"sync"
 	"time"
 
@@ -57,6 +58,11 @@ type InternalService struct {
 	sessionMu      sync.Mutex
 	workerSessions map[string]*workerSession
 	sessionGrace   time.Duration
+
+	// CPU feedback is Leader-local soft state. It is never replicated and is
+	// rebuilt from idle-slot requests after every leadership change.
+	loadMu            sync.Mutex
+	lastOverloadProbe map[string]time.Time
 }
 
 type workerSession struct {
@@ -71,12 +77,15 @@ type workerSession struct {
 type PerformanceObserver interface {
 	ObservePendingSelection(scanned, selected int, duration time.Duration)
 	SetDispatcherQueueDepths(assignment, completion int)
+	ObserveWorkerLoad(nodeID string, cpuMillis, runningTasks, capacity int, observedAt time.Time)
+	ObserveLoadAdmission(loadAware, throttled, unavailable, stale int)
 }
 
 type assignmentJob struct {
-	ctx     context.Context
-	request *grpcv1.AssignmentRequest
-	outcome chan<- assignmentOutcome
+	ctx        context.Context
+	request    *grpcv1.AssignmentRequest
+	receivedAt time.Time
+	outcome    chan<- assignmentOutcome
 }
 
 type assignmentOutcome struct {
@@ -104,19 +113,20 @@ func NewInternalService(
 	logger *zap.Logger,
 ) *InternalService {
 	return &InternalService{
-		nodeID:           nodeID,
-		raft:             raft,
-		fsm:              fsm,
-		logger:           logger,
-		assignmentJobs:   make(chan assignmentJob, 16384),
-		assignmentWindow: claimBatchWindow,
-		assignmentMax:    claimBatchMaxSize,
-		completionJobs:   make(chan completionJob, 16384),
-		completionWindow: claimBatchWindow,
-		completionMax:    claimBatchMaxSize,
-		subs:             make(map[string]chan<- *grpcv1.AllocationPlan),
-		workerSessions:   make(map[string]*workerSession),
-		sessionGrace:     5 * time.Second,
+		nodeID:            nodeID,
+		raft:              raft,
+		fsm:               fsm,
+		logger:            logger,
+		assignmentJobs:    make(chan assignmentJob, 16384),
+		assignmentWindow:  claimBatchWindow,
+		assignmentMax:     claimBatchMaxSize,
+		completionJobs:    make(chan completionJob, 16384),
+		completionWindow:  claimBatchWindow,
+		completionMax:     claimBatchMaxSize,
+		subs:              make(map[string]chan<- *grpcv1.AllocationPlan),
+		workerSessions:    make(map[string]*workerSession),
+		sessionGrace:      5 * time.Second,
+		lastOverloadProbe: make(map[string]time.Time),
 	}
 }
 
@@ -135,6 +145,11 @@ func (s *InternalService) SetWorkerSessionGrace(grace time.Duration) {
 // SetLeader arms recovery for stateless workers when this control node becomes
 // leader. Workers that reconnect before the grace expires keep their capacity.
 func (s *InternalService) SetLeader(leader bool) {
+	if leader {
+		s.loadMu.Lock()
+		s.lastOverloadProbe = make(map[string]time.Time)
+		s.loadMu.Unlock()
+	}
 	s.sessionMu.Lock()
 	defer s.sessionMu.Unlock()
 	if !leader {
@@ -473,7 +488,10 @@ func (s *InternalService) AssignmentStream(stream grpcv1.SluiceInternal_Assignme
 				}
 				continue
 			}
-			job := assignmentJob{ctx: stream.Context(), request: request, outcome: outcomes}
+			job := assignmentJob{
+				ctx: stream.Context(), request: request,
+				receivedAt: time.Now().UTC(), outcome: outcomes,
+			}
 			select {
 			case s.assignmentJobs <- job:
 				pendingResponses++
@@ -550,6 +568,17 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 		request *grpcv1.AssignmentRequest
 		task    *types.TaskRecord
 	}
+	type nodeLoad struct {
+		cpuMillis int
+		running   int
+		capacity  int
+	}
+	type assignmentCandidate struct {
+		index     int
+		request   *grpcv1.AssignmentRequest
+		load      nodeLoad
+		loadValid bool
+	}
 	outcomes := make([]assignmentOutcome, len(batch))
 	for i, job := range batch {
 		if job.request != nil {
@@ -567,10 +596,14 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 
 	s.claimMu.Lock()
 	selectionStarted := time.Now()
+	now := selectionStarted.UTC()
 	allocations := s.fsm.GetAllAllocations()
+	nodes := s.fsm.GetAllNodes()
 	selected := make([]selectedAssignment, 0, len(batch))
-	eligibleIndexes := make([]int, 0, len(batch))
-	slots := make([]raftpkg.PendingSlot, 0, len(batch))
+	candidates := make([]assignmentCandidate, 0, len(batch))
+	nodeLoads := make(map[string]nodeLoad)
+	unavailableLoads := 0
+	staleLoads := 0
 	for i, job := range batch {
 		request := job.request
 		if job.ctx.Err() != nil || request == nil || request.RequestId == "" ||
@@ -578,13 +611,114 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 			continue
 		}
 		allocation, ok := allocations[request.NodeId]
+		node := nodes[request.NodeId]
 		if !ok || allocation.Tenants[request.PreferredTenantId] <= 0 {
 			continue
 		}
-		eligibleIndexes = append(eligibleIndexes, i)
+
+		receivedAt := job.receivedAt
+		if receivedAt.IsZero() {
+			receivedAt = now
+		}
+		fresh := now.Sub(receivedAt) <= assignmentLoadFreshness
+		valid := request.CpuLoadValid && fresh &&
+			request.CpuUtilizationMillis >= 0 && request.CpuUtilizationMillis <= 1000
+		if request.CpuLoadValid && !fresh {
+			staleLoads++
+		} else if !valid {
+			unavailableLoads++
+		}
+		candidate := assignmentCandidate{index: i, request: request}
+		if valid {
+			capacity := 0
+			if node != nil && node.Role == types.NodeRoleWorker &&
+				node.Status == types.NodeStatusUp && node.TotalWorkers > 0 {
+				capacity = node.TotalWorkers
+			} else {
+				// Allocation remains the rolling-upgrade eligibility boundary.
+				// Production has NodeInfo; old snapshots and focused tests may
+				// only have the committed allocation.
+				for _, workers := range allocation.Tenants {
+					capacity += workers
+				}
+			}
+			load := nodeLoad{
+				cpuMillis: int(request.CpuUtilizationMillis),
+				running:   max(int(request.RunningTasks), 0),
+				capacity:  capacity,
+			}
+			if previous, exists := nodeLoads[request.NodeId]; !exists ||
+				load.cpuMillis > previous.cpuMillis ||
+				(load.cpuMillis == previous.cpuMillis && load.running > previous.running) {
+				nodeLoads[request.NodeId] = load
+			}
+		}
+		candidates = append(candidates, candidate)
+	}
+	for index := range candidates {
+		if load, ok := nodeLoads[candidates[index].request.NodeId]; ok {
+			candidates[index].load = load
+			candidates[index].loadValid = true
+		}
+	}
+	sort.SliceStable(candidates, func(left, right int) bool {
+		a, b := candidates[left], candidates[right]
+		aScore := assignmentCPUTargetMillis / 2
+		if a.loadValid {
+			aScore = a.load.cpuMillis
+		}
+		bScore := assignmentCPUTargetMillis / 2
+		if b.loadValid {
+			bScore = b.load.cpuMillis
+		}
+		if aScore != bScore {
+			return aScore < bScore
+		}
+		if a.loadValid && b.loadValid {
+			return a.load.running < b.load.running
+		}
+		return false
+	})
+
+	eligibleIndexes := make([]int, 0, len(batch))
+	slots := make([]raftpkg.PendingSlot, 0, len(batch))
+	nodeBudgets := make(map[string]int, len(nodeLoads))
+	nodeAdmitted := make(map[string]int, len(nodeLoads))
+	loadAwareRequests := 0
+	throttledRequests := 0
+	for _, candidate := range candidates {
+		request := candidate.request
+		if candidate.loadValid {
+			loadAwareRequests++
+			budget, exists := nodeBudgets[request.NodeId]
+			if !exists {
+				budget = cpuAssignmentBudget(candidate.load.cpuMillis, candidate.load.capacity)
+				if budget == 0 && s.allowOverloadProbe(request.NodeId, now) {
+					budget = 1
+				}
+				nodeBudgets[request.NodeId] = budget
+				if s.performance != nil {
+					s.performance.ObserveWorkerLoad(
+						request.NodeId, candidate.load.cpuMillis,
+						candidate.load.running, candidate.load.capacity, now,
+					)
+				}
+			}
+			if nodeAdmitted[request.NodeId] >= budget {
+				throttledRequests++
+				continue
+			}
+			nodeAdmitted[request.NodeId]++
+		}
+		eligibleIndexes = append(eligibleIndexes, candidate.index)
 		slots = append(slots, raftpkg.PendingSlot{
 			NodeID: request.NodeId, TenantID: request.PreferredTenantId,
 		})
+	}
+	if s.performance != nil {
+		s.performance.ObserveLoadAdmission(
+			loadAwareRequests, throttledRequests, unavailableLoads, staleLoads,
+		)
 	}
 	tasks, inspected := s.fsm.SelectPendingForSlots(slots, time.Now().UTC())
 	for slotIndex, task := range tasks {
@@ -649,6 +783,46 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 		}
 	}
 	s.deliverAssignmentOutcomes(batch, outcomes)
+}
+
+const (
+	assignmentLoadFreshness       = 2 * time.Second
+	assignmentCPUTargetMillis     = 850
+	assignmentOverloadProbePeriod = time.Second
+)
+
+// cpuAssignmentBudget maps the currently observed CPU headroom to the maximum
+// number of idle slots from one node admitted in this dispatcher batch. The
+// replicated node capacity is the bound; Worker-reported capacity is only
+// diagnostic metadata.
+func cpuAssignmentBudget(cpuMillis, capacity int) int {
+	if capacity <= 0 || cpuMillis >= assignmentCPUTargetMillis {
+		return 0
+	}
+	if cpuMillis < 0 {
+		cpuMillis = 0
+	}
+	headroom := assignmentCPUTargetMillis - cpuMillis
+	budget := (capacity*headroom + assignmentCPUTargetMillis - 1) /
+		assignmentCPUTargetMillis
+	if budget < 1 {
+		return 1
+	}
+	if budget > capacity {
+		return capacity
+	}
+	return budget
+}
+
+func (s *InternalService) allowOverloadProbe(nodeID string, now time.Time) bool {
+	s.loadMu.Lock()
+	defer s.loadMu.Unlock()
+	last := s.lastOverloadProbe[nodeID]
+	if !last.IsZero() && now.Sub(last) < assignmentOverloadProbePeriod {
+		return false
+	}
+	s.lastOverloadProbe[nodeID] = now
+	return true
 }
 
 func (s *InternalService) deliverAssignmentOutcomes(batch []assignmentJob, outcomes []assignmentOutcome) {

@@ -360,10 +360,16 @@ func TestPoolReconcileScaleDownRetiresAfterInflightCompletion(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("processor did not start")
 	}
+	if running, capacity := pool.ExecutionSnapshot(); running != 1 || capacity != 1 {
+		t.Fatalf("execution snapshot before scale-down = %d/%d, want 1/1", running, capacity)
+	}
 
 	pool.Reconcile(map[string]int{})
 	if got := pool.GetStatus()["a"]; got != 0 {
 		t.Fatalf("eligible workers after scale-down = %d, want 0", got)
+	}
+	if running, capacity := pool.ExecutionSnapshot(); running != 1 || capacity != 1 {
+		t.Fatalf("execution snapshot during graceful retirement = %d/%d, want 1/1", running, capacity)
 	}
 	select {
 	case <-processor.canceled:

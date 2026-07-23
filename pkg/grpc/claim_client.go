@@ -55,6 +55,7 @@ type ClaimClient struct {
 	generation   uint64
 	closed       bool
 	assignLegacy bool // current leader does not implement AssignmentStream
+	loadProvider func() types.WorkerLoadSnapshot
 
 	claimSendMu   sync.Mutex
 	assignSendMu  sync.Mutex
@@ -90,6 +91,15 @@ func NewClaimClient(nodeID string, logger *zap.Logger) *ClaimClient {
 	}
 }
 
+// SetLoadProvider configures ephemeral execution pressure attached to each
+// idle-slot request. It is read only by the current Leader and never enters
+// Raft. A nil provider preserves rolling-upgrade fail-open behavior.
+func (c *ClaimClient) SetLoadProvider(provider func() types.WorkerLoadSnapshot) {
+	c.mu.Lock()
+	c.loadProvider = provider
+	c.mu.Unlock()
+}
+
 // Assign reports one idle execution slot to the leader. supported=false is
 // returned only while rolling against an older leader that does not implement
 // AssignmentStream; callers may use the legacy claim path in that case.
@@ -97,6 +107,7 @@ func (c *ClaimClient) Assign(ctx context.Context, preferredTenantID string) (*ty
 	c.mu.Lock()
 	stream, streamCtx, generation := c.assignStream, c.streamCtx, c.generation
 	legacy := c.assignLegacy
+	loadProvider := c.loadProvider
 	c.mu.Unlock()
 	if legacy {
 		return nil, false, nil
@@ -124,9 +135,17 @@ func (c *ClaimClient) Assign(ctx context.Context, preferredTenantID string) (*ty
 		c.pendingAssignMu.Unlock()
 	}()
 
+	var load types.WorkerLoadSnapshot
+	if loadProvider != nil {
+		load = loadProvider()
+	}
 	c.assignSendMu.Lock()
 	err := stream.Send(&grpcv1.AssignmentRequest{
 		RequestId: requestID, NodeId: c.nodeID, PreferredTenantId: preferredTenantID,
+		CpuUtilizationMillis: load.CPUUtilizationMillis,
+		CpuLoadValid:         load.CPUValid,
+		RunningTasks:         int32(load.RunningTasks),
+		WorkerCapacity:       int32(load.WorkerCapacity),
 	})
 	c.assignSendMu.Unlock()
 	if err != nil {

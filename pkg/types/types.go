@@ -60,6 +60,15 @@ type WorkerCapacityResponse struct {
 	CapacityOverride int    `json:"capacity_override"`
 }
 
+// WorkerLoadSnapshot is ephemeral execution-plane feedback attached to an
+// idle-slot request. It is never written to Raft or an FSM snapshot.
+type WorkerLoadSnapshot struct {
+	CPUUtilizationMillis int32
+	CPUValid             bool
+	RunningTasks         int
+	WorkerCapacity       int
+}
+
 // ---------------------------------------------------------------------------
 // Tenant
 // ---------------------------------------------------------------------------

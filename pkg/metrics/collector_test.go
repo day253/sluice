@@ -32,6 +32,8 @@ func TestCollectorStoresBoundedPerformanceHistory(t *testing.T) {
 	)
 	performance.ObservePendingSelection(5000, 128, 2*time.Millisecond)
 	performance.SetDispatcherQueueDepths(11, 13)
+	performance.ObserveWorkerLoad("worker-0", 760, 7, 10, time.Now())
+	performance.ObserveLoadAdmission(20, 4, 2, 1)
 
 	collector := NewCollector(fsm, zap.NewNop())
 	collector.SetPerformance(performance)
@@ -57,6 +59,12 @@ func TestCollectorStoresBoundedPerformanceHistory(t *testing.T) {
 	assertLatest("performance:scheduler:select-us", 2000)
 	assertLatest("performance:scheduler:assignment-queue-depth", 11)
 	assertLatest("performance:scheduler:completion-queue-depth", 13)
+	assertLatest("performance:scheduler:load-aware-requests", 20)
+	assertLatest("performance:scheduler:load-throttled-requests", 4)
+	assertLatest("performance:scheduler:load-unavailable-requests", 2)
+	assertLatest("performance:scheduler:stale-load-requests", 1)
+	assertLatest("performance:scheduler:worker-cpu-max-millis", 760)
+	assertLatest("performance:scheduler:reporting-workers", 1)
 
 	diagnostics := collector.PerformanceDiagnostics("node-0")
 	if diagnostics.NodeID != "node-0" || diagnostics.Current.Raft[raftpkg.OpCompleteBatch].Items != 2 {

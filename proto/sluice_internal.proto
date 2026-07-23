@@ -60,6 +60,10 @@ message AssignmentRequest {
   string request_id          = 1;
   string node_id             = 2;
   string preferred_tenant_id = 3;
+  int32 cpu_utilization_millis = 4; // normalized process/container CPU, 0..1000
+  bool  cpu_load_valid         = 5; // false preserves rolling-upgrade fail-open behavior
+  int32 running_tasks          = 6; // Processor calls executing on this Worker process
+  int32 worker_capacity        = 7; // current local Processor slots, observability only
 }
 
 message AssignedTask {

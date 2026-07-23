@@ -685,6 +685,43 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   3-voter Raft、Leader allocation、AllocationPush、stateless Pool 完成 3→1→4，并以
   启动默认 3 重启同 ID，最终仍保持 override 4。
 
+### SCHED-006：Leader 基于 Worker 实际 CPU 反馈分配任务
+
+- **需求边界**：任务的 CPU 成本可以相差很大，静态 `TotalWorkers` 只能限制最大并发，
+  不能说明某个 Worker 此刻是否已经被重任务打满。每个空闲 Processor 槽发送
+  `AssignmentRequest` 时附带进程/容器 CPU 利用率（0..1000）、正在执行的 Processor 数和
+  本地槽数。生产采样读取进程累计 CPU 时间，以 cgroup v2 `cpu.max` 配额归一化；没有配额
+  时按 Go 进程可用并行度归一化。一个进程内所有槽共享 250ms 缓存，不按请求读取系统文件。
+- **Leader 决策**：全节点请求仍先进入唯一的 global assignment dispatcher。Leader 对
+  2 秒内收到的有效样本按节点取较高 CPU/执行数，在同一批中先处理低 CPU、再处理低
+  running；每节点本批 admission budget 为
+  `ceil(RaftCapacity × (850 - cpuMillis) / 850)`。达到 85% 时暂停普通 admission，但每秒
+  保留一个探测槽；CPU 回落后下一次 idle-slot 请求立即恢复。容量上界只信任 Raft
+  `NodeInfo.TotalWorkers`，Worker 自报 capacity 只用于诊断。
+- **共识与正确性**：CPU 只决定哪些 idle-slot request 进入本轮选择。Leader 随后仍用
+  pending 派生索引选择不同任务，并把全部具体 `task→node` 放进一条
+  `OpClaimBatch` Raft entry；ACK 仍严格晚于 Apply。已 claim/已开始 Processor 不因 CPU
+  波动取消、迁移或重新分配，tenant Limit、allocation、借用和 claim lease 均不变。
+- **失效与滚动升级**：protobuf 新字段都是可选默认值。旧 Worker、采样失败、非法值或在
+  dispatcher 中等待超过 2 秒的样本全部 fail-open，保持原 admission；它们不能阻断
+  backlog。Leader 切换丢弃 probe 时间和最近负载，Worker 的后续 idle 请求自动重建。
+  过载探测防止长期错误但持续刷新的高值让一个节点永久饥饿。
+- **存储与观测**：每节点最近 CPU/running/capacity 是 Leader 进程内最多保留 5 秒的当前
+  镜像；load-aware、throttled、unavailable、stale 计数和最大 CPU 进入既有 174 点性能
+  ring。两类数据都不写 Raft/FSM/Snapshot，也不反馈给 allocator/HPA。WebUI Performance
+  面板显示 `CPU admission`，原始 JSON 保留每节点最近值。
+- **明确非目标**：当前任务 payload 没有稳定、可信的 task-type/cost 字段，本轮不能在
+  第一次执行前预测单条任务 CPU，也不把某个进程的 CPU 时间归因到并发 goroutine。它是
+  基于节点实际消耗的闭环 admission，不处理内存/GPU/磁盘/下游限流，不抢占已执行任务，
+  也不改变 Kubernetes Pod placement 或提供业务副作用 exactly-once。
+- **覆盖**：CPU sampler 单测固定配额归一化、250ms 缓存和上界；Pool 单测固定执行中
+  snapshot；gRPC 单测固定 protobuf 上报、低 CPU 排序、85% throttle、Raft 单批提交、
+  stale fail-open 和 capacity budget；metrics/Chrome 固定 JSON、174 点计数和可视化。
+  `TestLeaderAssignmentUsesWorkerCPULoadFeedback` 使用真实 Follower HTTP、3-voter Raft、
+  两个 stateless Worker/AssignmentStream、阻塞 Processor 和 ResultStream，验证
+  100m CPU Worker 先填满、950m Worker 只有一次 probe、反馈降到 100m 后领取剩余任务，
+  四条任务各执行并提交一次。
+
 ### HPA-001：只扩缩无状态 Worker 的原生 Kubernetes HPA
 
 - **需求边界**：`spec.replicas` / `control.replicas` 是固定、奇数的 control/Raft 成员数，

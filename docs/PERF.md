@@ -737,3 +737,53 @@ pending scanned/selected 为 30769/20000（1.54x），结束后 assignment/compl
 集成阶段 257.743 秒；远程 `go test ./...` 集成阶段 222.757 秒。新增真实 Case 经
 Follower HTTP、3-voter Raft、Leader allocation、AllocationPush 和 stateless Pool 完成
 3→1→4，并以启动默认 3 重启同 ID 后继续保持 override 4。
+
+### 7.10 CPU 感知 Leader 准入后固定形状复核（2026-07-24）
+
+SCHED-006 让 stateless Worker 在每个空闲槽请求上携带进程/容器实际 CPU、运行中任务数
+和本地执行容量。Leader 在跨全部 Worker stream 聚合请求后，先按新鲜 CPU 从低到高排序，
+再按相对 85% CPU 目标的余量限制本批从单节点接收的空闲槽；高负载节点每秒仍保留一个
+探测槽，缺失或超过 2 秒的样本 fail-open。负载反馈和诊断都是 Leader 进程内当前状态，
+不写 Raft/FSM/snapshot；具体 task→node 关系仍只在一个 `ClaimBatch` 中由 Leader 提交。
+因此本轮复核 CPU 判断的任务路径成本、批次形状和诊断完整性，不把 sleep Processor 的
+低 CPU 结果外推成 CPU 密集任务吞吐。
+
+环境仍是同一台 ThinkPad L14 Gen 2 单物理故障域、MicroK8s、5 control voter/0
+non-voter、50 个 stateless Worker、每 Pod 100 槽，总容量 5000。Helm revision 54
+运行镜像 `localhost:32000/sluice:0e0056c-20260723200003`；标签来自部署前 HEAD，
+远端编译内容是本节待提交工作树。部署后 5/5 control、50/50 Worker Ready，56 个相关
+Pod 的总 restart=0，Raft membership 和 role split 门禁通过。
+
+固定形状继续使用 `perf-a..d` 四个 tenant，Limit 为 100/60/30/500，每 tenant
+5000 条、全局逐条 round-robin；小型 JSON payload 含 run/index/shape 和唯一幂等键，
+HTTP batch=500、concurrency=4，经 Mac `127.0.0.1:19090` 隧道进入远程 Service。
+开始前四 tenant unfinished=0；100ms 条件采样，连续两次 unfinished=0 后结束，
+deadline 120 秒。Demo Processor 仍为每条 sleep 50～200ms。revision 52 和 54 的
+物理机、拓扑、协议与工作形状相同，可作相邻单轮观察，但不是统计 SLA。
+
+| 版本/拓扑 | accepted | accepted 后排空 | 端到端 | 吞吐 | t50 | t90 | 请求错误/最终 unfinished |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| revision 52，SCHED-006 前，50 Worker | 2.924s | 8.636s | 11.560s | 1730.1 task/s | 6.738s | 10.422s | 0 / 0 |
+| revision 54，SCHED-006 后，50 Worker | 2.214s | 9.225s | 11.439s | 1748.4 task/s | 6.476s | 10.210s | 0 / 0 |
+
+revision 54 的峰值 unfinished 为 18250。Create 为 40 Apply/20000 items/平均批次
+500/平均 Apply 100.848ms，Claim 为 173/20000/115.6/50.094ms，Complete 为
+176/20000/113.6/48.471ms；三类新增 error=0，`RequeueTasks` 和 lease recovery 均为
+0。pending scanned/selected 为 30971/20000（1.55x）。采样窗口内 assignment/completion
+queue 峰值分别为 648/441，明确结束样本均为 0；空闲 Worker 持续申领时瞬时 assignment
+queue 可在聚合窗口内出现个位数，不代表 unfinished backlog。
+
+本轮有 47068 个新鲜 CPU-aware 空闲槽请求，throttled/unavailable/stale 增量都是 0；
+50 个 Worker 都提供了最近样本，观测到的单 Worker 峰值 CPU 是 96/1000（9.6%）。
+这与 Demo Processor 以 sleep 为主相符：新策略不应在有充足 CPU 余量时人为限速。相邻
+单轮端到端仅快 0.121 秒（约 1.0%），不足以宣称性能提升，但可确认排序、准入和观测没有
+把固定基线从约 1.7k task/s 拉低。CPU 密集或异质任务的效果由 SCHED-006 的可控负载
+单元测试及真实 3-voter/双 Worker 集成回归验证；生产容量结论仍需用真实 Processor
+payload 另跑同形状基线。
+
+本地完整 `make test` 的 unit、真实 Chrome 和 integration 全部以 `-race -count=1`
+通过，真实集成阶段 258.920 秒；远程 `go test ./...` 集成阶段 225.781 秒。SCHED-006
+集成 Case 使用真实 Follower HTTP、3-voter Raft、Leader dispatcher、两个 stateless
+Worker 和真实 Assignment/Result stream：950/100 CPU 时低负载节点先拿满 2 个任务，
+高负载节点仅得 1 个探测任务；把高负载样本降到 100 后剩余任务自动下发，最终每条任务
+只执行一次且 unfinished=0。

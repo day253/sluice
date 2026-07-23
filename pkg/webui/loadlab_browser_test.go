@@ -73,7 +73,26 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/api/v1/metrics":
 		writeBrowserJSON(w, []any{})
 	case r.URL.Path == "/api/v1/admin/performance":
-		writeBrowserJSON(w, map[string]any{})
+		writeBrowserJSON(w, map[string]any{
+			"node_id": "control-0", "collected_at": time.Now().UTC(),
+			"current": map[string]any{
+				"raft": map[string]any{},
+				"scheduler": map[string]any{
+					"load_aware_requests":     12,
+					"load_throttled_requests": 3,
+					"max_worker_cpu_millis":   720,
+					"worker_loads": map[string]any{
+						"worker-0": map[string]any{
+							"cpu_utilization_millis": 720,
+							"running_tasks":          5,
+							"capacity":               100,
+							"observed_at":            time.Now().UTC(),
+						},
+					},
+				},
+			},
+			"history": map[string]any{},
+		})
 	case r.Method == http.MethodPut &&
 		r.URL.Path == "/api/v1/admin/nodes/worker-0/capacity":
 		var request struct {
@@ -191,20 +210,23 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	); err != nil {
 		t.Fatal(err)
 	}
-	var capacity, allocated, nodeSummary, workerLegend string
+	var capacity, allocated, nodeSummary, workerLegend, cpuAdmission, cpuNote string
 	if err := chromedp.Run(ctx,
 		chromedp.Text("#metric-capacity", &capacity, chromedp.ByQuery),
 		chromedp.Text("#metric-allocated", &allocated, chromedp.ByQuery),
 		chromedp.Text("#metric-nodes", &nodeSummary, chromedp.ByQuery),
 		chromedp.Text("#worker-chart-legend", &workerLegend, chromedp.ByQuery),
+		chromedp.Text("#performance-cpu-admission", &cpuAdmission, chromedp.ByQuery),
+		chromedp.Text("#performance-cpu-note", &cpuNote, chromedp.ByQuery),
 	); err != nil {
 		t.Fatal(err)
 	}
 	if capacity != "100" || allocated != "0" || nodeSummary != "2" ||
-		strings.Contains(workerLegend, "worker-retained") {
+		strings.Contains(workerLegend, "worker-retained") ||
+		cpuAdmission != "3 / 12" || !strings.Contains(cpuNote, "max 72% CPU") {
 		t.Fatalf(
-			"live Worker UI capacity=%q allocated=%q nodes=%q legend=%q",
-			capacity, allocated, nodeSummary, workerLegend,
+			"live Worker UI capacity=%q allocated=%q nodes=%q legend=%q CPU=%q note=%q",
+			capacity, allocated, nodeSummary, workerLegend, cpuAdmission, cpuNote,
 		)
 	}
 	if err := chromedp.Run(ctx,

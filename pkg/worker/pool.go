@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -75,8 +76,9 @@ type Pool struct {
 	processor        Processor
 	logger           *zap.Logger
 
-	activeMu sync.Mutex
-	active   map[string]struct{} // task IDs currently being claimed or processed locally
+	activeMu  sync.Mutex
+	active    map[string]struct{} // task IDs currently being claimed or processed locally
+	executing atomic.Int64        // business Processor calls currently running
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -196,6 +198,24 @@ func (p *Pool) GetStatus() map[string]int {
 		out[tid] = g.current
 	}
 	return out
+}
+
+// ExecutionSnapshot returns current business execution pressure and the
+// locally running Processor-slot count. It is ephemeral Worker telemetry and
+// never participates in task ownership.
+func (p *Pool) ExecutionSnapshot() (running, capacity int) {
+	running = int(p.executing.Load())
+	p.mu.Lock()
+	for _, group := range p.groups {
+		capacity += group.current
+	}
+	p.mu.Unlock()
+	// Graceful scale-down removes a slot from the desired/current pool before
+	// an already-started Processor returns. Report a coherent lower bound.
+	if capacity < running {
+		capacity = running
+	}
+	return running, capacity
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +405,9 @@ func (p *Pool) workerLoop(ctx context.Context, retire <-chan struct{}, tenantID 
 		}
 
 		// 5. Process the task (context-aware).
+		p.executing.Add(1)
 		result, err := p.processor.Process(ctx, task.TaskID, task.TenantID, json.RawMessage(task.Payload))
+		p.executing.Add(-1)
 		if err != nil && ctx.Err() != nil {
 			// A rollout interrupted execution. Leave the claim unfinished so the
 			// leader lease scanner can return it to pending for retry.

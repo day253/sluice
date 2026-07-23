@@ -151,6 +151,17 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	n.claimClient = grpcpkg.NewClaimClient(cfg.NodeID, logger)
 	n.pool.SetClaimer(n.claimClient)
 	n.pool.SetCompleter(n.claimClient)
+	loadSampler := worker.NewProcessCPULoadSampler()
+	n.claimClient.SetLoadProvider(func() types.WorkerLoadSnapshot {
+		cpuMillis, valid := loadSampler.Sample()
+		running, capacity := n.pool.ExecutionSnapshot()
+		return types.WorkerLoadSnapshot{
+			CPUUtilizationMillis: cpuMillis,
+			CPUValid:             valid,
+			RunningTasks:         running,
+			WorkerCapacity:       capacity,
+		}
+	})
 	if cfg.Role == types.NodeRoleControl {
 		n.pool.SetWorkerGuard(func() bool { return false })
 	} else {
