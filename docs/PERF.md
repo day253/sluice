@@ -787,3 +787,72 @@ payload 另跑同形状基线。
 Worker 和真实 Assignment/Result stream：950/100 CPU 时低负载节点先拿满 2 个任务，
 高负载节点仅得 1 个探测任务；把高负载样本降到 100 后剩余任务自动下发，最终每条任务
 只执行一次且 unfinished=0。
+
+### 7.11 多信号 HPA 与冷启动速率门控复核（2026-07-24）
+
+HPA-007 把单一 unfinished 候选扩展为 queue、actual execution、CPU、drain 和 arrival
+取最大，并新增一次一致的 `/api/v1/admin/autoscaling` 当前快照。pending count/oldest
+从随 FSM Apply 增量维护、Restore 可重建的派生索引 O(1) 读取，不在每五秒 HPA 或每秒
+WebUI poll 重扫 task map。HPA 诊断、Worker load 和速率 EWMA 都是进程本地当前状态，
+不写 Raft/FSM/snapshot；任务 Create/Claim/Complete 协议没有变化。
+
+环境仍是同一台 ThinkPad L14 Gen 2 单物理故障域、MicroK8s、5 control voter/0
+non-voter、初始 50 个 stateless Worker、每 Pod 100 槽。四个 tenant 继续是
+`perf-a..d`，Limit 100/60/30/500，每 tenant 5000 条、全局逐条 round-robin；小型 JSON
+payload 含 run/index/shape 和唯一幂等键，HTTP batch=500、concurrency=4，经 Mac
+`127.0.0.1:19090` 隧道进入远程 Service。两轮均从四 tenant unfinished=0、50/50 Ready
+开始，100ms 条件采样，连续两次 unfinished=0 后结束，deadline 120 秒。Demo Processor
+仍为每条 sleep 50～200ms。
+
+revision 56 运行
+`localhost:32000/sluice:a63ec74-20260723211201`，首次 HPA-007 固定负载复现了冷启动
+速率外推问题：第 4.434 秒 StatefulSet desired 从 50 变为 100，任务结束时 API 已注册
+97 个 Worker。触发轮的 unfinished/pending/running 是 16937/16405/532，queue/execution/
+CPU/drain/arrival desired 分别为 42/5/3/90/409；arrival=2000.365 task/s、
+completion=306.356 task/s，但 actual execution utilization 只有 5.8%，平均 CPU 只有
+4.2%。因此把当时完成率当成饱和 per-Pod 服务率并不成立。
+
+HPA-008 只给 drain/arrival 增加资源饱和门槛：execution utilization，或至少 80%
+Worker 上报时的平均 CPU，达到默认 50% 才允许速率投影。queue/execution/CPU 候选仍独立
+扩容，超大低 CPU backlog 不会被该门槛隐藏。revision 57 运行
+`localhost:32000/sluice:b896b5e-20260723214216`；实际 Deployment 参数包含
+`--min-rate-utilization-percent=50`。
+
+| 版本/拓扑 | accepted | accepted 后排空 | 端到端 | 吞吐 | t50 | t90 | 峰值 unfinished | 请求错误/最终 unfinished |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| revision 56，门控前，50→100 desired | 1.897s | 16.011s | 17.908s | 1116.8 task/s | 9.272s | 15.836s | 19131 | 0 / 0 |
+| revision 57，50% 门控，固定 50/50 | 2.430s | 12.318s | 14.748s | 1356.1 task/s | 8.342s | 12.650s | 18918 | 0 / 0 |
+
+revision 57 全程只有一个 Kubernetes 拓扑样本状态 50 desired/50 Ready，统一快照始终有
+50 reporter，最高 pending/running/oldest 是 17243/721/10.403s，最高 executing 是
+371/5000，平均/单 Worker 最高 CPU 是 5.3%/10.4%。最关键的第二个 autoscaler 窗口是
+unfinished=14512、pending=13988、arrival=1802.385、completion=562.361，
+`ratePressure=3.92%`，所以 `rateProjectionActive=false`、drain/arrival desired 都为
+0；queue/execution/CPU desired 为 35/3/3，最终保持 min=50。说明本次修复命中了
+revision 56 的误扩容原因，而不是靠 max、速率限制或 Pod 启动延迟掩盖结果。
+
+两轮的 Raft/调度诊断差值如下：
+
+| 指标 | revision 56，50→100 | revision 57，固定 50 |
+|---|---:|---:|
+| Create Apply/items/平均批次/平均 Apply | 40 / 20000 / 500 / 71.223ms | 40 / 20000 / 500 / 111.444ms |
+| Claim Apply/items/平均批次/平均 Apply | 181 / 20000 / 110.5 / 70.429ms | 176 / 20000 / 113.6 / 57.494ms |
+| Complete Apply/items/平均批次/平均 Apply | 181 / 20000 / 110.5 / 75.419ms | 185 / 20000 / 108.1 / 57.373ms |
+| allocation Apply/items | 55 / 4284 | 6 / 300 |
+| pending scanned/selected | 22600 / 20000（1.13x） | 31381 / 20000（1.57x） |
+| CPU-aware requests/throttled/unavailable/stale | 43101 / 0 / 0 / 792 | 33350 / 0 / 0 / 0 |
+| 最终 assignment/completion queue | 0 / 0 | 0 / 0 |
+
+门控轮端到端比误扩容轮少 3.160 秒，但两轮实际拓扑不同，不能把 17.6% 差值当成固定
+容量下的算法吞吐提升；误扩容自身还引入了 49 次额外 allocation Apply 和 StatefulSet
+滚动启动干扰。revision 57 与历史 revision 54 都是固定 50 Worker，但 14.748 秒慢于
+revision 54 的 11.439 秒；它们是相隔多个部署、仅各一轮的观察，也不能据此宣称 28.9%
+回归。当前可确认的结论限于：冷启动速率不再制造 50→100，任务最终态和共识批次保持
+正确；稳定性能仍需在机器空闲窗口做多轮 warm/cold 分组后再校准。
+
+HPA-007 本地完整 `make test` 的 unit、真实 Chrome 和 integration 全部以
+`-race -count=1` 通过，集成阶段 259.284 秒；revision 56 远程集成为 226.302 秒。
+HPA-008 最终本地集成阶段 268.588 秒，revision 57 远程集成为 233.370 秒。新增真实
+HPA-008 Case 启动三 voter、两个 stateless Worker，经 Follower HTTP 先形成实际完成率，
+再用 gated Processor 制造高 arrival/completion 比和 4/40 槽占用，副本保持 2，释放后
+所有任务 exactly-once 排空。
