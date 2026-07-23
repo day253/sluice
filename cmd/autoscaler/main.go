@@ -26,7 +26,7 @@ func main() {
 		minReplicas, maxReplicas, workersPerPod, sluicePort            int
 		targetWorkerUtilization, targetCPUUtilization                  int
 		targetThroughputUtilization, tolerancePercent                  int
-		minTelemetryCoveragePercent                                    int
+		minRateUtilizationPercent, minTelemetryCoveragePercent         int
 		scaleUpPercent, scaleUpPods, scaleDownPercent                  int
 		config                                                         = defaults
 	)
@@ -45,6 +45,7 @@ func main() {
 	flag.IntVar(&targetCPUUtilization, "target-cpu-utilization", int(defaults.TargetCPUUtilization), "Target average Worker process/container CPU percentage")
 	flag.DurationVar(&targetQueueDrain, "target-queue-drain", defaults.TargetQueueDrainTime, "Target time to drain the current pending queue")
 	flag.IntVar(&targetThroughputUtilization, "target-throughput-utilization", int(defaults.TargetThroughputUtilization), "Target fraction of measured completion throughput reserved for steady arrivals")
+	flag.IntVar(&minRateUtilizationPercent, "min-rate-utilization-percent", int(defaults.MinRateUtilizationPercent), "Minimum execution or fully reported CPU utilization required for rate projection")
 	flag.IntVar(&tolerancePercent, "tolerance-percent", int(defaults.TolerancePercent), "Replica recommendation deadband percentage")
 	flag.IntVar(&minTelemetryCoveragePercent, "min-telemetry-coverage-percent", int(defaults.MinTelemetryCoveragePercent), "Minimum reporting Worker percentage required before scale-down")
 	flag.IntVar(&scaleUpPercent, "scale-up-percent", int(defaults.ScaleUpPercent), "Maximum scale-up percentage per interval")
@@ -60,6 +61,7 @@ func main() {
 	config.TargetCPUUtilization = int32(targetCPUUtilization)
 	config.TargetQueueDrainTime = targetQueueDrain
 	config.TargetThroughputUtilization = int32(targetThroughputUtilization)
+	config.MinRateUtilizationPercent = int32(minRateUtilizationPercent)
 	config.TolerancePercent = int32(tolerancePercent)
 	config.MinTelemetryCoveragePercent = int32(minTelemetryCoveragePercent)
 	config.ScaleUpPercent, config.ScaleUpPods = int32(scaleUpPercent), int32(scaleUpPods)

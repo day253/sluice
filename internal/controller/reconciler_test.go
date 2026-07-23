@@ -347,11 +347,24 @@ func TestNormalizeClusterSpecDefaultsAndHonorsWorkloadScaleDownWindow(t *testing
 	if got := defaulted.workloadAutoscaling.TargetThroughputUtilization; got != 80 {
 		t.Fatalf("default throughput target = %d, want 80", got)
 	}
+	if got := defaulted.workloadAutoscaling.MinRateUtilizationPercent; got != 50 {
+		t.Fatalf("default rate utilization floor = %d, want 50", got)
+	}
 	if got := defaulted.workloadAutoscaling.TolerancePercent; got != 10 {
 		t.Fatalf("default tolerance = %d, want 10", got)
 	}
 	if got := defaulted.workloadAutoscaling.MinTelemetryCoveragePercent; got != 80 {
 		t.Fatalf("default telemetry coverage = %d, want 80", got)
+	}
+	base.Autoscaling.Workload = &sluicev1.WorkloadAutoscalingSpec{
+		MinRateUtilizationPercent: 65,
+	}
+	configuredRateFloor, err := normalizeClusterSpec(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := configuredRateFloor.workloadAutoscaling.MinRateUtilizationPercent; got != 65 {
+		t.Fatalf("configured rate utilization floor = %d, want 65", got)
 	}
 	base.Autoscaling.Workload = &sluicev1.WorkloadAutoscalingSpec{
 		ScaleDownStabilizationSeconds: ptr(int32(0)),

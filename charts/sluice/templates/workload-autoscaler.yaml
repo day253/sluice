@@ -22,6 +22,9 @@
 {{- if or (lt (int $workload.targetThroughputUtilization) 1) (gt (int $workload.targetThroughputUtilization) 100) -}}
 {{- fail "worker.autoscaling.workload.targetThroughputUtilization must be between 1 and 100" -}}
 {{- end -}}
+{{- if or (lt (int $workload.minRateUtilizationPercent) 1) (gt (int $workload.minRateUtilizationPercent) 100) -}}
+{{- fail "worker.autoscaling.workload.minRateUtilizationPercent must be between 1 and 100" -}}
+{{- end -}}
 {{- if or (lt (int $workload.tolerancePercent) 0) (gt (int $workload.tolerancePercent) 100) -}}
 {{- fail "worker.autoscaling.workload.tolerancePercent must be between 0 and 100" -}}
 {{- end -}}
@@ -108,6 +111,7 @@ spec:
             - "--target-cpu-utilization={{ $workload.targetCPUUtilization }}"
             - "--target-queue-drain={{ $workload.targetQueueDrainSeconds }}s"
             - "--target-throughput-utilization={{ $workload.targetThroughputUtilization }}"
+            - "--min-rate-utilization-percent={{ $workload.minRateUtilizationPercent }}"
             - "--tolerance-percent={{ $workload.tolerancePercent }}"
             - "--min-telemetry-coverage-percent={{ $workload.minTelemetryCoveragePercent }}"
             - "--scale-up-percent={{ $workload.scaleUpPercent }}"

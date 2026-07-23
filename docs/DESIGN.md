@@ -896,7 +896,8 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   - arrival：`ceil(arrivalRate / (completionRatePerPod ×
     targetThroughputUtilization))`，默认保留 20% 吞吐余量。
   默认 queue=400 task/Pod、execution=70%、CPU=70%、drain=30 秒、
-  throughput=80%。EWMA `alpha=0.5`，避免只凭一个短采样尖峰反复抖动。
+  throughput=80%。drain/arrival 还必须满足 HPA-008 的资源饱和门槛；EWMA
+  `alpha=0.5`，避免只凭一个短采样尖峰反复抖动。
 - **正在启动的 Pod 与抖动**：候选是绝对副本数，并与 StatefulSet 当前 desired
   replicas 比较；未 Ready 但已在 desired 中的 Pod 已计入当前目标，不会每轮重复追增。
   当已注册 Worker 少于 desired 时暂不继续放大 drain/arrival 速率候选，先等待已经创建的
@@ -940,6 +941,37 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   Follower HTTP、生产 Assignment/Result、阻塞 Processor 和统一 snapshot 验证 queue 与
   execution telemetry 后只扩 Worker，最终每条任务恰好完成一次。真实 Chrome 回归验证
   pressure 面板使用生产 JSON 且 down Worker 不污染当前容量。
+
+### HPA-008：冷启动速率不能跨空闲 Worker 线性外推
+
+- **已复现故障**：revision 56 的固定 20,000 task 突发在第一个五秒速率窗口得到
+  arrival=2000.4 task/s、completion=306.4 task/s。旧公式直接把这一冷启动完成率当成
+  单 Pod 饱和服务率，算出 `arrivalDesired=409` 并被 max clamp 为 100；但同一一致快照
+  的 execution utilization 只有 5.8%、平均 CPU 只有 4.2%。StatefulSet 在任务已开始
+  排空后才继续创建 50 个 Pod，不能证明扩容能解除当时的共享瓶颈。
+- **需求与不变量**：queue depth、actual execution 和 CPU 仍是相互独立的扩容证据；
+  超大 pending 即使 CPU 很低也能按 `pending/targetBacklogPerPod` 扩容。只有 drain 和
+  arrival 预测依赖“Pod 数与完成率近似线性”的假设，因此只有资源确实忙时才可启用。
+  这不改变 durable submission、Leader-only assignment、tenant Limit、claim owner 或
+  exactly-once final commit。
+- **速率投影门槛**：定义 `ratePressure=max(executing/liveCapacity, averageCPU)`。CPU
+  只有在至少 `minTelemetryCoveragePercent` 的 live Worker 上报时才可进入 max，避免一个
+  热点 reporter 外推到全体；execution 在缺失节点时只会低估，因而可以安全参与。
+  `ratePressure >= minRateUtilizationPercent` 时才计算 drain/arrival，默认门槛 50%；
+  否则两个候选明确为 0，但 rate EWMA 继续学习，queue/execution/CPU 候选照常工作。
+  参数由 CRD/Helm `minRateUtilizationPercent` 和进程参数
+  `--min-rate-utilization-percent` 暴露。
+- **GPU/队列映射**：该门槛对应 GPU 服务中的“队列存在且 accelerator/批处理资源已忙”
+  才外推副本吞吐，而不是拿低利用率冷启动的 token/s 估计容量。未来 GPU provider 可把
+  真实 GPU/显存/KV-cache pressure 接入同一资源门槛；本 Case 不把 CPU 当 GPU、不实现
+  placement，也不保证外部下游或单 Raft shard 会随 Pod 数线性扩展。
+- **回归与验收**：policy 单测固定 revision 56 的 16,937 unfinished、5.8% execution、
+  4.2% CPU 和 arrival/completion 速率，要求 queueDesired=42、rate candidates=0、
+  副本保持 50。真实
+  `TestWorkloadAutoscalerDoesNotProjectColdBurstAcrossIdleWorkers` 建立三 voter、
+  Follower HTTP、两个 stateless Worker 和真实完成率基线，再用 gated Processor 制造
+  高 arrival/completion 比且只占 4/40 槽，断言 StatefulSet 保持 2，释放后每任务只完成
+  一次。远程必须用同一固定形状复测 50→100 不再发生，并把结果保留在 PERF。
 
 ### UI-LOAD-001：用原子页面操作组合复杂业务负载
 

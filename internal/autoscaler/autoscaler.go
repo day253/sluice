@@ -57,6 +57,7 @@ type Config struct {
 	TargetCPUUtilization        int32
 	TargetQueueDrainTime        time.Duration
 	TargetThroughputUtilization int32
+	MinRateUtilizationPercent   int32
 	TolerancePercent            int32
 	MinTelemetryCoveragePercent int32
 	ScaleUpPercent              int32
@@ -74,7 +75,8 @@ func DefaultConfig() Config {
 		MinReplicas: 5, MaxReplicas: 100, WorkersPerPod: 100,
 		TargetBacklogPerPod: 400, TargetWorkerUtilization: 70,
 		TargetCPUUtilization: 70, TargetQueueDrainTime: 30 * time.Second,
-		TargetThroughputUtilization: 80, TolerancePercent: 10,
+		TargetThroughputUtilization: 80, MinRateUtilizationPercent: 50,
+		TolerancePercent:            10,
 		MinTelemetryCoveragePercent: 80,
 		ScaleUpPercent:              100, ScaleUpPods: 10, ScaleUpPeriod: 5 * time.Second,
 		ScaleDownPercent: 25, ScaleDownPeriod: time.Minute,
@@ -98,6 +100,9 @@ func (c Config) Validate() error {
 	}
 	if c.TargetQueueDrainTime <= 0 {
 		return fmt.Errorf("targetQueueDrainTime must be positive")
+	}
+	if c.MinRateUtilizationPercent < 1 || c.MinRateUtilizationPercent > 100 {
+		return fmt.Errorf("minRateUtilizationPercent must be between 1 and 100")
 	}
 	if c.TolerancePercent < 0 || c.TolerancePercent > 100 {
 		return fmt.Errorf("tolerancePercent must be between 0 and 100")
@@ -131,6 +136,8 @@ type Recommendation struct {
 	ArrivalRate        float64
 	CompletionRate     float64
 	RatesValid         bool
+	RatePressure       float64
+	RateProjection     bool
 	TelemetryCoverage  float64
 	ScaleDownBlocked   bool
 	DominantSignal     string
@@ -231,13 +238,40 @@ func (p Policy) Recommend(current int32, signals Signals, now time.Time, state *
 		))
 	}
 
+	telemetryCoverage := float64(0)
+	telemetryCoverageComplete := false
+	if registeredPods == 0 {
+		// No execution instances is a coherent complete snapshot. The minimum
+		// replica bound still prevents removal of all execution capacity.
+		telemetryCoverageComplete = signals.ExecutionSignalsValid
+	} else {
+		telemetryCoverage = float64(signals.ReportingWorkers) / float64(registeredPods) * 100
+		telemetryCoverageComplete = signals.ExecutionSignalsValid &&
+			signals.ReportingWorkers <= registeredPods &&
+			telemetryCoverage >= float64(config.MinTelemetryCoveragePercent)
+	}
+
+	// Arrival and drain projections assume adding Pods increases service rate.
+	// That assumption is invalid while execution resources are mostly idle: a
+	// short burst then divides by a cold-start completion rate and can scale to
+	// the maximum even though the bottleneck is Raft, tenant quota, or another
+	// shared dependency. Execution-slot utilization is conservative under
+	// partial telemetry. CPU may activate projection only when enough Pods
+	// reported, so one hot reporter is never extrapolated across the cluster.
+	ratePressure := utilization
+	if telemetryCoverageComplete {
+		ratePressure = math.Max(ratePressure, cpuPercent)
+	}
+	ratePressureSufficient := ratePressure >= float64(config.MinRateUtilizationPercent)
+
 	drainDesired, arrivalDesired := int32(0), int32(0)
 	// Rate projection uses only Pods that produced the measured completion
 	// rate. While StatefulSet desired is still above registered Pods, those
 	// already-starting Pods satisfy the current rate recommendation; wait for
 	// them before projecting another rate-driven increase.
-	if state.ratesValid && registeredPods >= int64(current) &&
-		registeredPods > 0 && state.completionRate > 0 {
+	rateProjection := state.ratesValid && registeredPods >= int64(current) &&
+		registeredPods > 0 && state.completionRate > 0 && ratePressureSufficient
+	if rateProjection {
 		perPodCompletionRate := state.completionRate / float64(registeredPods)
 		if pending > 0 {
 			drainDesired = ceilFloat(
@@ -260,18 +294,6 @@ func (p Policy) Recommend(current int32, signals Signals, now time.Time, state *
 	raw = clamp(raw, config.MinReplicas, config.MaxReplicas)
 	desired := raw
 	reason := "within target"
-	telemetryCoverage := float64(0)
-	telemetryCoverageComplete := false
-	if registeredPods == 0 {
-		// No execution instances is a coherent complete snapshot. The minimum
-		// replica bound still prevents removal of all execution capacity.
-		telemetryCoverageComplete = signals.ExecutionSignalsValid
-	} else {
-		telemetryCoverage = float64(signals.ReportingWorkers) / float64(registeredPods) * 100
-		telemetryCoverageComplete = signals.ExecutionSignalsValid &&
-			signals.ReportingWorkers <= registeredPods &&
-			telemetryCoverage >= float64(config.MinTelemetryCoveragePercent)
-	}
 	dominant := dominantSignal(
 		raw, queueDesired, utilizationDesired, cpuDesired, drainDesired, arrivalDesired,
 	)
@@ -329,7 +351,8 @@ func (p Policy) Recommend(current int32, signals Signals, now time.Time, state *
 		DrainDesired: drainDesired, ArrivalDesired: arrivalDesired,
 		UtilizationPercent: utilization, CPUPercent: cpuPercent,
 		ArrivalRate: state.arrivalRate, CompletionRate: state.completionRate,
-		RatesValid: state.ratesValid, TelemetryCoverage: telemetryCoverage,
+		RatesValid: state.ratesValid, RatePressure: ratePressure,
+		RateProjection: rateProjection, TelemetryCoverage: telemetryCoverage,
 		ScaleDownBlocked: raw < current &&
 			(!signals.TaskBreakdownValid || !telemetryCoverageComplete ||
 				!state.ratesValid),
@@ -607,6 +630,8 @@ func (r *Runner) ReconcileOnce(ctx context.Context) error {
 				"arrivalDesired", recommendation.ArrivalDesired,
 				"arrivalRate", recommendation.ArrivalRate,
 				"completionRate", recommendation.CompletionRate,
+				"ratePressurePercent", recommendation.RatePressure,
+				"rateProjectionActive", recommendation.RateProjection,
 				"telemetryCoveragePercent", recommendation.TelemetryCoverage,
 				"scaleDownBlocked", recommendation.ScaleDownBlocked,
 				"rawDesired", recommendation.RawDesired,
@@ -640,6 +665,8 @@ func (r *Runner) ReconcileOnce(ctx context.Context) error {
 		"arrivalDesired", recommendation.ArrivalDesired,
 		"arrivalRate", recommendation.ArrivalRate,
 		"completionRate", recommendation.CompletionRate,
+		"ratePressurePercent", recommendation.RatePressure,
+		"rateProjectionActive", recommendation.RateProjection,
 		"telemetryCoveragePercent", recommendation.TelemetryCoverage,
 		"scaleDownBlocked", recommendation.ScaleDownBlocked,
 		"dominantSignal", recommendation.DominantSignal,

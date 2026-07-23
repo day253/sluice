@@ -486,6 +486,10 @@ func normalizeClusterSpec(in sluicev1.SluiceClusterSpec) (normalizedSpec, error)
 					workload.TargetThroughputUtilization =
 						configured.TargetThroughputUtilization
 				}
+				if configured.MinRateUtilizationPercent > 0 {
+					workload.MinRateUtilizationPercent =
+						configured.MinRateUtilizationPercent
+				}
 				if configured.TolerancePercent != nil {
 					workload.TolerancePercent = *configured.TolerancePercent
 				}

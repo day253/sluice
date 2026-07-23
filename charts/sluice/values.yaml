@@ -23,6 +23,7 @@ worker:
       targetCPUUtilization: 70
       targetQueueDrainSeconds: 30
       targetThroughputUtilization: 80
+      minRateUtilizationPercent: 50
       tolerancePercent: 10
       minTelemetryCoveragePercent: 80
       scaleUpPercent: 100

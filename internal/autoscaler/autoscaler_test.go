@@ -247,8 +247,39 @@ func TestPolicyTakesMaxOfCPUQueueDrainAndArrivalCandidates(t *testing.T) {
 	next := policy.Recommend(5, nextSignals, start.Add(10*time.Second), state)
 	if next.DrainDesired != 2 || next.ArrivalDesired != 13 ||
 		next.RawDesired != 13 || next.Desired != 13 ||
-		next.DominantSignal != "arrival rate" {
+		next.DominantSignal != "arrival rate" || !next.RateProjection {
 		t.Fatalf("multi-signal recommendation = %+v, want arrival-driven 13", next)
+	}
+}
+
+func TestPolicyDoesNotProjectColdRateFromUnsaturatedShortBurst(t *testing.T) {
+	config := DefaultConfig()
+	config.MinReplicas = 1
+	config.MaxReplicas = 100
+	config.TolerancePercent = 0
+	policy := Policy{Config: config}
+	state := &State{}
+	start := time.Unix(1000, 0)
+	signals := Signals{
+		ObservedAt: start, Backlog: 16_937, PendingTasks: 16_405,
+		RunningTasks: 532, TaskBreakdownValid: true,
+		WorkerCapacity: 5_000, WorkerInstances: 50,
+		ExecutionSignalsValid: true, ReportingWorkers: 50,
+		ExecutingTasks: 289, AverageWorkerCPUMillis: 42,
+		RateCountersValid: true, TelemetrySource: "leader-0",
+		TelemetryStartedAt: start.Add(-time.Minute),
+	}
+	_ = policy.Recommend(50, signals, start, state)
+	signals.ObservedAt = start.Add(5 * time.Second)
+	signals.SubmittedTasksTotal = 10_000
+	signals.CompletedTasksTotal = 1_532
+
+	got := policy.Recommend(50, signals, signals.ObservedAt, state)
+	if !got.RatesValid || got.RateProjection ||
+		got.RatePressure < 5.7 || got.RatePressure > 5.9 ||
+		got.DrainDesired != 0 || got.ArrivalDesired != 0 ||
+		got.QueueDesired != 42 || got.Desired != 50 {
+		t.Fatalf("cold short-burst rate was projected across idle Pods: %+v", got)
 	}
 }
 
@@ -363,7 +394,8 @@ func TestPolicyDoesNotExtrapolateOneCPUReporterAcrossMissingWorkers(t *testing.T
 		state,
 	)
 	if recommendation.CPUDesired != 2 || recommendation.Desired != 10 ||
-		!recommendation.ScaleDownBlocked {
+		!recommendation.ScaleDownBlocked || recommendation.RateProjection ||
+		recommendation.RatePressure != 0 {
 		t.Fatalf("partial CPU telemetry was extrapolated to all Workers: %+v", recommendation)
 	}
 }

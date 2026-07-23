@@ -1654,6 +1654,194 @@ func TestWorkloadAutoscalerReadsRealClusterBacklogAndScalesOnlyWorkers(t *testin
 	}, 30*time.Second, "autoscaling workload drains after Processor release")
 }
 
+// TestWorkloadAutoscalerDoesNotProjectColdBurstAcrossIdleWorkers preserves
+// HPA-008 at the production boundary. A real baseline establishes completion
+// throughput, then a gated short burst creates a high arrival/completion-rate
+// ratio while only one tenth of execution capacity is occupied. The workload
+// autoscaler must not assume that adding Pods linearly fixes a non-saturated
+// bottleneck; queue depth, execution utilization, and CPU remain independent
+// scale-up candidates.
+func TestWorkloadAutoscalerDoesNotProjectColdBurstAcrossIdleWorkers(t *testing.T) {
+	k8slog.SetLogger(logr.Discard())
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	executionWorkers := make([]*node.StatelessWorker, 0, 2)
+	for index := 0; index < 2; index++ {
+		execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+			NodeID:     fmt.Sprintf("cold-rate-worker-%d", index),
+			APIAddress: "127.0.0.1:0", ControllerAddress: tc.httpAddrs[0],
+			TotalWorkers: 20,
+		}, tc.proc, zap.NewNop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		executionWorkers = append(executionWorkers, execution)
+		go func() { _ = execution.Start() }()
+	}
+	defer func() {
+		for _, execution := range executionWorkers {
+			_ = execution.Shutdown(5 * time.Second)
+		}
+	}()
+	tc.waitFor(func() bool {
+		nodes := tc.fsms().GetAllNodes()
+		for index := range executionWorkers {
+			info := nodes[fmt.Sprintf("cold-rate-worker-%d", index)]
+			if info == nil || info.Role != types.NodeRoleWorker ||
+				info.Status != types.NodeStatusUp {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "cold-rate Workers register")
+
+	const tenantID = "autoscale-cold-rate"
+	tc.addTenant(tenantID, 4)
+	tc.waitAllocation(10 * time.Second)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	scheme := k8sruntime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	worker := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "cold-rate-worker", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: integrationPtr(int32(2))},
+	}
+	serviceHost, servicePortText, err := net.SplitHostPort(tc.httpAddrs[follower])
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicePort, err := strconv.Atoi(servicePortText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "cold-rate-api", Namespace: "default"},
+		Spec:       corev1.ServiceSpec{ClusterIP: serviceHost},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(worker, service).Build()
+	config := workloadautoscaler.DefaultConfig()
+	config.MinReplicas, config.MaxReplicas = 2, 20
+	config.WorkersPerPod = 20
+	config.TargetBacklogPerPod = 1_000
+	config.TolerancePercent = 0
+	runner := &workloadautoscaler.Runner{
+		Client: k8sClient, Namespace: "default", StatefulSet: "cold-rate-worker",
+		SluiceService: "cold-rate-api", SluicePort: int32(servicePort),
+		Policy: workloadautoscaler.Policy{Config: config},
+	}
+	if err := runner.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	submit := func(prefix string, count int) []types.TaskResponse {
+		t.Helper()
+		request := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, count)}
+		for index := range request.Tasks {
+			request.Tasks[index] = types.TaskSubmitRequest{
+				TenantID:       tenantID,
+				Payload:        json.RawMessage(fmt.Sprintf(`{"index":%d}`, index)),
+				IdempotencyKey: fmt.Sprintf("%s:%d", prefix, index),
+			}
+		}
+		body, marshalErr := json.Marshal(request)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		response, postErr := client.Post(
+			"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+			"application/json",
+			bytes.NewReader(body),
+		)
+		if postErr != nil {
+			t.Fatal(postErr)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusAccepted {
+			payload, _ := io.ReadAll(response.Body)
+			t.Fatalf("submit %s status=%s body=%s", prefix, response.Status, payload)
+		}
+		var accepted types.BatchTaskResponse
+		if decodeErr := json.NewDecoder(response.Body).Decode(&accepted); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		return accepted.Tasks
+	}
+
+	baseline := submit("hpa-008-baseline", 20)
+	tc.waitFor(func() bool {
+		for _, task := range baseline {
+			if result := tc.fsms().GetResult(task.TaskID); result == nil ||
+				result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 20*time.Second, "rate baseline completes")
+	if err := runner.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	started, release := tc.proc.gate(tenantID)
+	defer release()
+	burst := submit("hpa-008-burst", 100)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cold-rate burst did not start")
+	}
+	reader := workloadautoscaler.HTTPReader{}
+	tc.waitFor(func() bool {
+		signals, readErr := reader.Read(
+			context.Background(),
+			"http://"+tc.httpAddrs[follower],
+		)
+		return readErr == nil && signals.Backlog == 100 &&
+			signals.PendingTasks > 0 && signals.RunningTasks > 0 &&
+			signals.ExecutingTasks <= 4 && signals.WorkerCapacity == 40
+	}, 10*time.Second, "real cold-rate burst and idle capacity become observable")
+	if err := runner.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var target appsv1.StatefulSet
+	if err := k8sClient.Get(
+		context.Background(),
+		k8stypes.NamespacedName{Name: "cold-rate-worker", Namespace: "default"},
+		&target,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if target.Spec.Replicas == nil || *target.Spec.Replicas != 2 {
+		t.Fatalf(
+			"cold short-burst rate changed replicas to %v, want 2 idle-capacity Pods",
+			target.Spec.Replicas,
+		)
+	}
+
+	release()
+	tc.waitFor(func() bool {
+		for _, task := range burst {
+			if result := tc.fsms().GetResult(task.TaskID); result == nil ||
+				result.Status != types.TaskStatusDone ||
+				tc.proc.processedTaskCount(task.TaskID) != 1 {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, "cold-rate burst drains exactly once")
+}
+
 // TestWorkloadAutoscalerIgnoresAllocationForDownWorker preserves HPA-006
 // through real Raft replication and follower HTTP. A rolling replacement can
 // make a Worker down before the next allocation plan commits; its stale

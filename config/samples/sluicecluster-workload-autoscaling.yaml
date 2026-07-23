@@ -26,6 +26,9 @@ spec:
       # drain pending work within this SLO and retain steady-arrival headroom.
       targetQueueDrainSeconds: 30
       targetThroughputUtilization: 80
+      # Never extrapolate a cold-start service rate unless execution slots or
+      # fully reported CPU show that adding Worker Pods can relieve pressure.
+      minRateUtilizationPercent: 50
       tolerancePercent: 10
       # Missing execution telemetry may still cause scale-up, but at least
       # this percentage must report before any scale-down is allowed.
