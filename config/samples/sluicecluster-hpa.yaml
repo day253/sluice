@@ -11,6 +11,7 @@ spec:
   image: ghcr.io/day253/sluice:latest
   autoscaling:
     enabled: true
+    mode: hpa
     minReplicas: 5
     maxReplicas: 100
     metrics:

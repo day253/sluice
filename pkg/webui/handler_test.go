@@ -82,16 +82,25 @@ func TestDashboardChartsExposeRawJSONLinks(t *testing.T) {
 	}
 }
 
-func TestWorkerChartExcludesControlOnlyNodes(t *testing.T) {
+func TestWorkerChartUsesOnlyCurrentLiveWorkerNodes(t *testing.T) {
 	handler := Handler(http.NotFoundHandler())
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
 	}
-	if fragment := `executionNodes=S.nodes.filter(node=>Number(node.total_workers||0)>0)`;
-		!strings.Contains(recorder.Body.String(), fragment) {
-		t.Fatalf("dashboard is missing execution-role chart filter %q", fragment)
+	if fragment := `executionNodes=S.nodes.filter(node=>node.role==='worker'&&node.status==='up'&&Number(node.total_workers||0)>0)`; !strings.Contains(recorder.Body.String(), fragment) {
+		t.Fatalf("dashboard is missing live execution-role chart filter %q", fragment)
+	}
+	for _, fragment := range []string{
+		`function currentAllocations(){const live=new Set(S.nodes.filter(node=>node.role==='worker'&&node.status==='up')`,
+		`const capacity=liveWorkers.reduce((sum,node)=>sum+Number(node.total_workers||0),0)`,
+		`S.workerHistories.reduce((sum,item)=>sum+item.limit,0)`,
+		`S.nodes.filter(node=>node.role==='worker'&&node.status==='up').map`,
+	} {
+		if !strings.Contains(recorder.Body.String(), fragment) {
+			t.Fatalf("dashboard current Worker mirror is missing %q", fragment)
+		}
 	}
 }
 

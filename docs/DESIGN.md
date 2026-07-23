@@ -395,6 +395,28 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   执行 Worker、处理 4096 个任务，断言所有 Raft 批次不超过 128、lease 前排空、每任务
   只执行一次且没有超时重连或 lease 回收。
 
+### SCHED-005：大量一槽 idle tenant 挤满第一个 Worker 实例
+
+- **已复现故障**：Load Lab 保留 100 个 tenant，加原 8 个 tenant 后都进入 idle，每个按
+  设计保留一个 catch-all Worker。集群有 50 个实例、每实例 100 槽、总量仅 108，但旧
+  placement 对每个 tenant 都从排序第一个节点重新分 remainder，最终
+  `sluice-worker-0=108/100`，违反单节点容量上限。
+- **根因与修复**：tenant map 逐项独立做 `total/nodeCount`，所有 `total=1` 的 remainder
+  都落在 index 0。新 placement 先稳定排序 tenant，跨所有 tenant 共享 round-robin cursor
+  和每节点 remaining capacity；borrowed 镜像只放进该 tenant 已获得的 effective slot，
+  因而每节点 borrowed≤effective。
+- **发布阻断校验**：Leader 在 `OpUpdateAllocation` 前再次校验每个 NodeID 存在、节点
+  Tenants 总数≤`TotalWorkers`、每 tenant 的全局 effective/borrowed 总数没有丢失且
+  borrowed 不超过该节点 effective。校验失败保留上一份已提交 allocation，不把无效计划
+  写 Raft。
+- **协议边界与非目标**：仅改变同一份 Leader-owned allocation 计划的节点 placement，
+  不改变 max-min tenant 总量、idle minimum、借用目标、任务选择、claim lease、Worker
+  并发或 Raft command。稳定 tenant/node 排序使相同输入产生相同计划；本轮不优化最少迁移
+  或跨故障域拓扑感知。
+- **回归覆盖**：单测用 108 个一槽 tenant/50×100 节点断言每节点 2～3，并单独拒绝
+  overflow plan；真实三 voter + 两个 3 槽 stateless Worker + 五 tenant Case 经注册、
+  allocator、Raft Apply 和 allocation mirror 断言两个节点均≤3、所有 tenant≥1。
+
 ### PERF-003：每节点 credit 过小导致全局批次仍填不满
 
 - **现象证据**：SCHED-004 的 8 节点/4900 执行槽/4096 任务固定 Case 虽然不再发生
@@ -630,11 +652,11 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   为一小时，经 Follower HTTP、Leader Raft、Allocator、allocation push 和 Worker 验证
   2 秒内唤醒、20 条任务最终各处理一次。
 
-### HPA-001：只扩缩无状态 Worker 的 Kubernetes HPA
+### HPA-001：只扩缩无状态 Worker 的原生 Kubernetes HPA
 
 - **需求边界**：`spec.replicas` / `control.replicas` 是固定、奇数的 control/Raft 成员数，
   永远不是 HPA target；`spec.workerReplicas` / `worker.replicas` 是无状态执行面的静态或
-  初始规模。Helm 与 `SluiceCluster` CRD 都只创建 `autoscaling/v2` HPA，且
+  初始规模。`mode=hpa` 时 Helm 与 `SluiceCluster` CRD 只创建 `autoscaling/v2` HPA，且
   `scaleTargetRef` 必须是独立的 Worker StatefulSet。扩一个 Worker 只增加
   `workersPerNode` 个执行槽，不增加 Raft 日志副本、quorum 或 PVC。
 - **所有权**：Helm 开启 `worker.autoscaling.enabled` 后不再渲染 Worker 的
@@ -674,3 +696,124 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   `TestStatelessWorkerRoleSplit` 在三 voter 集群中扩一个 Worker、制造 durable backlog、
   验证新容量参与分配且 membership 不变，再缩回并确认后续任务无 lease 尾部、Leader
   故障后仍 exactly-once 排空。
+
+### HPA-003：unfinished backlog / Worker 利用率驱动执行面扩容
+
+- **问题与需求边界**：Demo Processor 主要是 sleep/I/O 时，Pod CPU 很低并不代表执行面有
+  空闲；unfinished 持续增加而 CPU HPA 不动作会让积压排空过慢。`mode=workload` 每 5 秒
+  只读取三个当前时刻镜像：所有 tenant 的 `inflight` 总和、`status=up/role=worker` 的
+  `total_workers` 总容量、allocation 中已分配 Worker 总数。它们不新增历史、不进入 Raft、
+  FSM 或 Snapshot，也不参与 task→node 选择。
+- **决策**：backlog 建议副本为
+  `ceil(total unfinished / targetBacklogPerPod)`；利用率建议副本按已注册 Worker Pod 数和
+  `allocatedWorkers / liveWorkerCapacity` 投影到 `targetWorkerUtilization`。两者取最大值，
+  再限制在 `minReplicas..maxReplicas`。默认 `targetBacklogPerPod=400`、
+  `targetWorkerUtilization=70%`。积压大但 CPU 空闲，或积压尚小但分配槽已满，均可扩容。
+- **速率与缩容**：默认每轮扩容最多取“当前副本 100%”和“10 Pod”中的较大值，5 秒后可
+  再次试探；连续 300 秒低负载后才缩容，每分钟最多收回 25%。信号 GET、解析、Lease
+  选主或 Kubernetes Patch 任一失败时，在副本已处于静态上下界内的前提下保留当前副本，
+  不能把未知当作零负载；低于 `minReplicas` 或高于 `maxReplicas` 的副本先独立恢复边界，
+  不依赖动态信号。缩容仍走既有 Worker drain、offline grace 和 claim lease；不会取消
+  已经开始的 Processor。
+- **唯一所有者**：Helm 直接部署由一个带 Kubernetes Lease 选主的
+  `sluice-autoscaler` Deployment patch Worker StatefulSet；CRD 部署由 operator 内同一
+  policy patch 对应 Worker。`mode=workload` 不创建 HPA，`mode=hpa` 不运行 workload
+  决策，两个入口不能同时拥有同一个 Worker `spec.replicas`。control/Raft StatefulSet
+  永不成为 target。
+- **每 Pod 并发**：本轮只增加无状态 Worker Pod 数，不在线修改 `workersPerNode`。动态
+  增大单 Pod Processor 并发会绕过 CPU/内存 request/limit、连接池和下游限流的容量边界，
+  也让一次 Pod 故障丢失更大的已领取工作面；需要单独协议和容量实验后才能支持。
+- **故障模型与不变量**：扩容只增加执行槽；租户 Limit、借用、公平分配、集群存活容量、
+  Leader-only assignment、Raft durable create/claim/final commit 和 exactly-once final
+  state 都不变。autoscaler 重启会丢失本地缩容稳定计时并重新等待完整窗口，最坏情况是晚
+  缩容，不会提前收容量。多个 autoscaler 副本中只有 Lease Leader 写 scale。
+- **可观测性**：每次有压力或副本变化都记录 backlog、allocated/capacity、利用率、raw
+  desired、实际 desired 和限速原因；WebUI 现有 unfinished 174 点、Worker allocation/
+  Limit、Raft Apply/dispatcher JSON 继续用于区分“执行容量不足”和“单 Raft shard 饱和”。
+  autoscaler 日志和 Kubernetes StatefulSet/Deployment 是当前控制状态，不写业务共识。
+- **非目标**：不做 scale-to-zero、按 tenant 独立 Pod 池、control/Multi-Raft shard 自动
+  扩缩、基于预测的任务预分配，也不保证增加 Worker 能突破单 shard Raft Apply 上限。
+- **回归覆盖**：policy 单测固定 backlog/utilization 扩容、速率上限、300 秒缩容稳定和
+  信号失败保留；HTTPReader 单测固定 role/up/容量语义；CRD 和 Chart 单测固定唯一 target
+  与 HPA/workload 互斥。真实
+  `TestWorkloadAutoscalerReadsRealClusterBacklogAndScalesOnlyWorkers` 经三 voter Raft、
+  Follower HTTP、stateless Worker registration/allocation 和阻塞 Processor 生成低 CPU
+  backlog，再由生产 reader/policy patch Worker 副本，control 始终不变，释放后任务全部
+  exactly-once 排空。
+
+### HPA-004：集群内信号直连与最小容量冷启动
+
+- **已复现故障**：远程 revision 47 首次启用 workload mode 时，Helm 为避免与 scale owner
+  争抢而不渲染 Worker `spec.replicas`，Kubernetes 暂时默认成 1；同时 autoscaler Pod
+  内的 CoreDNS 把 `sluice-sluice` 解析为 fake IP `198.18.0.12`，对三个只读 GET 连续
+  timeout/EOF；实际 Service ClusterIP `10.152.183.17` 返回 200。旧实现把未知信号安全地
+  解释为“保持 1”，因此永远达不到配置的 `minReplicas=50`。
+- **修复边界**：直接 Helm autoscaler 从 Kubernetes Service 对象读取实际 ClusterIP，不
+  用目标环境的集群 DNS；生产 `HTTPReader` 还显式禁用外部 Proxy。CRD operator 原本已用
+  Service ClusterIP。调用者显式注入的测试 Client 不被改写。副本低于 min 或高于 max 时
+  先 patch Worker 边界且不读取业务信号；边界内仍保持 HPA-003 的“信号失败不扩不缩”。
+  control、Raft membership、task ownership、每 Pod 并发和租户 Limit 均不改变。
+- **部署验收**：远程脚本在 autoscaler Deployment Ready 后，以一秒条件轮询、180 秒硬
+  截止等待 Worker desired/ready 都达到 50，再按当前 50～100 个 Running Worker 及其实际
+  capacity 进行 FSM allocation 拓扑检查；不能把调谐前的瞬时 1 副本误报为最终失败，也
+  不能在合法压力扩容到 72/100 时仍强制门禁等于 50。
+- **回归覆盖**：单测固定 Service DNS 与 ClusterIP 不同时必须使用后者、`HTTP_PROXY`
+  存在时默认 reader 的 Transport 无 Proxy，并固定信号不可用时只把 Worker 1→min、control
+  不变；进程级集成测试在启动环境预置失效 Proxy，经非 loopback 入口访问真实三 voter
+  HTTP API，主 HPA-003 集成路径还通过 Kubernetes Service 对象解析真实地址。Chart 测试
+  固定 Service RBAC/参数和远程验收必须先等待 min 收敛。
+
+### HPA-005：Raft 迁移只枚举 control
+
+- **已复现故障**：revision 48 升级前的地址迁移按 release/name 标签枚举，新的 autoscaler
+  Deployment 共享这些标签，因此脚本为它误建 `*-raft` Service 并调用 join。5 voter 上限
+  和成员修复最终保持了 5 voter/0 non-voter，但扩缩容组件绝不能依赖后续清理来避免进入
+  control plane。
+- **修复与非目标**：创建 per-Pod Raft Service、选择探针 Pod和逐成员 join 的三个入口都
+  必须额外限定 `app.kubernetes.io/component=control`；Worker、autoscaler、operator 或
+  未来观测组件均不参与。该修复不改变合法 control 的地址迁移协议或 voter 上限。
+- **回归与验收**：Chart/脚本单测固定 migration block 的 control selector；远程复现产生
+  的错误 Service 已删除，revision 48 验证最终 membership 为 5 voter/0 non-voter。后续
+  部署仍必须执行相同真实 membership 门禁。
+
+### HPA-006：滚动升级期间只计算 live Worker allocation
+
+- **已复现故障**：revision 49 滚动替换 Worker 时，`status=up` 容量先下降，而 allocation
+  当前镜像仍短暂包含刚 down 节点。旧 reader 用所有 allocation 除以 live capacity，得到
+  超过 100% 的假利用率，把 50 副本错误扩到 max=100。
+- **语义边界**：capacity 和 allocated 必须来自同一个 live Worker 集合。reader 先由
+  `role=worker,status=up` 建立 NodeID 集合，再只汇总这些 NodeID 的 allocation；down、
+  control、未知节点即使镜像中暂存 allocation 也不计入扩容利用率。unfinished backlog
+  仍按所有 tenant 求和，因此真实任务突发不会被过滤。
+- **非目标与正确性**：本修复不删除 FSM 的 retained down 身份、不提前修改 allocation、
+  不干预 StatefulSet rollout，也不改变 Leader 分配。它只让只读 autoscaling 快照内部的
+  分子分母一致。
+- **回归覆盖**：reader 单测固定 up/down 各自有 allocation 时只取 up；真实三 voter 测试
+  经 Raft 提交 NodeDown 和包含旧节点的 allocation，再从 follower HTTP 读取，断言
+  capacity=100、allocated=50。WebUI 的当前摘要、allocated/borrowed 汇总、placement 和
+  Worker instance 图使用相同 live Worker NodeID 集合；retained down 身份仍可从原始 JSON
+  读取，但不显示为当前容量或不可用集群成员。真实浏览器回归固定 up/down 各一个 Worker
+  时只显示 100 slots、0 stale allocation 和一个 Worker 图例。
+
+### UI-LOAD-001：用原子页面操作组合复杂业务负载
+
+- **操作模型**：页面只组合已有生产 API：批量创建/更新最多 100 个稳定
+  `load-lab-001..100` tenant，以及按 tenant 轮转构造任务流。quota 可取相同、5/20/100
+  分层或斜坡；任务可取均匀、单热 tenant 或 1/3/8 金字塔；delivery 可取立即 burst 或
+  最多 20 个一秒 wave。preset 只是这些原子的已命名参数，不另开测试后门。
+- **提交与边界**：任务仍使用 `/api/v1/tasks/batch`，batch=500、并发=4，跨 tenant
+  round-robin，每条任务携带 run/tenant/index 幂等键；未知结果只重试一次。浏览器硬上限
+  为 100 tenant、单 tenant 5000 条、单次合计 100000 条。开始前若共享 Load Lab pool
+  仍有 unfinished，拒绝覆盖；Stop 只停止未来批次，已经 durable accepted 的任务继续
+  排空。
+- **状态与持久化**：当前 run 显示 preparing/submitting/draining/completed/failed/
+  stopped、提交/失败/剩余/峰值/耗时；浏览器只在 `localStorage` 保留最近 10 条 run JSON。
+  这不是集群事实、Raft 数据或服务端测试记录；刷新或换浏览器不能把它当审计日志。集群的
+  tenant/task 最终状态仍由生产 API/Raft 决定。
+- **非目标**：不是批量导入文件、不是服务端场景 runner、不能取消 committed task，也不
+  承诺浏览器保持打开之外的 wave 定时精度。大于安全上限的压测继续使用版本化 benchmark。
+- **回归覆盖**：纯 JS 组件测试固定稳定 tenant ID、100×200、hotspot、wave、安全上限和
+  首轮每 tenant 一条；真实 Chrome E2E 从页面点击创建 3 tenant、轮转提交 6 条并检查
+  status/JSON/idempotency。`TestAtomicHundredTenantLoadThroughFollowerHTTP` 用 100 个
+  tenant 经真实 Follower HTTP、三 voter Raft、Allocator/Worker/final state 验证每 tenant
+  两条、每 task 一次且最终 unfinished=0。

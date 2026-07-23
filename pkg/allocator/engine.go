@@ -15,6 +15,7 @@ package allocator
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -274,6 +275,11 @@ func (e *Engine) reconcile() error {
 
 	// 8. Distribute each tenant's effective and borrowed workers across nodes.
 	nodeAllocs := e.distributeAcrossNodesWithBorrowed(finalAlloc, borrowed, executionNodes)
+	if err := validateNodeAllocationCapacity(
+		nodeAllocs, executionNodes, finalAlloc, borrowed,
+	); err != nil {
+		return err
+	}
 
 	// 9. Write to Raft.
 	allocMap := make(map[string]*types.NodeAllocation, len(nodeAllocs))
@@ -619,9 +625,14 @@ func (e *Engine) distributeAcrossNodes(
 	return e.distributeAcrossNodesWithBorrowed(tenantAlloc, nil, nodes)
 }
 
-// distributeAcrossNodesWithBorrowed spreads effective and borrowed worker
-// counts using the same deterministic split. Borrowed is a current snapshot
-// field for observability; workers enforce only the effective Tenants count.
+// distributeAcrossNodesWithBorrowed spreads effective workers in stable
+// tenant order while sharing one round-robin cursor and each node's remaining
+// capacity across every tenant. Starting each tenant at node zero would let a
+// large set of one-worker idle tenants overfill the first instance.
+//
+// Borrowed is a current snapshot field for observability. It is placed only
+// within that tenant's already assigned effective slots; workers enforce only
+// the effective Tenants count.
 func (e *Engine) distributeAcrossNodesWithBorrowed(
 	tenantAlloc map[string]int,
 	borrowedAlloc map[string]int,
@@ -637,29 +648,131 @@ func (e *Engine) distributeAcrossNodesWithBorrowed(
 		}
 	}
 
-	distribute := func(values map[string]int, field func(*types.NodeAllocation) map[string]int) {
-		for tenantID, total := range values {
-			if total <= 0 {
-				continue
+	if nodeCount == 0 {
+		return result
+	}
+	tenantIDs := sortedWorkerKeys(tenantAlloc)
+	remainingCapacity := make([]int, nodeCount)
+	totalRequested := sumWorkers(tenantAlloc)
+	for index, node := range nodes {
+		remainingCapacity[index] = node.TotalWorkers
+		if remainingCapacity[index] <= 0 {
+			// Compatibility callers and focused unit tests may omit capacity.
+			// Production executionNodes always carry a positive bound.
+			remainingCapacity[index] = totalRequested
+		}
+	}
+	cursor := 0
+	for _, tenantID := range tenantIDs {
+		remaining := tenantAlloc[tenantID]
+		for remaining > 0 {
+			placed := false
+			for offset := 0; offset < nodeCount; offset++ {
+				index := (cursor + offset) % nodeCount
+				if remainingCapacity[index] <= 0 {
+					continue
+				}
+				result[index].Tenants[tenantID]++
+				remainingCapacity[index]--
+				remaining--
+				cursor = (index + 1) % nodeCount
+				placed = true
+				break
 			}
-			perNode := total / nodeCount
-			remainder := total % nodeCount
-
-			for i, na := range result {
-				count := perNode
-				if i < remainder {
-					count++
-				}
-				if count > 0 {
-					field(na)[tenantID] = count
-				}
+			if !placed {
+				break
 			}
 		}
 	}
-	distribute(tenantAlloc, func(na *types.NodeAllocation) map[string]int { return na.Tenants })
-	distribute(borrowedAlloc, func(na *types.NodeAllocation) map[string]int { return na.Borrowed })
+
+	borrowCursor := 0
+	for _, tenantID := range sortedWorkerKeys(borrowedAlloc) {
+		remaining := borrowedAlloc[tenantID]
+		for remaining > 0 {
+			placed := false
+			for offset := 0; offset < nodeCount; offset++ {
+				index := (borrowCursor + offset) % nodeCount
+				if result[index].Borrowed[tenantID] >= result[index].Tenants[tenantID] {
+					continue
+				}
+				result[index].Borrowed[tenantID]++
+				remaining--
+				borrowCursor = (index + 1) % nodeCount
+				placed = true
+				break
+			}
+			if !placed {
+				break
+			}
+		}
+	}
 
 	return result
+}
+
+func validateNodeAllocationCapacity(
+	allocations []*types.NodeAllocation,
+	nodes []*types.NodeInfo,
+	expected map[string]int,
+	expectedBorrowed map[string]int,
+) error {
+	capacity := make(map[string]int, len(nodes))
+	for _, node := range nodes {
+		capacity[node.ID] = node.TotalWorkers
+	}
+	actual := make(map[string]int, len(expected))
+	actualBorrowed := make(map[string]int, len(expectedBorrowed))
+	for _, allocation := range allocations {
+		total := sumWorkers(allocation.Tenants)
+		limit, exists := capacity[allocation.NodeID]
+		if !exists {
+			return fmt.Errorf("allocation targets unknown execution node %s", allocation.NodeID)
+		}
+		if total > limit {
+			return fmt.Errorf(
+				"allocation for node %s exceeds capacity: %d > %d",
+				allocation.NodeID, total, limit,
+			)
+		}
+		for tenantID, workers := range allocation.Tenants {
+			actual[tenantID] += workers
+		}
+		for tenantID, borrowed := range allocation.Borrowed {
+			if borrowed < 0 || borrowed > allocation.Tenants[tenantID] {
+				return fmt.Errorf(
+					"borrowed allocation for tenant %s on node %s is outside effective allocation",
+					tenantID, allocation.NodeID,
+				)
+			}
+			actualBorrowed[tenantID] += borrowed
+		}
+	}
+	for tenantID, workers := range expected {
+		if actual[tenantID] != workers {
+			return fmt.Errorf(
+				"distributed allocation for tenant %s is %d, want %d",
+				tenantID, actual[tenantID], workers,
+			)
+		}
+	}
+	for tenantID, borrowed := range expectedBorrowed {
+		if actualBorrowed[tenantID] != borrowed {
+			return fmt.Errorf(
+				"distributed borrowed allocation for tenant %s is %d, want %d",
+				tenantID, actualBorrowed[tenantID], borrowed,
+			)
+		}
+	}
+	return nil
+}
+
+func sortedWorkerKeys(values map[string]int) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // ---------------------------------------------------------------------------

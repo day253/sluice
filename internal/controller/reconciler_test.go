@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
@@ -18,6 +20,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	sluicev1 "github.com/day253/sluice/api/v1"
+	workloadautoscaler "github.com/day253/sluice/internal/autoscaler"
 )
 
 func newClusterReconciler(t *testing.T, cluster *sluicev1.SluiceCluster) (*SluiceClusterReconciler, client.Client) {
@@ -217,6 +220,95 @@ func TestClusterReconcilerDoesNotFightHPAAndRestoresStaticReplicasWhenDisabled(t
 	}
 }
 
+type controllerSignalReaderFunc func(context.Context, string) (workloadautoscaler.Signals, error)
+
+func (f controllerSignalReaderFunc) Read(
+	ctx context.Context, baseURL string,
+) (workloadautoscaler.Signals, error) {
+	return f(ctx, baseURL)
+}
+
+func TestClusterReconcilerWorkloadModeScalesWorkersAndNeverControlOrHPA(t *testing.T) {
+	cluster := &sluicev1.SluiceCluster{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: sluicev1.SchemeGroupVersion.String(),
+			Kind:       "SluiceCluster",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "sample", Namespace: "default", UID: types.UID("cluster-uid"),
+		},
+		Spec: sluicev1.SluiceClusterSpec{
+			Replicas: 3, WorkerReplicas: 4, WorkersPerNode: 100,
+			Autoscaling: &sluicev1.WorkerAutoscalingSpec{
+				Enabled: true, Mode: "workload", MinReplicas: 2, MaxReplicas: 20,
+				Workload: &sluicev1.WorkloadAutoscalingSpec{
+					PollIntervalSeconds: 5, TargetBacklogPerPod: 100,
+					TargetWorkerUtilization: 70, ScaleUpPercent: 100,
+					ScaleUpPods: 10, ScaleDownPercent: 25,
+					ScaleDownStabilizationSeconds: ptr(int32(300)),
+				},
+			},
+		},
+	}
+	reconciler, k8sClient := newClusterReconciler(t, cluster)
+	now := time.Unix(1000, 0)
+	reconciler.Now = func() time.Time { return now }
+	reconciler.SignalReader = controllerSignalReaderFunc(
+		func(_ context.Context, baseURL string) (workloadautoscaler.Signals, error) {
+			if baseURL != "http://sample:9090" {
+				t.Fatalf("signal base URL = %q", baseURL)
+			}
+			return workloadautoscaler.Signals{
+				Backlog: 2_000, AllocatedWorkers: 200, WorkerCapacity: 200,
+			}, nil
+		},
+	)
+	key := types.NamespacedName{Name: "sample", Namespace: "default"}
+	reconcileCluster(t, reconciler, key)
+
+	var worker appsv1.StatefulSet
+	workerKey := types.NamespacedName{Name: "sample-worker", Namespace: "default"}
+	if err := k8sClient.Get(context.Background(), workerKey, &worker); err != nil {
+		t.Fatal(err)
+	}
+	if worker.Spec.Replicas == nil || *worker.Spec.Replicas != 12 {
+		t.Fatalf("workload-scaled Worker replicas = %v, want bounded scale from 2 to 12", worker.Spec.Replicas)
+	}
+	var control appsv1.StatefulSet
+	if err := k8sClient.Get(context.Background(), key, &control); err != nil {
+		t.Fatal(err)
+	}
+	if control.Spec.Replicas == nil || *control.Spec.Replicas != 3 {
+		t.Fatalf("control replicas = %v, want fixed 3", control.Spec.Replicas)
+	}
+	var hpa autoscalingv2.HorizontalPodAutoscaler
+	if err := k8sClient.Get(context.Background(), workerKey, &hpa); !apierrors.IsNotFound(err) {
+		t.Fatalf("workload mode unexpectedly created HPA: %v", err)
+	}
+	var current sluicev1.SluiceCluster
+	if err := k8sClient.Get(context.Background(), key, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.DesiredWorkerReplicas != 12 {
+		t.Fatalf("desired Worker status = %d, want 12", current.Status.DesiredWorkerReplicas)
+	}
+
+	// An unavailable read is not interpreted as zero load and cannot remove
+	// execution capacity.
+	reconciler.SignalReader = controllerSignalReaderFunc(
+		func(context.Context, string) (workloadautoscaler.Signals, error) {
+			return workloadautoscaler.Signals{}, errors.New("control API unavailable")
+		},
+	)
+	reconcileCluster(t, reconciler, key)
+	if err := k8sClient.Get(context.Background(), workerKey, &worker); err != nil {
+		t.Fatal(err)
+	}
+	if worker.Spec.Replicas == nil || *worker.Spec.Replicas != 12 {
+		t.Fatalf("Worker replicas after signal failure = %v, want 12", worker.Spec.Replicas)
+	}
+}
+
 func TestNormalizeClusterSpecRejectsAutoscalingControlPlaneOrInvalidBounds(t *testing.T) {
 	for name, spec := range map[string]sluicev1.SluiceClusterSpec{
 		"even control quorum": {Replicas: 4},
@@ -229,5 +321,31 @@ func TestNormalizeClusterSpecRejectsAutoscalingControlPlaneOrInvalidBounds(t *te
 				t.Fatal("invalid cluster spec was accepted")
 			}
 		})
+	}
+}
+
+func TestNormalizeClusterSpecDefaultsAndHonorsWorkloadScaleDownWindow(t *testing.T) {
+	base := sluicev1.SluiceClusterSpec{
+		Replicas: 3, WorkersPerNode: 100,
+		Autoscaling: &sluicev1.WorkerAutoscalingSpec{
+			Enabled: true, Mode: "workload", MinReplicas: 2, MaxReplicas: 20,
+		},
+	}
+	defaulted, err := normalizeClusterSpec(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := defaulted.workloadAutoscaling.ScaleDownStabilization; got != 5*time.Minute {
+		t.Fatalf("default scale-down stabilization = %s, want 5m", got)
+	}
+	base.Autoscaling.Workload = &sluicev1.WorkloadAutoscalingSpec{
+		ScaleDownStabilizationSeconds: ptr(int32(0)),
+	}
+	explicitZero, err := normalizeClusterSpec(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := explicitZero.workloadAutoscaling.ScaleDownStabilization; got != 0 {
+		t.Fatalf("explicit scale-down stabilization = %s, want 0", got)
 	}
 }

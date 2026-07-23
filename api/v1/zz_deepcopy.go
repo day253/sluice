@@ -55,6 +55,14 @@ func (in *SluiceClusterSpec) DeepCopyInto(out *SluiceClusterSpec) {
 
 func (in *WorkerAutoscalingSpec) DeepCopyInto(out *WorkerAutoscalingSpec) {
 	*out = *in
+	if in.Workload != nil {
+		clone := *in.Workload
+		if in.Workload.ScaleDownStabilizationSeconds != nil {
+			value := *in.Workload.ScaleDownStabilizationSeconds
+			clone.ScaleDownStabilizationSeconds = &value
+		}
+		out.Workload = &clone
+	}
 	if in.Metrics != nil {
 		out.Metrics = make([]autoscalingv2.MetricSpec, len(in.Metrics))
 		for i := range in.Metrics {

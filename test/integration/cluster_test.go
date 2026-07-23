@@ -15,22 +15,34 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	hashicorpraft "github.com/hashicorp/raft"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	k8stypes "k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	k8slog "sigs.k8s.io/controller-runtime/pkg/log"
 
+	workloadautoscaler "github.com/day253/sluice/internal/autoscaler"
 	metricspkg "github.com/day253/sluice/pkg/metrics"
 	"github.com/day253/sluice/pkg/node"
 	"github.com/day253/sluice/pkg/queue"
@@ -1080,7 +1092,7 @@ func TestStatelessWorkerRoleSplit(t *testing.T) {
 		workerInfo := controls[1].RaftCluster().FSM().GetAllNodes()["worker-0"]
 		allocation, allocated := controls[1].RaftCluster().FSM().GetAllocation("worker-0")
 		if workerInfo == nil || workerInfo.Status != types.NodeStatusUp ||
-			!allocated || allocation.Tenants["role-split"] == 0 {
+			!allocated || sumIntegrationWorkers(allocation.Tenants) == 0 {
 			t.Fatalf("connected Worker did not remain active through Leader recovery: node=%+v allocation=%+v",
 				workerInfo, allocation)
 		}
@@ -1226,6 +1238,535 @@ func TestHTTPBatchSubmitThroughFollower(t *testing.T) {
 		t.Fatalf("idempotent batch retry processed %d tasks, want %d", got, taskCount)
 	}
 }
+
+// TestAtomicHundredTenantLoadThroughFollowerHTTP locks UI-LOAD-001 at the
+// production boundary. The browser operation is deliberately only a composer:
+// tenant upserts and one round-robin task stream still cross follower HTTP,
+// leader-owned Raft commits, allocation, execution, and final-state recovery.
+func TestAtomicHundredTenantLoadThroughFollowerHTTP(t *testing.T) {
+	tc := newTestCluster(t, 3, 100)
+	defer tc.shutdown()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	const tenantCount = 100
+	const tasksPerTenant = 2
+	type tenantJob struct {
+		index int
+		err   error
+	}
+	jobs := make(chan int)
+	results := make(chan tenantJob, tenantCount)
+	var workers sync.WaitGroup
+	for worker := 0; worker < 12; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				tenantID := fmt.Sprintf("load-lab-%03d", index+1)
+				body := strings.NewReader(fmt.Sprintf(
+					`{"name":"Load Lab %03d","max_workers":2}`, index+1,
+				))
+				request, err := http.NewRequest(
+					http.MethodPut,
+					"http://"+tc.httpAddrs[follower]+"/api/v1/admin/tenants/"+tenantID,
+					body,
+				)
+				if err == nil {
+					request.Header.Set("Content-Type", "application/json")
+					var response *http.Response
+					response, err = client.Do(request)
+					if err == nil {
+						payload, readErr := io.ReadAll(response.Body)
+						_ = response.Body.Close()
+						if readErr != nil {
+							err = readErr
+						} else if response.StatusCode != http.StatusOK {
+							err = fmt.Errorf("status=%s body=%s", response.Status, payload)
+						}
+					}
+				}
+				results <- tenantJob{index: index, err: err}
+			}
+		}()
+	}
+	for index := 0; index < tenantCount; index++ {
+		jobs <- index
+	}
+	close(jobs)
+	workers.Wait()
+	close(results)
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("upsert load-lab-%03d: %v", result.index+1, result.err)
+		}
+	}
+
+	tc.waitFor(func() bool {
+		return len(tc.fsms().GetAllTenants()) == tenantCount
+	}, 20*time.Second, "100 frontend-created tenants replicated")
+	tc.waitAllocation(20 * time.Second)
+
+	submission := types.BatchTaskSubmitRequest{
+		Tasks: make([]types.TaskSubmitRequest, 0, tenantCount*tasksPerTenant),
+	}
+	for taskIndex := 0; taskIndex < tasksPerTenant; taskIndex++ {
+		for tenantIndex := 0; tenantIndex < tenantCount; tenantIndex++ {
+			tenantID := fmt.Sprintf("load-lab-%03d", tenantIndex+1)
+			submission.Tasks = append(submission.Tasks, types.TaskSubmitRequest{
+				TenantID: tenantID,
+				Payload: json.RawMessage(fmt.Sprintf(
+					`{"source":"load-lab","index":%d}`, taskIndex,
+				)),
+				IdempotencyKey: fmt.Sprintf(
+					"ui-load-001:%s:%d", tenantID, taskIndex,
+				),
+			})
+		}
+	}
+	body, err := json.Marshal(submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("submit round-robin load: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		payload, _ := io.ReadAll(response.Body)
+		t.Fatalf("submit status=%s body=%s", response.Status, payload)
+	}
+	var submitted types.BatchTaskResponse
+	if err := json.NewDecoder(response.Body).Decode(&submitted); err != nil {
+		t.Fatal(err)
+	}
+	if len(submitted.Tasks) != tenantCount*tasksPerTenant {
+		t.Fatalf("accepted tasks = %d, want %d", len(submitted.Tasks), tenantCount*tasksPerTenant)
+	}
+
+	tc.waitFor(func() bool {
+		for _, task := range submitted.Tasks {
+			result := tc.fsms().GetResult(task.TaskID)
+			if result == nil || result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, "100-tenant load reaches durable final state")
+	for tenantIndex := 0; tenantIndex < tenantCount; tenantIndex++ {
+		tenantID := fmt.Sprintf("load-lab-%03d", tenantIndex+1)
+		if count := tc.proc.processedByTenant(tenantID); count != tasksPerTenant {
+			t.Fatalf("%s processed %d tasks, want %d", tenantID, count, tasksPerTenant)
+		}
+	}
+	for _, task := range submitted.Tasks {
+		if count := tc.proc.processedTaskCount(task.TaskID); count != 1 {
+			t.Fatalf("task %s processed %d times, want exactly once", task.TaskID, count)
+		}
+	}
+	var lastSnapshot map[string]struct {
+		Inflight int `json:"inflight"`
+	}
+	tc.waitFor(func() bool {
+		tenantsResponse, getErr := client.Get(
+			"http://" + tc.httpAddrs[follower] + "/api/v1/admin/tenants",
+		)
+		if getErr != nil {
+			return false
+		}
+		defer tenantsResponse.Body.Close()
+		if tenantsResponse.StatusCode != http.StatusOK {
+			return false
+		}
+		var snapshot map[string]struct {
+			Inflight int `json:"inflight"`
+		}
+		if decodeErr := json.NewDecoder(tenantsResponse.Body).Decode(&snapshot); decodeErr != nil {
+			return false
+		}
+		lastSnapshot = snapshot
+		if len(snapshot) != tenantCount {
+			return false
+		}
+		for _, tenant := range snapshot {
+			if tenant.Inflight != 0 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "Follower tenant mirror observes zero unfinished tasks")
+	for tenantID, tenant := range lastSnapshot {
+		if tenant.Inflight != 0 {
+			t.Fatalf("%s has %d unfinished tasks after convergence", tenantID, tenant.Inflight)
+		}
+	}
+}
+
+// TestWorkloadAutoscalerReadsRealClusterBacklogAndScalesOnlyWorkers preserves
+// HPA-003 across the real Raft, follower HTTP, allocator, and execution path.
+// A sleeping Processor keeps CPU irrelevant while the current unfinished and
+// allocated-Worker mirrors drive the production autoscaler policy.
+func TestWorkloadAutoscalerReadsRealClusterBacklogAndScalesOnlyWorkers(t *testing.T) {
+	k8slog.SetLogger(logr.Discard())
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	executionWorkers := make([]*node.StatelessWorker, 0, 2)
+	for index := 0; index < 2; index++ {
+		execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+			NodeID:     fmt.Sprintf("autoscale-worker-%d", index),
+			APIAddress: "127.0.0.1:0", ControllerAddress: tc.httpAddrs[0],
+			TotalWorkers: 20,
+		}, tc.proc, zap.NewNop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		executionWorkers = append(executionWorkers, execution)
+		go func() { _ = execution.Start() }()
+	}
+	defer func() {
+		for _, execution := range executionWorkers {
+			_ = execution.Shutdown(5 * time.Second)
+		}
+	}()
+	tc.waitFor(func() bool {
+		nodes := tc.fsms().GetAllNodes()
+		for index := 0; index < len(executionWorkers); index++ {
+			info := nodes[fmt.Sprintf("autoscale-worker-%d", index)]
+			if info == nil || info.Role != types.NodeRoleWorker ||
+				info.Status != types.NodeStatusUp {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "stateless Worker Pods register")
+
+	const tenantID = "autoscale-backlog"
+	tc.addTenant(tenantID, 40)
+	tc.waitAllocation(10 * time.Second)
+	started, release := tc.proc.gate(tenantID)
+	defer release()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	submission := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, 100)}
+	for index := range submission.Tasks {
+		submission.Tasks[index] = types.TaskSubmitRequest{
+			TenantID:       tenantID,
+			Payload:        json.RawMessage(fmt.Sprintf(`{"index":%d}`, index)),
+			IdempotencyKey: fmt.Sprintf("hpa-003:%d", index),
+		}
+	}
+	body, err := json.Marshal(submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := (&http.Client{Timeout: 10 * time.Second}).Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		payload, _ := io.ReadAll(response.Body)
+		t.Fatalf("submit status=%s body=%s", response.Status, payload)
+	}
+	var accepted types.BatchTaskResponse
+	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+		t.Fatal(err)
+	}
+	if len(accepted.Tasks) != len(submission.Tasks) {
+		t.Fatalf("accepted tasks = %d, want %d", len(accepted.Tasks), len(submission.Tasks))
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("real Worker did not start gated backlog")
+	}
+
+	reader := workloadautoscaler.HTTPReader{}
+	signals, err := reader.Read(
+		context.Background(),
+		"http://"+tc.httpAddrs[follower],
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signals.Backlog != 100 || signals.WorkerCapacity != 40 ||
+		signals.AllocatedWorkers < 1 {
+		t.Fatalf("real cluster workload signals = %+v", signals)
+	}
+
+	scheme := k8sruntime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	control := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "sluice", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: integrationPtr(int32(3)),
+		},
+	}
+	worker := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "sluice-worker", Namespace: "default"},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: integrationPtr(int32(2)),
+		},
+	}
+	serviceHost, servicePortText, err := net.SplitHostPort(tc.httpAddrs[follower])
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicePort, err := strconv.Atoi(servicePortText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "sluice-api", Namespace: "default"},
+		Spec:       corev1.ServiceSpec{ClusterIP: serviceHost},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(control, worker, service).Build()
+	config := workloadautoscaler.DefaultConfig()
+	config.MinReplicas, config.MaxReplicas = 2, 20
+	config.WorkersPerPod = 20
+	config.TargetBacklogPerPod = 10
+	config.ScaleUpPods = 3
+	runner := &workloadautoscaler.Runner{
+		Client: k8sClient, Namespace: "default", StatefulSet: "sluice-worker",
+		SluiceURL:     "http://fake-dns.invalid:9090",
+		SluiceService: "sluice-api", SluicePort: int32(servicePort),
+		Policy: workloadautoscaler.Policy{Config: config},
+		Now:    func() time.Time { return time.Unix(1000, 0) },
+	}
+	if err := runner.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]int32{"sluice": 3, "sluice-worker": 5} {
+		var statefulSet appsv1.StatefulSet
+		if err := k8sClient.Get(
+			context.Background(),
+			k8stypes.NamespacedName{Name: name, Namespace: "default"},
+			&statefulSet,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != want {
+			t.Fatalf("%s replicas = %v, want %d", name, statefulSet.Spec.Replicas, want)
+		}
+	}
+
+	release()
+	tc.waitFor(func() bool {
+		for _, task := range accepted.Tasks {
+			if result := tc.fsms().GetResult(task.TaskID); result == nil ||
+				result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, "autoscaling workload drains after Processor release")
+}
+
+// TestWorkloadAutoscalerIgnoresAllocationForDownWorker preserves HPA-006
+// through real Raft replication and follower HTTP. A rolling replacement can
+// make a Worker down before the next allocation plan commits; its stale
+// allocation must not inflate utilization against the smaller live capacity.
+func TestWorkloadAutoscalerIgnoresAllocationForDownWorker(t *testing.T) {
+	tc := newTestClusterWithAllocatorInterval(t, 3, 20, time.Hour)
+	defer tc.shutdown()
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader")
+	}
+	apply := func(op string, payload any) {
+		t.Helper()
+		command := raftpkg.MustMarshalCommand(op, payload)
+		if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(command, 5*time.Second).Error(); err != nil {
+			t.Fatalf("apply %s: %v", op, err)
+		}
+	}
+	apply(raftpkg.OpNodeUp, types.NodeInfo{
+		ID: "rolling-live", Role: types.NodeRoleWorker, SessionID: "live-session",
+		Address: "127.0.0.1:1", Status: types.NodeStatusUp, TotalWorkers: 100,
+	})
+	apply(raftpkg.OpNodeUp, types.NodeInfo{
+		ID: "rolling-old", Role: types.NodeRoleWorker, SessionID: "old-session",
+		Address: "127.0.0.1:2", Status: types.NodeStatusUp, TotalWorkers: 100,
+	})
+	apply(raftpkg.OpNodeDown, raftpkg.NodeDownData{ID: "rolling-old"})
+	apply(raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"rolling-live": {
+			NodeID: "rolling-live", Tenants: map[string]int{"rolling": 50},
+		},
+		"rolling-old": {
+			NodeID: "rolling-old", Tenants: map[string]int{"rolling": 100},
+		},
+	})
+
+	follower := (leader + 1) % len(tc.nodes)
+	reader := workloadautoscaler.HTTPReader{}
+	var last workloadautoscaler.Signals
+	tc.waitFor(func() bool {
+		signals, err := reader.Read(context.Background(), "http://"+tc.httpAddrs[follower])
+		if err != nil {
+			return false
+		}
+		last = signals
+		return signals.WorkerCapacity == 100 && signals.AllocatedWorkers == 50
+	}, 10*time.Second, "follower workload mirror excludes down Worker allocation")
+	if last.WorkerCapacity != 100 || last.AllocatedWorkers != 50 {
+		t.Fatalf("rolling workload signals = %+v", last)
+	}
+}
+
+// TestWorkloadAutoscalerBypassesExternalProxyAndRestoresMinimum preserves
+// HPA-004 at process startup, where net/http first observes HTTP_PROXY. The
+// child starts a real three-voter cluster, exposes its real API on a
+// non-loopback address, and proves that the production signal reader reaches
+// it directly while the replica controller restores its minimum independently
+// of signal availability.
+func TestWorkloadAutoscalerBypassesExternalProxyAndRestoresMinimum(t *testing.T) {
+	const helper = "SLUICE_HPA_004_PROXY_HELPER"
+	if os.Getenv(helper) != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx, os.Args[0],
+			"-test.run=^TestWorkloadAutoscalerBypassesExternalProxyAndRestoresMinimum$",
+			"-test.count=1",
+		)
+		environment := make([]string, 0, len(os.Environ())+5)
+		for _, value := range os.Environ() {
+			key := strings.ToUpper(strings.SplitN(value, "=", 2)[0])
+			switch key {
+			case "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY":
+				continue
+			default:
+				environment = append(environment, value)
+			}
+		}
+		command.Env = append(environment,
+			helper+"=1",
+			"HTTP_PROXY=http://127.0.0.1:1",
+			"HTTPS_PROXY=http://127.0.0.1:1",
+			"NO_PROXY=",
+		)
+		output, err := command.CombinedOutput()
+		if ctx.Err() != nil {
+			t.Fatalf("HPA-004 helper exceeded deadline: %s", output)
+		}
+		if err != nil {
+			t.Fatalf("HPA-004 helper failed: %v\n%s", err, output)
+		}
+		return
+	}
+
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+	tc.addTenant("proxy-direct", 5)
+
+	target, err := url.Parse("http://" + tc.httpAddrs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	productionAPI := httputil.NewSingleHostReverseProxy(target)
+	listener, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: productionAPI, ReadHeaderTimeout: 3 * time.Second}
+	go func() { _ = server.Serve(listener) }()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+	}()
+
+	host := firstNonLoopbackIPv4(t)
+	port := listener.Addr().(*net.TCPAddr).Port
+	sluiceURL := "http://" + net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	signals, err := (workloadautoscaler.HTTPReader{}).Read(context.Background(), sluiceURL)
+	if err != nil {
+		t.Fatalf("cluster-internal signal read used HTTP_PROXY: %v", err)
+	}
+	if signals.Backlog != 0 {
+		t.Fatalf("real cluster backlog = %d, want 0", signals.Backlog)
+	}
+
+	scheme := k8sruntime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	control := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "sluice", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: integrationPtr(int32(3))},
+	}
+	worker := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "sluice-worker", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: integrationPtr(int32(1))},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(control, worker).Build()
+	config := workloadautoscaler.DefaultConfig()
+	config.MinReplicas, config.MaxReplicas = 5, 20
+	runner := &workloadautoscaler.Runner{
+		Client: k8sClient, Namespace: "default", StatefulSet: "sluice-worker",
+		SluiceURL: sluiceURL, Policy: workloadautoscaler.Policy{Config: config},
+	}
+	if err := runner.ReconcileOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]int32{"sluice": 3, "sluice-worker": 5} {
+		var statefulSet appsv1.StatefulSet
+		if err := k8sClient.Get(
+			context.Background(),
+			k8stypes.NamespacedName{Name: name, Namespace: "default"},
+			&statefulSet,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if statefulSet.Spec.Replicas == nil || *statefulSet.Spec.Replicas != want {
+			t.Fatalf("%s replicas = %v, want %d", name, statefulSet.Spec.Replicas, want)
+		}
+	}
+}
+
+func firstNonLoopbackIPv4(t *testing.T) string {
+	t.Helper()
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, address := range addresses {
+		ip, _, err := net.ParseCIDR(address.String())
+		if err == nil && ip.To4() != nil && !ip.IsLoopback() {
+			return ip.String()
+		}
+	}
+	t.Skip("HPA-004 requires a non-loopback IPv4 address")
+	return ""
+}
+
+func integrationPtr[T any](value T) *T { return &value }
 
 // TestPerformanceDiagnosticsProxyFromFollower covers OBS-001 through the
 // production boundary: real follower HTTP forwarding, leader-owned assignment
@@ -2475,6 +3016,118 @@ func TestAdaptiveIdleBorrowing(t *testing.T) {
 		}
 		return borrowed["borrower"] > 0 && borrowed["other"] > 0 && effectiveTotal <= 5
 	}, 12*time.Second, "spare workers shared by two backlogged tenants")
+}
+
+// TestManyTenantsRespectPerWorkerNodeCapacity preserves SCHED-005 through a
+// real three-voter cluster, stateless Worker registration, Leader allocation,
+// Raft Apply, and the current allocation mirror. More one-worker tenants than
+// one instance can hold must spill deterministically to the next Worker.
+func TestManyTenantsRespectPerWorkerNodeCapacity(t *testing.T) {
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no Raft leader")
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpSetControlNodes, raftpkg.SetControlNodesData{
+			NodeIDs: []string{"node-0", "node-1", "node-2"},
+		}), 5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("migrate voters to control-only role: %v", err)
+	}
+	tc.waitFor(func() bool {
+		nodes := tc.fsms().GetAllNodes()
+		for index := 0; index < 3; index++ {
+			info := nodes[fmt.Sprintf("node-%d", index)]
+			if info == nil || info.Role != types.NodeRoleControl || info.TotalWorkers != 0 {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, "Raft voters become control-only")
+
+	executionWorkers := make([]*node.StatelessWorker, 0, 2)
+	for index := 0; index < 2; index++ {
+		execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+			NodeID: fmt.Sprintf("capacity-worker-%d", index), APIAddress: "127.0.0.1:0",
+			ControllerAddress: tc.httpAddrs[0], TotalWorkers: 3,
+		}, tc.proc, zap.NewNop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		executionWorkers = append(executionWorkers, execution)
+		go func() { _ = execution.Start() }()
+	}
+	defer func() {
+		for _, execution := range executionWorkers {
+			_ = execution.Shutdown(5 * time.Second)
+		}
+	}()
+	tc.waitFor(func() bool {
+		nodes := tc.fsms().GetAllNodes()
+		for index := 0; index < len(executionWorkers); index++ {
+			info := nodes[fmt.Sprintf("capacity-worker-%d", index)]
+			if info == nil || info.Role != types.NodeRoleWorker ||
+				info.Status != types.NodeStatusUp || info.TotalWorkers != 3 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "capacity Workers register")
+
+	tenantIDs := make([]string, 5)
+	for index := range tenantIDs {
+		tenantIDs[index] = fmt.Sprintf("capacity-tenant-%d", index)
+		tc.addTenant(tenantIDs[index], 5)
+	}
+
+	var last map[string]*types.NodeAllocation
+	tc.waitFor(func() bool {
+		last = tc.fsms().GetAllAllocations()
+		perTenant := make(map[string]int, len(tenantIDs))
+		total := 0
+		for index := 0; index < len(executionWorkers); index++ {
+			allocation := last[fmt.Sprintf("capacity-worker-%d", index)]
+			if allocation == nil {
+				return false
+			}
+			nodeTotal := 0
+			for tenantID, workers := range allocation.Tenants {
+				nodeTotal += workers
+				perTenant[tenantID] += workers
+			}
+			if nodeTotal > 3 {
+				return false
+			}
+			total += nodeTotal
+		}
+		if total != 6 {
+			return false
+		}
+		for _, tenantID := range tenantIDs {
+			if perTenant[tenantID] < 1 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "many tenants stay within every Worker node capacity")
+
+	for index := 0; index < len(executionWorkers); index++ {
+		nodeID := fmt.Sprintf("capacity-worker-%d", index)
+		if total := sumIntegrationWorkers(last[nodeID].Tenants); total > 3 {
+			t.Fatalf("%s allocation = %d, capacity 3", nodeID, total)
+		}
+	}
+}
+
+func sumIntegrationWorkers(workers map[string]int) int {
+	total := 0
+	for _, count := range workers {
+		total += count
+	}
+	return total
 }
 
 // TestOversubscription verifies the max-min fairness allocation when the sum

@@ -125,7 +125,109 @@ func TestWorkerAutoscalingTargetsOnlyStatelessStatefulSet(t *testing.T) {
 	}
 }
 
-func TestAutoscalingDefaultsProtectWorkerDrain(t *testing.T) {
+func TestWorkloadAutoscalingTargetsOnlyStatelessStatefulSet(t *testing.T) {
+	data, err := os.ReadFile("../templates/workload-autoscaler.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, required := range []string{
+		`eq (default "workload" .Values.worker.autoscaling.mode) "workload"`,
+		`/usr/local/bin/sluice-autoscaler`,
+		`--statefulset={{ include "sluice.fullname" . }}-worker`,
+		`--sluice-service={{ include "sluice.fullname" . }}`,
+		`--target-backlog-per-pod=`,
+		`--target-worker-utilization=`,
+		`resources: ["statefulsets"]`,
+		`verbs: ["get", "list", "watch", "patch", "update"]`,
+		`resources: ["services"]`,
+		`verbs: ["get"]`,
+		`resources: ["leases"]`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("workload autoscaler template is missing %q", required)
+		}
+	}
+	if strings.Contains(source, `--statefulset={{ include "sluice.fullname" . }}"`) {
+		t.Fatal("workload autoscaler may not target the control/Raft StatefulSet")
+	}
+	hpaData, err := os.ReadFile("../templates/hpa.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(
+		string(hpaData),
+		`eq (default "workload" .Values.worker.autoscaling.mode) "hpa"`,
+	) {
+		t.Fatal("native HPA and workload autoscaler modes are not mutually exclusive")
+	}
+}
+
+func TestRemoteDeployWaitsForWorkloadAutoscalerMinimum(t *testing.T) {
+	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	wait := strings.Index(source, "Waiting for workload autoscaler minimum Worker capacity")
+	verify := strings.Index(source, "Verifying control and Worker topology")
+	for _, required := range []string{
+		`worker_desired="$(microk8s kubectl get`,
+		`worker_ready="$(microk8s kubectl get`,
+		`if [ "${worker_desired}" -ge 50 ] && [ "${worker_ready}" -ge 50 ]`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("remote deployment is missing autoscaler convergence check %q", required)
+		}
+	}
+	if wait < 0 || verify < 0 || wait >= verify {
+		t.Fatal("minimum Worker capacity must converge before topology verification")
+	}
+}
+
+func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
+	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, required := range []string{
+		`[ "${worker_count}" -lt 50 ]`,
+		`[ "${worker_count}" -gt 100 ]`,
+		`worker_capacity="$((worker_count * 100))"`,
+		`--controls 5 --workers "${worker_count}" --worker-capacity "${worker_capacity}"`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("remote topology gate is not autoscaling-aware: missing %q", required)
+		}
+	}
+	if strings.Contains(source, `--controls 5 --workers 50 --worker-capacity 5000`) {
+		t.Fatal("remote topology gate still requires the autoscaler to remain at its minimum")
+	}
+}
+
+func TestRemoteRaftMigrationSelectsOnlyControlPods(t *testing.T) {
+	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	start := strings.Index(source, "Migrating existing Raft members")
+	end := strings.Index(source, "Upgrading Helm release")
+	if start < 0 || end <= start {
+		t.Fatal("cannot locate remote Raft migration block")
+	}
+	migration := source[start:end]
+	selector := `app.kubernetes.io/component=control`
+	if strings.Count(migration, selector) < 2 {
+		t.Fatalf("Raft migration selectors do not consistently require %q", selector)
+	}
+	if strings.Contains(migration, "worker-autoscaler") {
+		t.Fatal("Raft migration must not name or select the workload autoscaler")
+	}
+}
+
+func TestAutoscalingDefaultsProtectWorkerDrainAndReactToBacklog(t *testing.T) {
 	data, err := os.ReadFile("../values.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -133,6 +235,8 @@ func TestAutoscalingDefaultsProtectWorkerDrain(t *testing.T) {
 	values := string(data)
 	for _, required := range []string{
 		"autoscaling:", "enabled: false", "minReplicas: 5", "maxReplicas: 100",
+		"mode: workload", "targetBacklogPerPod: 400", "targetWorkerUtilization: 70",
+		"scaleUpPods: 10",
 		"averageUtilization: 70", "stabilizationWindowSeconds: 300",
 	} {
 		if !strings.Contains(values, required) {
@@ -150,6 +254,8 @@ func TestChartAndStandaloneCRDsExposeWorkerAutoscaling(t *testing.T) {
 		source := string(data)
 		for _, required := range []string{
 			"workerReplicas:", "autoscaling:", "minReplicas:", "maxReplicas:",
+			"enum: [hpa, workload]", "targetBacklogPerPod:",
+			"targetWorkerUtilization:", "scaleDownStabilizationSeconds:",
 			"x-kubernetes-preserve-unknown-fields: true", "desiredWorkerReplicas:",
 		} {
 			if !strings.Contains(source, required) {
@@ -182,5 +288,8 @@ func TestOptionalOperatorCanManageWorkerHPA(t *testing.T) {
 	}
 	if !strings.Contains(string(dockerfile), "/usr/local/bin/sluice-operator") {
 		t.Fatal("runtime image does not contain the CRD operator binary")
+	}
+	if !strings.Contains(string(dockerfile), "/usr/local/bin/sluice-autoscaler") {
+		t.Fatal("runtime image does not contain the workload autoscaler binary")
 	}
 }

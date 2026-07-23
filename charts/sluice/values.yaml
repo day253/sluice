@@ -7,12 +7,23 @@ control:
 # and session fencing, but no PVC and no Raft membership.
 worker:
   replicas: 50
-  # HPA only scales the stateless Worker StatefulSet. The Raft/control
-  # StatefulSet above always remains at control.replicas.
+  # Autoscaling only changes the stateless Worker StatefulSet. "workload"
+  # directly uses unfinished backlog and allocated Worker utilization and does
+  # not require metrics-server. "hpa" renders a native autoscaling/v2 HPA for
+  # clusters that already provide resource/custom/external Metrics APIs.
   autoscaling:
     enabled: false
+    mode: workload
     minReplicas: 5
     maxReplicas: 100
+    workload:
+      pollIntervalSeconds: 5
+      targetBacklogPerPod: 400
+      targetWorkerUtilization: 70
+      scaleUpPercent: 100
+      scaleUpPods: 10
+      scaleDownPercent: 25
+      scaleDownStabilizationSeconds: 300
     metrics:
       - type: Resource
         resource:
@@ -101,3 +112,12 @@ operator:
     limits:
       cpu: 250m
       memory: 256Mi
+
+workloadAutoscaler:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi

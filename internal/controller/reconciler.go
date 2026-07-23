@@ -21,12 +21,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	sluicev1 "github.com/day253/sluice/api/v1"
+	workloadautoscaler "github.com/day253/sluice/internal/autoscaler"
 )
 
 // SluiceClusterReconciler reconciles a SluiceCluster object.
 type SluiceClusterReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme           *runtime.Scheme
+	SignalReader     workloadautoscaler.SignalReader
+	Now              func() time.Time
+	AutoscalerStates workloadautoscaler.StateStore
 }
 
 // +kubebuilder:rbac:groups=sluice.day253.github.com,resources=sluiceclusters,verbs=get;list;watch;create;update;patch;delete
@@ -234,7 +238,7 @@ func (r *SluiceClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	hpa := &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{
 		Name: cluster.Name + "-worker", Namespace: cluster.Namespace,
 	}}
-	if spec.autoscaling.Enabled {
+	if spec.autoscaling.Enabled && spec.autoscalingMode == "hpa" {
 		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, hpa, func() error {
 			hpa.Labels = workerLabels
 			hpa.Spec = autoscalingv2.HorizontalPodAutoscalerSpec{
@@ -254,22 +258,66 @@ func (r *SluiceClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("get disabled worker hpa: %w", err)
 	}
 
+	if spec.autoscaling.Enabled && spec.autoscalingMode == "workload" {
+		reader := r.SignalReader
+		if reader == nil {
+			reader = workloadautoscaler.HTTPReader{}
+		}
+		signals, readErr := reader.Read(ctx, "http://"+controllerHost+":9090")
+		if readErr != nil {
+			// Missing or stale workload signals must never cause scale-down.
+			log.FromContext(ctx).Error(readErr, "read workload autoscaling signals; retaining Worker replicas")
+		} else {
+			current := spec.autoscaling.MinReplicas
+			if workerSTS.Spec.Replicas != nil {
+				current = *workerSTS.Spec.Replicas
+			}
+			now := time.Now()
+			if r.Now != nil {
+				now = r.Now()
+			}
+			stateKey := cluster.Namespace + "/" + cluster.Name
+			recommendation := r.AutoscalerStates.Recommend(
+				stateKey, workloadautoscaler.Policy{Config: spec.workloadAutoscaling},
+				current, signals, now,
+			)
+			if recommendation.Desired != current {
+				before := workerSTS.DeepCopy()
+				workerSTS.Spec.Replicas = ptr(recommendation.Desired)
+				if err := r.Patch(ctx, workerSTS, client.MergeFrom(before)); err != nil {
+					return ctrl.Result{}, fmt.Errorf("scale Worker StatefulSet from workload: %w", err)
+				}
+				r.AutoscalerStates.RecordApplied(stateKey, now)
+				log.FromContext(ctx).Info("scaled CRD Worker StatefulSet from workload",
+					"from", current, "to", recommendation.Desired,
+					"backlog", signals.Backlog, "allocatedWorkers", signals.AllocatedWorkers,
+					"workerCapacity", signals.WorkerCapacity, "reason", recommendation.Reason)
+			}
+		}
+	}
+
 	cluster.Status.ReadyReplicas = controlSTS.Status.ReadyReplicas
 	cluster.Status.ControlReadyReplicas = controlSTS.Status.ReadyReplicas
 	cluster.Status.WorkerReadyReplicas = workerSTS.Status.ReadyReplicas
 	cluster.Status.DesiredWorkerReplicas = spec.workerReplicas
-	if spec.autoscaling.Enabled {
+	if spec.autoscaling.Enabled && spec.autoscalingMode == "hpa" {
 		cluster.Status.DesiredWorkerReplicas = hpa.Status.DesiredReplicas
 		if cluster.Status.DesiredWorkerReplicas == 0 {
 			cluster.Status.DesiredWorkerReplicas = spec.autoscaling.MinReplicas
 		}
+	} else if spec.autoscaling.Enabled && workerSTS.Spec.Replicas != nil {
+		cluster.Status.DesiredWorkerReplicas = *workerSTS.Spec.Replicas
 	}
 	cluster.Status.Leader = ""
 	if err := r.Status().Update(ctx, &cluster); err != nil {
 		log.FromContext(ctx).Error(err, "failed to update status")
 	}
 
-	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	requeueAfter := 30 * time.Second
+	if spec.autoscaling.Enabled && spec.autoscalingMode == "workload" {
+		requeueAfter = spec.workloadPollInterval
+	}
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 func (r *SluiceClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -333,13 +381,16 @@ func (r *TenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func ptr[T any](v T) *T { return &v }
 
 type normalizedSpec struct {
-	controlReplicas int32
-	workerReplicas  int32
-	workersPerNode  int32
-	image           string
-	logLevel        string
-	resources       corev1.ResourceRequirements
-	autoscaling     sluicev1.WorkerAutoscalingSpec
+	controlReplicas      int32
+	workerReplicas       int32
+	workersPerNode       int32
+	image                string
+	logLevel             string
+	resources            corev1.ResourceRequirements
+	autoscaling          sluicev1.WorkerAutoscalingSpec
+	autoscalingMode      string
+	workloadAutoscaling  workloadautoscaler.Config
+	workloadPollInterval time.Duration
 }
 
 func normalizeClusterSpec(in sluicev1.SluiceClusterSpec) (normalizedSpec, error) {
@@ -389,7 +440,14 @@ func normalizeClusterSpec(in sluicev1.SluiceClusterSpec) (normalizedSpec, error)
 		if out.autoscaling.MinReplicas < 1 || out.autoscaling.MaxReplicas < out.autoscaling.MinReplicas {
 			return normalizedSpec{}, fmt.Errorf("autoscaling requires 1 <= minReplicas <= maxReplicas")
 		}
-		if len(out.autoscaling.Metrics) == 0 {
+		out.autoscalingMode = strings.ToLower(out.autoscaling.Mode)
+		if out.autoscalingMode == "" {
+			out.autoscalingMode = "hpa"
+		}
+		if out.autoscalingMode != "hpa" && out.autoscalingMode != "workload" {
+			return normalizedSpec{}, fmt.Errorf("autoscaling mode must be hpa or workload")
+		}
+		if out.autoscalingMode == "hpa" && len(out.autoscaling.Metrics) == 0 {
 			target := int32(70)
 			out.autoscaling.Metrics = []autoscalingv2.MetricSpec{{
 				Type: autoscalingv2.ResourceMetricSourceType,
@@ -399,8 +457,43 @@ func normalizeClusterSpec(in sluicev1.SluiceClusterSpec) (normalizedSpec, error)
 				},
 			}}
 		}
-		if out.autoscaling.Behavior == nil {
+		if out.autoscalingMode == "hpa" && out.autoscaling.Behavior == nil {
 			out.autoscaling.Behavior = defaultWorkerHPABehavior()
+		}
+		if out.autoscalingMode == "workload" {
+			workload := workloadautoscaler.DefaultConfig()
+			workload.MinReplicas, workload.MaxReplicas = out.autoscaling.MinReplicas, out.autoscaling.MaxReplicas
+			workload.WorkersPerPod = out.workersPerNode
+			pollSeconds := int32(5)
+			if configured := out.autoscaling.Workload; configured != nil {
+				if configured.PollIntervalSeconds > 0 {
+					pollSeconds = configured.PollIntervalSeconds
+				}
+				if configured.TargetBacklogPerPod > 0 {
+					workload.TargetBacklogPerPod = configured.TargetBacklogPerPod
+				}
+				if configured.TargetWorkerUtilization > 0 {
+					workload.TargetWorkerUtilization = configured.TargetWorkerUtilization
+				}
+				if configured.ScaleUpPercent > 0 {
+					workload.ScaleUpPercent = configured.ScaleUpPercent
+				}
+				if configured.ScaleUpPods > 0 {
+					workload.ScaleUpPods = configured.ScaleUpPods
+				}
+				if configured.ScaleDownPercent > 0 {
+					workload.ScaleDownPercent = configured.ScaleDownPercent
+				}
+				if configured.ScaleDownStabilizationSeconds != nil {
+					workload.ScaleDownStabilization = time.Duration(*configured.ScaleDownStabilizationSeconds) * time.Second
+				}
+			}
+			workload.ScaleUpPeriod = time.Duration(pollSeconds) * time.Second
+			if err := workload.Validate(); err != nil {
+				return normalizedSpec{}, err
+			}
+			out.workloadAutoscaling = workload
+			out.workloadPollInterval = time.Duration(pollSeconds) * time.Second
 		}
 	}
 	return out, nil

@@ -7,7 +7,7 @@ import (
 	"net/http"
 )
 
-//go:embed index.html
+//go:embed index.html loadlab.js
 var content embed.FS
 
 // Handler returns an http.Handler serving the dashboard on / and falling
@@ -22,6 +22,18 @@ func Handler(apiHandler http.Handler) http.Handler {
 		// Route /api/* to the API handler.
 		if len(r.URL.Path) >= 4 && r.URL.Path[:4] == "/api" {
 			apiHandler.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path == "/assets/loadlab.js" {
+			asset, readErr := fs.ReadFile(content, "loadlab.js")
+			if readErr != nil {
+				http.Error(w, "load lab asset unavailable", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(asset)
 			return
 		}
 		// Everything else → dashboard.

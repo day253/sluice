@@ -58,11 +58,15 @@ spec:
                       x-kubernetes-preserve-unknown-fields: true
                 autoscaling:
                   type: object
-                  description: autoscaling/v2 policy for the stateless Worker StatefulSet only
+                  description: Exclusive native-HPA or Sluice-workload scaling policy for the stateless Worker StatefulSet only
                   properties:
                     enabled:
                       type: boolean
                       default: false
+                    mode:
+                      type: string
+                      enum: [hpa, workload]
+                      default: hpa
                     minReplicas:
                       type: integer
                       minimum: 1
@@ -71,6 +75,41 @@ spec:
                       type: integer
                       minimum: 1
                       default: 100
+                    workload:
+                      type: object
+                      description: Direct Worker scaling from Sluice unfinished backlog and allocated Worker utilization
+                      properties:
+                        pollIntervalSeconds:
+                          type: integer
+                          minimum: 1
+                          default: 5
+                        targetBacklogPerPod:
+                          type: integer
+                          format: int64
+                          minimum: 1
+                          default: 400
+                        targetWorkerUtilization:
+                          type: integer
+                          minimum: 1
+                          maximum: 100
+                          default: 70
+                        scaleUpPercent:
+                          type: integer
+                          minimum: 1
+                          default: 100
+                        scaleUpPods:
+                          type: integer
+                          minimum: 1
+                          default: 10
+                        scaleDownPercent:
+                          type: integer
+                          minimum: 1
+                          maximum: 100
+                          default: 25
+                        scaleDownStabilizationSeconds:
+                          type: integer
+                          minimum: 0
+                          default: 300
                     metrics:
                       type: array
                       items:
@@ -82,6 +121,8 @@ spec:
                   x-kubernetes-validations:
                     - rule: "!self.enabled || self.minReplicas <= self.maxReplicas"
                       message: minReplicas must not exceed maxReplicas
+                    - rule: "!self.enabled || self.mode != 'workload' || has(self.workload)"
+                      message: workload mode requires workload settings
             status:
               type: object
               properties:

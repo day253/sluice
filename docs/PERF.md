@@ -570,3 +570,124 @@ autoscaling/v2 external/custom metrics adapter。指标缺失时 HPA 会显示 `
 shard 约 1.5K task/s 的 Raft Apply 上限不会因继续增加 Worker 自动提高；超过规划水位仍应
 优先拆 Multi-Raft shard。最终 `make test` 的 unit + integration 全部以 `-race -count=1`
 通过，真实集成阶段耗时 220.520 秒。
+
+### 7.7 workload autoscaler 与 100 tenant Load Lab（2026-07-24）
+
+本轮把直接 Helm 和 CRD 的 Worker 扩容增加为 `mode=workload`：每 5 秒读取当前
+unfinished、live Worker capacity 和同一 live NodeID 集合上的 allocation；默认
+`targetBacklogPerPod=400`、allocation utilization 目标 70%，扩容每轮最多增加当前 100%
+或 10 Pod 中较大者，低负载持续 300 秒后每分钟最多收回 25%。这些信号是进程本地当前镜像，
+不写 Raft/FSM/Snapshot，也不改变每 Pod 100 个 Processor 槽、tenant Limit 或 Leader-only
+assignment。远程仍是同一台 ThinkPad 的单物理故障域 MicroK8s、5 control voter/0
+non-voter；Demo Processor 每条 sleep 50～200ms。最终 Helm revision 50 和运行镜像是
+`localhost:32000/sluice:fcbfa8c-20260723173721`。
+
+真实滚动先复现并修复三类部署/观测故障：Service 名在目标 CoreDNS 被解析成
+`198.18.0.12`，而真实 ClusterIP `10.152.183.17` 返回 200；Raft 地址迁移误把共享 release
+标签的 autoscaler 当 control；Worker rollout 中 down 节点旧 allocation 与 live capacity
+相除，曾把 50 错推到 100。修复后 revision 50 顺序替换全部 50 个 Worker 期间，持续采样
+desired=50，autoscaler 无 error/scale 日志；最终部署门禁为 5 control、50 Worker、
+5000 live slots、5 voter/0 non-voter。WebUI 同样只用 live Worker 集合，retained down
+身份不再把页面误报为 55/105 和 10000 slots。
+
+Load Lab 从 Mac 浏览器经 `http://127.0.0.1:19090/` 点击内置 “100-tenant burst”：
+先并发创建/更新稳定的 `load-lab-001..100`，再按 tenant round-robin 提交每 tenant 200
+条，共 20000 条；HTTP batch=500、concurrency=4，每条 payload 含 run/recipe/index 和
+幂等键。页面从点击到首次观察到 20000 accepted 且进入 drain 不超过 6.7 秒（包含 100 次
+tenant upsert；本轮没有从浏览器 JSON 另取更细提交时间），端到端显示 20 秒、1025
+task/s、failed=0、最终 100 tenant unfinished 合计为 0。该形状与历史四 tenant 基线不同，
+因此不对 revision 45 做百分比比较。
+
+| 时刻/信号 | backlog | allocated/live capacity | StatefulSet desired | 结果 |
+|---|---:|---:|---:|---|
+| 首轮压力 | 8000 | 5000/5000 | 50→72 | utilization=100%，立即扩容 |
+| 下一轮（限速中） | 15965 | 7200/7200 | 72 | raw desired=100，等待满 5 秒 |
+| 第二次扩容 | 8910 | 7200/7200 | 72→100 | 达到远程配置 max |
+| 排空尾部 | 2196 | 8031/9200 | 100 | raw desired=100，继续排空 |
+| 稳定窗口结束 | 0 | 104/9900 | 100→75 | 低负载连续 300 秒 |
+| 限速缩容 | 0 | 104/7500 | 75→57 | 65 秒后，最多收回 25% |
+| 最终 | 0 | 104/5700 | 57→50 | 再过 60 秒回到 min，50/50 Ready |
+
+单节点 kubelet 在目标 100 时有一个 Pod 因 `Too many pods` 保持 Pending，实际峰值为 99
+个 up Worker/9900 slots；这是本次单机 scale experiment 的基础设施上限，不冒充 100
+Ready。多节点生产集群可继续使用 max=100；这台演示机若长期需要 100 Ready，应增加
+Kubernetes node 或调整经过容量评估的 kubelet pod 上限。
+
+负载窗口 Leader diagnostics 为：Create 40 Apply/20000 items/平均批次 500/平均
+113.311ms，Claim 161/20000/124/77.105ms，Complete 182/20000/109/72.827ms；三类
+error 都为 0。pending scanned/selected 为 20212/20000（1.01x），assignment/completion
+queue 最终均为 0。100 次 tenant upsert 和扩容期间的 allocation 更新单列为 100 Apply 与
+249 Apply/15154 items，不能混入四 tenant 固定基线。
+
+本地完整 `make test` 的 unit、真实 Chrome 和 integration 全部以 `-race -count=1`
+通过，集成阶段 238.681 秒；远程部署前完整集成为 213.358 秒。新增的真实 Case 包括
+100 tenant follower HTTP/Raft 最终态、低 CPU backlog 扩 Worker、进程启动时失效 Proxy、
+Service ClusterIP、down Worker 旧 allocation，以及浏览器 up/down 当前镜像。
+
+为保留历史 PERF-001 的固定形状，缩容回到 50/50 Ready 后另跑四 tenant 基线：Limit
+100/60/30/500，每 tenant 5000 条、全局逐条 round-robin；小型 JSON payload，HTTP
+batch=500、concurrency=4，开始前 unfinished=0，结束条件为 250ms 间隔连续三次
+unfinished=0。负载期间 autoscaler 在 backlog=13500/3251 时观察到 live allocation
+962/1154、capacity=5000，backlog desired≤50 且 allocation utilization 远低于 70%，
+因此 StatefulSet 全程保持 50/50，不存在拓扑混淆。
+
+| 版本/拓扑 | accepted | accepted 后排空 | 端到端 | 吞吐 | t50 | t90 | 请求错误/最终 unfinished |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| revision 45，50 Worker，单轮 | 1.314s | 11.812s | 13.125s | 1523.8 task/s | 7.507s | 11.616s | 0 / 0 |
+| revision 50，workload mode、50 Worker，单轮 | 1.728s | 9.747s | 11.476s | 1742.8 task/s | 6.355s | 9.942s | 0 / 0 |
+
+两轮形状、物理机、voter 和 Worker 数相同，revision 50 单轮观察值高 14.4%；但中间包含
+revision 46～50 的其他版本积累，且每版只有一轮，不能把差值归因于不在 task/Raft 数据
+路径执行的 autoscaler，也不能当统计 SLA。revision 50 提交阶段已经同步处理任务，观察到
+的峰值 unfinished 为 18523。
+
+从紧邻两轮远程 diagnostics 的累计差值得到本次固定轮次：Create 40 Apply/20000/
+500/约 73.911ms，Claim 180/20000/111.1/约 45.826ms，Complete
+179/20000/111.7/约 46.637ms；三类新增 error=0。pending scanned/selected 增量为
+30401/20000（1.52x），最终 assignment/completion queue 均为 0。与 100 tenant 场景的
+1.01x 不同，说明 tenant/arrival shape 仍会改变派生索引的候选检查量，但两者都远低于旧
+全量扫描的 77.1x。
+
+### 7.8 多租户节点容量边界修复后复核（2026-07-24）
+
+SCHED-005 修正 allocator 的实例放置：旧实现为每个 tenant 都从第一个 Worker
+重新开始 round-robin，108 个已空闲 tenant 的保底槽因此曾全部落到
+`sluice-sluice-worker-0`，形成 usage 108 / limit 100。新实现按稳定 tenant ID
+顺序共享一个游标，并在生成 Raft allocation command 前校验每个 NodeID 的总分配不超过
+`TotalWorkers`、全局 effective/borrowed 数量没有丢失。它只改变当前 allocation 镜像的
+实例放置，不改变 tenant Limit、max-min 结果、任务协议、单所有者 claim 或 Processor
+执行时间。
+
+远程环境仍是同一台 ThinkPad 单物理故障域、MicroK8s、5 control voter/0 non-voter、
+50 个 stateless Worker、每 Pod 100 槽，Demo Processor 每条 sleep 50～200ms。Helm
+revision 51 运行
+`localhost:32000/sluice:fcbfa8c-20260723181436`；标签中的 commit 是部署前基准，
+镜像包含本节待提交工作树。滚动替换期间持续采样的 StatefulSet desired 始终为 50，
+没有由 down Worker 旧 allocation 触发 50→100。部署后真实 FSM 中 108 个 tenant 的
+effective allocation 合计 108，50 个 Worker 的单节点最大值为 3，超过 limit 100 的节点
+为 0。
+
+固定性能形状继续使用 `perf-a..d` 四个 tenant，Limit 为 100/60/30/500，每 tenant
+5000 条、全局逐条 round-robin；小型 JSON payload 含 run/index/shape 和唯一幂等键，
+HTTP batch=500、concurrency=4。开始前四 tenant unfinished=0；100ms 条件采样，连续两次
+unfinished=0 后结束，deadline 120 秒。与 revision 50 相同物理机、协议和 50 Worker
+拓扑，可以作为相邻单轮观察，但仍不当作统计 SLA。
+
+| 版本/拓扑 | accepted | accepted 后排空 | 端到端 | 吞吐 | t50 | t90 | 请求错误/最终 unfinished |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| revision 50，SCHED-005 前，50 Worker | 1.728s | 9.747s | 11.476s | 1742.8 task/s | 6.355s | 9.942s | 0 / 0 |
+| revision 51，SCHED-005 后，50 Worker | 1.764s | 9.901s | 11.665s | 1714.5 task/s | 6.667s | 10.241s | 0 / 0 |
+
+revision 51 的峰值 unfinished 为 19507。autoscaler 在 backlog=15027/4661 时观察到
+live allocation=962/1349、capacity=5000，两次 raw desired 都为 50，StatefulSet 最终
+50/50 Ready；这说明该固定形状受 tenant Limit/分配和单 shard 共识约束，当前不需要额外
+Worker Pod。Create 为 40 Apply/20000 items/平均批次 500/平均 Apply 62.085ms，Claim
+为 176/20000/113.6/48.280ms，Complete 为 176/20000/113.6/49.524ms，三类新增
+error=0。pending scanned/selected 为 31147/20000（1.56x）；采样结束瞬间 assignment
+queue 为 3，2 秒后的明确条件复核为 assignment/completion queue 均为 0。
+
+本地完整 `make test` 的 unit、真实 Chrome 和 integration 全部以 `-race -count=1`
+通过，真实集成阶段 238.874 秒；远程部署前真实集成阶段 210.676 秒。SCHED-005 的聚焦
+单元用例构造 108 个单槽 tenant/50 个容量 100 的 Worker，并直接拒绝越界计划；集成用例
+启动真实 3-voter control 集群、2 个容量 3 的 stateless Worker 和 5 个 tenant，通过真实
+Worker 注册、Leader allocation、Raft Apply 与 follower FSM 镜像验证每实例不超过 3。

@@ -63,11 +63,22 @@ microk8s helm3 template "${RELEASE}" ./charts/sluice \
   --namespace "${NAMESPACE}" \
   --set control.replicas=5 \
   --set worker.autoscaling.enabled=true \
+  --set worker.autoscaling.mode=workload \
   --set worker.autoscaling.minReplicas=50 \
   --set worker.autoscaling.maxReplicas=100 \
-  --set operator.enabled=true >/tmp/sluice-autoscaling-rendered.yaml
+  >/tmp/sluice-workload-autoscaling-rendered.yaml
 microk8s kubectl apply --dry-run=server --namespace "${NAMESPACE}" \
-  -f /tmp/sluice-autoscaling-rendered.yaml >/dev/null
+  -f /tmp/sluice-workload-autoscaling-rendered.yaml >/dev/null
+microk8s helm3 template "${RELEASE}" ./charts/sluice \
+  --namespace "${NAMESPACE}" \
+  --set control.replicas=5 \
+  --set worker.autoscaling.enabled=true \
+  --set worker.autoscaling.mode=hpa \
+  --set worker.autoscaling.minReplicas=50 \
+  --set worker.autoscaling.maxReplicas=100 \
+  --set operator.enabled=true >/tmp/sluice-hpa-autoscaling-rendered.yaml
+microk8s kubectl apply --dry-run=server --namespace "${NAMESPACE}" \
+  -f /tmp/sluice-hpa-autoscaling-rendered.yaml >/dev/null
 
 printf '\n==> Building container on remote host\n'
 if ! docker build -t "${IMAGE}" .; then
@@ -84,9 +95,11 @@ if ! docker build -t "${IMAGE}" .; then
   mkdir -p bin
   CGO_ENABLED=0 go build -trimpath -o bin/sluice ./cmd/sluice
   CGO_ENABLED=0 go build -trimpath -o bin/sluice-operator ./cmd/operator
+  CGO_ENABLED=0 go build -trimpath -o bin/sluice-autoscaler ./cmd/autoscaler
   offline_container="$(docker create "${BASE_IMAGE}")"
   if ! docker cp bin/sluice "${offline_container}:/usr/local/bin/sluice" || \
-    ! docker cp bin/sluice-operator "${offline_container}:/usr/local/bin/sluice-operator"; then
+    ! docker cp bin/sluice-operator "${offline_container}:/usr/local/bin/sluice-operator" || \
+    ! docker cp bin/sluice-autoscaler "${offline_container}:/usr/local/bin/sluice-autoscaler"; then
     docker rm "${offline_container}" >/dev/null
     exit 1
   fi
@@ -100,7 +113,7 @@ docker push "${IMAGE}"
 printf '\n==> Migrating existing Raft members to stable per-Pod ClusterIPs\n'
 existing_pods="$(microk8s kubectl get pods \
   --namespace "${NAMESPACE}" \
-  -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE}" \
+  -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control" \
   -o name 2>/dev/null || true)"
 
 if [ -n "${existing_pods}" ]; then
@@ -126,7 +139,7 @@ if [ -n "${existing_pods}" ]; then
 
   probe_name="$(microk8s kubectl get pods \
     --namespace "${NAMESPACE}" \
-    -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE}" \
+    -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control" \
     -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{"\n"}{end}' \
     2>/dev/null | head -n 1 || true)"
 
@@ -181,6 +194,10 @@ microk8s helm3 upgrade --install "${RELEASE}" ./charts/sluice \
   --set image.pullPolicy=Always \
   --set control.replicas=5 \
   --set worker.replicas=50 \
+  --set worker.autoscaling.enabled=true \
+  --set worker.autoscaling.mode=workload \
+  --set worker.autoscaling.minReplicas=50 \
+  --set worker.autoscaling.maxReplicas=100 \
   --set raftVoters=5 \
   --set affinity.enabled=false \
   --wait \
@@ -193,11 +210,34 @@ microk8s kubectl rollout status "statefulset/${STATEFULSET}" \
 microk8s kubectl rollout status "statefulset/${WORKER_STATEFULSET}" \
   --namespace "${NAMESPACE}" \
   --timeout "${ROLLOUT_TIMEOUT}"
+microk8s kubectl rollout status "deployment/${RELEASE}-sluice-worker-autoscaler" \
+  --namespace "${NAMESPACE}" \
+  --timeout "${ROLLOUT_TIMEOUT}"
+
+printf '\n==> Waiting for workload autoscaler minimum Worker capacity\n'
+worker_min_ready=false
+for _ in $(seq 1 180); do
+  worker_desired="$(microk8s kubectl get "statefulset/${WORKER_STATEFULSET}" \
+    --namespace "${NAMESPACE}" -o jsonpath='{.spec.replicas}')"
+  worker_ready="$(microk8s kubectl get "statefulset/${WORKER_STATEFULSET}" \
+    --namespace "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}')"
+  worker_ready="${worker_ready:-0}"
+  if [ "${worker_desired}" -ge 50 ] && [ "${worker_ready}" -ge 50 ]; then
+    worker_min_ready=true
+    break
+  fi
+  sleep 1
+done
+if [ "${worker_min_ready}" != "true" ]; then
+  printf 'Workload autoscaler did not restore minimum capacity: desired=%s ready=%s\n' \
+    "${worker_desired}" "${worker_ready}" >&2
+  exit 1
+fi
 
 printf '\n==> Verifying control and Worker topology\n'
 pods="$(microk8s kubectl get pods \
   --namespace "${NAMESPACE}" \
-  -l "app.kubernetes.io/instance=${RELEASE}" \
+  -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component in (control,worker)" \
   -o name)"
 
 if [ -z "${pods}" ]; then
@@ -219,10 +259,11 @@ control_count="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
 worker_count="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
   -l "app.kubernetes.io/name=sluice-worker,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=worker" \
   --field-selector=status.phase=Running --no-headers | wc -l | tr -d ' ')"
-if [ "${control_count}" != "5" ] || [ "${worker_count}" != "50" ]; then
+if [ "${control_count}" != "5" ] || [ "${worker_count}" -lt 50 ] || [ "${worker_count}" -gt 100 ]; then
   printf 'Unexpected topology: controls=%s workers=%s\n' "${control_count}" "${worker_count}" >&2
   exit 1
 fi
+worker_capacity="$((worker_count * 100))"
 
 probe_control="$(microk8s kubectl get pods --namespace "${NAMESPACE}" \
   -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control" \
@@ -235,7 +276,7 @@ for _ in $(seq 1 60); do
     wget -qO- 'http://127.0.0.1:9090/api/v1/admin/allocations')"
   if NODES_JSON="${nodes_json}" ALLOCATIONS_JSON="${allocations_json}" \
     python3 scripts/validate-topology.py \
-      --controls 5 --workers 50 --worker-capacity 5000; then
+      --controls 5 --workers "${worker_count}" --worker-capacity "${worker_capacity}"; then
     topology_ready=true
     break
   fi

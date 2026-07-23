@@ -1,0 +1,34 @@
+apiVersion: sluice.day253.github.com/v1
+kind: SluiceCluster
+metadata:
+  name: sample-workload
+  namespace: default
+spec:
+  # Fixed control/Raft quorum. Workload scaling never changes this field.
+  replicas: 3
+  workerReplicas: 5
+  workersPerNode: 100
+  image: ghcr.io/day253/sluice:latest
+  autoscaling:
+    enabled: true
+    mode: workload
+    minReplicas: 5
+    maxReplicas: 100
+    workload:
+      pollIntervalSeconds: 5
+      # Scale toward enough Pods for current unfinished tasks. This is not a
+      # queue admission limit; tenant limits and Leader allocation still apply.
+      targetBacklogPerPod: 400
+      # Also scale when registered Worker execution slots are heavily allocated.
+      targetWorkerUtilization: 70
+      scaleUpPercent: 100
+      scaleUpPods: 10
+      scaleDownPercent: 25
+      scaleDownStabilizationSeconds: 300
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi

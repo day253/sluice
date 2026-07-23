@@ -1,4 +1,4 @@
-.PHONY: all build test unit-test integration-test bench clean deps proto docker push-docker remote-deploy run-dev run-node1 run-node2 run-node3
+.PHONY: all build build-operator build-autoscaler test unit-test integration-test bench clean deps proto docker push-docker remote-deploy run-dev run-node1 run-node2 run-node3
 
 APP      := sluice
 CMD_DIR  := ./cmd/sluice
@@ -19,6 +19,10 @@ build:
 build-operator:
 	@mkdir -p bin
 	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/sluice-operator $(OP_DIR)
+
+build-autoscaler:
+	@mkdir -p bin
+	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/sluice-autoscaler ./cmd/autoscaler
 
 # ---- Test ----
 UNIT_PACKAGES := ./api/... ./charts/... ./cmd/... ./internal/... ./pkg/...

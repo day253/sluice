@@ -32,16 +32,29 @@ type SluiceClusterSpec struct {
 	Autoscaling    *WorkerAutoscalingSpec `json:"autoscaling,omitempty"`
 }
 
-// WorkerAutoscalingSpec configures an autoscaling/v2 HPA for only the
-// stateless Worker StatefulSet. Metrics and behavior use native Kubernetes
-// types so resource, custom Pods/Object, and external backlog metrics all keep
-// their standard HPA semantics.
+// WorkerAutoscalingSpec configures exactly one horizontal scaling owner for
+// only the stateless Worker StatefulSet. Native HPA mode preserves Kubernetes
+// metric semantics; workload mode reads Sluice current-state mirrors.
 type WorkerAutoscalingSpec struct {
-	Enabled     bool                                           `json:"enabled,omitempty"`
+	Enabled bool `json:"enabled,omitempty"`
+	// Mode is "hpa" for native autoscaling/v2 metrics or "workload" for
+	// Sluice unfinished-backlog and allocated-Worker signals.
+	Mode        string                                         `json:"mode,omitempty"`
 	MinReplicas int32                                          `json:"minReplicas,omitempty"`
 	MaxReplicas int32                                          `json:"maxReplicas,omitempty"`
+	Workload    *WorkloadAutoscalingSpec                       `json:"workload,omitempty"`
 	Metrics     []autoscalingv2.MetricSpec                     `json:"metrics,omitempty"`
 	Behavior    *autoscalingv2.HorizontalPodAutoscalerBehavior `json:"behavior,omitempty"`
+}
+
+type WorkloadAutoscalingSpec struct {
+	PollIntervalSeconds           int32  `json:"pollIntervalSeconds,omitempty"`
+	TargetBacklogPerPod           int64  `json:"targetBacklogPerPod,omitempty"`
+	TargetWorkerUtilization       int32  `json:"targetWorkerUtilization,omitempty"`
+	ScaleUpPercent                int32  `json:"scaleUpPercent,omitempty"`
+	ScaleUpPods                   int32  `json:"scaleUpPods,omitempty"`
+	ScaleDownPercent              int32  `json:"scaleDownPercent,omitempty"`
+	ScaleDownStabilizationSeconds *int32 `json:"scaleDownStabilizationSeconds,omitempty"`
 }
 
 type PersistenceSpec struct {

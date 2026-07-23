@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -757,5 +759,55 @@ func TestDistributeAcrossNodes_EvenSplit(t *testing.T) {
 		if total != 50 {
 			t.Errorf("node %s: expected total ~50, got %d", na.NodeID, total)
 		}
+	}
+}
+
+func TestDistributeManySingleWorkerTenantsRespectsPerNodeCapacity(t *testing.T) {
+	e := newTestEngine(nil)
+	const (
+		tenantCount  = 108
+		nodeCount    = 50
+		nodeCapacity = 100
+	)
+	tenantAlloc := make(map[string]int, tenantCount)
+	for index := 0; index < tenantCount; index++ {
+		tenantAlloc[fmt.Sprintf("tenant-%03d", index)] = 1
+	}
+	nodes := make([]*types.NodeInfo, nodeCount)
+	for index := range nodes {
+		nodes[index] = &types.NodeInfo{
+			ID: fmt.Sprintf("worker-%02d", index), TotalWorkers: nodeCapacity,
+		}
+	}
+
+	result := e.distributeAcrossNodes(tenantAlloc, nodes)
+	if err := validateNodeAllocationCapacity(result, nodes, tenantAlloc, nil); err != nil {
+		t.Fatal(err)
+	}
+	minWorkers, maxWorkers, total := tenantCount, 0, 0
+	for _, allocation := range result {
+		workers := sumWorkers(allocation.Tenants)
+		minWorkers = min(minWorkers, workers)
+		maxWorkers = max(maxWorkers, workers)
+		total += workers
+	}
+	if total != tenantCount || minWorkers != 2 || maxWorkers != 3 {
+		t.Fatalf(
+			"single-worker tenant placement total/min/max = %d/%d/%d, want 108/2/3",
+			total, minWorkers, maxWorkers,
+		)
+	}
+}
+
+func TestValidateNodeAllocationCapacityRejectsOverflow(t *testing.T) {
+	nodes := []*types.NodeInfo{{ID: "worker-0", TotalWorkers: 1}}
+	allocations := []*types.NodeAllocation{{
+		NodeID: "worker-0", Tenants: map[string]int{"a": 1, "b": 1},
+	}}
+	err := validateNodeAllocationCapacity(
+		allocations, nodes, map[string]int{"a": 1, "b": 1}, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "exceeds capacity") {
+		t.Fatalf("capacity validation error = %v, want overflow rejection", err)
 	}
 }

@@ -1,0 +1,118 @@
+{{- if and .Values.worker.autoscaling.enabled (eq (default "workload" .Values.worker.autoscaling.mode) "workload") }}
+{{- $autoscaling := .Values.worker.autoscaling -}}
+{{- $workload := $autoscaling.workload -}}
+{{- if lt (int $autoscaling.minReplicas) 1 -}}
+{{- fail "worker.autoscaling.minReplicas must be at least 1" -}}
+{{- end -}}
+{{- if lt (int $autoscaling.maxReplicas) (int $autoscaling.minReplicas) -}}
+{{- fail "worker.autoscaling.maxReplicas must be >= minReplicas" -}}
+{{- end -}}
+{{- if lt (int $workload.targetBacklogPerPod) 1 -}}
+{{- fail "worker.autoscaling.workload.targetBacklogPerPod must be positive" -}}
+{{- end -}}
+{{- if or (lt (int $workload.targetWorkerUtilization) 1) (gt (int $workload.targetWorkerUtilization) 100) -}}
+{{- fail "worker.autoscaling.workload.targetWorkerUtilization must be between 1 and 100" -}}
+{{- end -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "sluice.fullname" . }}-worker-autoscaler
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-autoscaler
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "sluice.fullname" . }}-worker-autoscaler
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "sluice.fullname" . }}-worker-autoscaler
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "sluice.fullname" . }}-worker-autoscaler
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "sluice.fullname" . }}-worker-autoscaler
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sluice.fullname" . }}-worker-autoscaler
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "sluice.labels" . | nindent 6 }}
+      app.kubernetes.io/component: worker-autoscaler
+  template:
+    metadata:
+      labels:
+        {{- include "sluice.labels" . | nindent 8 }}
+        app.kubernetes.io/component: worker-autoscaler
+    spec:
+      serviceAccountName: {{ include "sluice.fullname" . }}-worker-autoscaler
+      containers:
+        - name: autoscaler
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/sluice-autoscaler"]
+          args:
+            - "--namespace={{ .Release.Namespace }}"
+            - "--statefulset={{ include "sluice.fullname" . }}-worker"
+            - "--sluice-url=http://{{ include "sluice.fullname" . }}:{{ .Values.apiPort }}"
+            - "--sluice-service={{ include "sluice.fullname" . }}"
+            - "--sluice-port={{ .Values.apiPort }}"
+            - "--interval={{ $workload.pollIntervalSeconds }}s"
+            - "--min-replicas={{ $autoscaling.minReplicas }}"
+            - "--max-replicas={{ $autoscaling.maxReplicas }}"
+            - "--workers-per-pod={{ .Values.workersPerNode }}"
+            - "--target-backlog-per-pod={{ $workload.targetBacklogPerPod }}"
+            - "--target-worker-utilization={{ $workload.targetWorkerUtilization }}"
+            - "--scale-up-percent={{ $workload.scaleUpPercent }}"
+            - "--scale-up-pods={{ $workload.scaleUpPods }}"
+            - "--scale-down-percent={{ $workload.scaleDownPercent }}"
+            - "--scale-down-stabilization={{ $workload.scaleDownStabilizationSeconds }}s"
+            - "--health-probe-bind-address=:8081"
+          ports:
+            - name: health
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          {{- with .Values.workloadAutoscaler.resources }}
+          resources: {{ toYaml . | nindent 12 }}
+          {{- end }}
+{{- else if and .Values.worker.autoscaling.enabled (ne (default "workload" .Values.worker.autoscaling.mode) "hpa") }}
+{{- fail "worker.autoscaling.mode must be workload or hpa" }}
+{{- end }}

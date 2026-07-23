@@ -1,4 +1,4 @@
-{{- if .Values.worker.autoscaling.enabled }}
+{{- if and .Values.worker.autoscaling.enabled (eq (default "workload" .Values.worker.autoscaling.mode) "hpa") }}
 {{- $autoscaling := .Values.worker.autoscaling -}}
 {{- if lt (int $autoscaling.minReplicas) 1 -}}
 {{- fail "worker.autoscaling.minReplicas must be at least 1" -}}
