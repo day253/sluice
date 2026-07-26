@@ -452,6 +452,143 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	}
 }
 
+func TestLoadSamplesBrowserAddsFreshRandomTenantConfigs(t *testing.T) {
+	chromePath := findChrome()
+	if chromePath == "" {
+		t.Skip("Chrome/Chromium is not installed")
+	}
+	api := newLoadLabBrowserAPI()
+	api.tenants["existing-tenant"] = map[string]any{
+		"id": "existing-tenant", "name": "Existing tenant",
+		"max_workers": 77, "inflight": 0,
+	}
+	server := httptest.NewServer(Handler(api))
+	defer server.Close()
+
+	allocator, cancelAllocator := chromedp.NewExecAllocator(
+		context.Background(),
+		append(chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.ExecPath(chromePath),
+			chromedp.Flag("headless", true),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("no-sandbox", true),
+			chromedp.WindowSize(1280, 900),
+		)...,
+	)
+	defer cancelAllocator()
+	browserContext, cancelBrowser := chromedp.NewContext(allocator)
+	defer cancelBrowser()
+	ctx, cancel := context.WithTimeout(browserContext, 20*time.Second)
+	defer cancel()
+
+	var buttonText string
+	if err := chromedp.Run(
+		ctx,
+		chromedp.Navigate(server.URL),
+		chromedp.WaitVisible("#seed-tenants", chromedp.ByQuery),
+		chromedp.Text("#seed-tenants", &buttonText, chromedp.ByQuery),
+		chromedp.Click("#seed-tenants", chromedp.ByQuery),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if buttonText != "Add random tenants" {
+		t.Fatalf("sample button text = %q", buttonText)
+	}
+	waitForTenantCountAtLeast(t, api, 4, 8*time.Second)
+	if err := chromedp.Run(
+		ctx,
+		chromedp.WaitEnabled("#seed-tenants", chromedp.ByQuery),
+	); err != nil {
+		t.Fatal(err)
+	}
+	first := browserTenantSnapshot(api)
+	firstAdded := len(first) - 1
+	if firstAdded < 3 || firstAdded > 7 {
+		t.Fatalf("first random click added %d tenants, want 3..7", firstAdded)
+	}
+
+	if err := chromedp.Run(
+		ctx,
+		chromedp.Click("#seed-tenants", chromedp.ByQuery),
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitForTenantCountAtLeast(t, api, len(first)+3, 8*time.Second)
+	if err := chromedp.Run(
+		ctx,
+		chromedp.WaitEnabled("#seed-tenants", chromedp.ByQuery),
+	); err != nil {
+		t.Fatal(err)
+	}
+	final := browserTenantSnapshot(api)
+	secondAdded := len(final) - len(first)
+	if secondAdded < 3 || secondAdded > 7 {
+		t.Fatalf("second random click added %d tenants, want 3..7", secondAdded)
+	}
+	existing := final["existing-tenant"]
+	if existing["name"] != "Existing tenant" || existing["max_workers"] != 77 {
+		t.Fatalf("existing tenant was modified: %+v", existing)
+	}
+	allowedLimits := map[int]bool{
+		5: true, 10: true, 20: true, 30: true, 50: true,
+		60: true, 100: true, 200: true, 500: true,
+	}
+	for id, tenant := range final {
+		if id == "existing-tenant" {
+			continue
+		}
+		if !strings.HasPrefix(id, "sample-") {
+			t.Fatalf("random tenant ID %q does not use sample prefix", id)
+		}
+		limit, ok := tenant["max_workers"].(int)
+		if !ok || !allowedLimits[limit] {
+			t.Fatalf("random tenant %q has invalid limit: %+v", id, tenant)
+		}
+		if before, existed := first[id]; existed &&
+			(before["name"] != tenant["name"] ||
+				before["max_workers"] != tenant["max_workers"]) {
+			t.Fatalf("second click replaced first-click tenant %q: before=%+v after=%+v", id, before, tenant)
+		}
+	}
+}
+
+func browserTenantSnapshot(api *loadLabBrowserAPI) map[string]map[string]any {
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	snapshot := make(map[string]map[string]any, len(api.tenants))
+	for id, tenant := range api.tenants {
+		copy := make(map[string]any, len(tenant))
+		for key, value := range tenant {
+			copy[key] = value
+		}
+		snapshot[id] = copy
+	}
+	return snapshot
+}
+
+func waitForTenantCountAtLeast(
+	t *testing.T,
+	api *loadLabBrowserAPI,
+	minimum int,
+	deadline time.Duration,
+) {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		api.mu.Lock()
+		got := len(api.tenants)
+		api.mu.Unlock()
+		if got >= minimum {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	api.mu.Lock()
+	got := len(api.tenants)
+	api.mu.Unlock()
+	t.Fatalf("tenant count = %d, want at least %d", got, minimum)
+}
+
 func waitForSubmitted(t *testing.T, api *loadLabBrowserAPI, want int, deadline time.Duration) {
 	t.Helper()
 	end := time.Now().Add(deadline)

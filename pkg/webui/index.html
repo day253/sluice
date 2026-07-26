@@ -65,12 +65,12 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
       <div id="config-sidebar-body" class="panel-body sidebar-body">
         <div class="sidebar-config-section sidebar-group" aria-labelledby="tenant-limit-title">
           <div class="sidebar-section-title" id="tenant-limit-title">Tenant rate limits</div>
-          <div class="sidebar-section-note">Create tenants and edit the guaranteed Worker Limit used by fair allocation.</div>
+          <div class="sidebar-section-note">Create tenants, edit guaranteed Worker Limits, or add 3–7 random configurations for testing.</div>
           <div class="load-field config-tenant-select"><label for="config-tenant">Tenant</label><select id="config-tenant" aria-label="Configured tenant"><option value="">No tenants configured</option></select></div>
           <div class="sidebar-button-grid sidebar-tenant-actions">
             <button id="open-tenant" class="btn btn-primary" type="button">New tenant</button>
             <button id="edit-tenant" class="btn btn-secondary" type="button">Edit selected</button>
-            <button id="seed-tenants" class="btn btn-secondary" type="button">Load samples</button>
+            <button id="seed-tenants" class="btn btn-secondary" type="button">Add random tenants</button>
           </div>
         </div>
         <div class="sidebar-config-section sidebar-group" aria-labelledby="worker-capacity-title">
@@ -242,9 +242,8 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
 <script>
 const emptyHistory=()=>({days:Array(30).fill(0),hours:Array(24).fill(0),mins:Array(60).fill(0),secs:Array(60).fill(0)});
 const S={health:null,nodes:[],tenants:[],allocations:[],workerHistories:[],tenantHistories:[],autoscaling:null,performance:null,performanceRaftHistories:[],performanceSchedulerHistories:[],events:[],lastUpdate:null,lastLeader:null,lastOnline:null,editing:null,loadRun:null,loadHistory:[]};
-const SAMPLE_TENANTS=[{id:'acme-corp',name:'Acme Corp',max_workers:100},{id:'globex',name:'Globex',max_workers:60},{id:'initech',name:'Initech',max_workers:30}];
 const LOAD=SluiceLoadLab,LOAD_HISTORY_KEY='sluice.load-lab.history.v1',SIDEBAR_STATE_KEY='sluice.dashboard.sidebars.v1';
-let workerCapacityBusy=false;
+let workerCapacityBusy=false,sampleTenantGeneration=0;
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
 const fmt=n=>new Intl.NumberFormat().format(Number(n)||0);
@@ -483,7 +482,8 @@ function interleaveTasks(ids,count){const jobs=[];for(let index=0;index<count;in
 const SUBMIT_BATCH_SIZE=500,SUBMIT_BATCH_CONCURRENCY=4;
 async function submitJobBatch(batch){const response=await fetch('/api/v1/tasks/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:batch.map(job=>({tenant_id:job.tenant,payload:`ui-${Date.now()}-${job.tenant}-${job.index}`}))})});if(!response.ok)throw new Error(`batch request failed (${response.status})`);const body=await response.json();return Array.isArray(body.tasks)?body.tasks.length:batch.length}
 async function submitTasks(tenantIds){const ids=[...new Set(tenantIds)].filter(Boolean),count=quickCount();$('quick-count').value=count;if(!ids.length){toast('No tenants configured');return}const total=count*ids.length,jobs=interleaveTasks(ids,count),roundRobin=ids.length>1;setLoadBusy(true);toast(`Submitting ${fmt(total)} tasks${roundRobin?' in round-robin order':''}…`);let submitted=0,failed=0;try{for(let offset=0;offset<jobs.length;offset+=SUBMIT_BATCH_SIZE*SUBMIT_BATCH_CONCURRENCY){const batches=[];for(let start=offset;start<Math.min(jobs.length,offset+SUBMIT_BATCH_SIZE*SUBMIT_BATCH_CONCURRENCY);start+=SUBMIT_BATCH_SIZE)batches.push(jobs.slice(start,start+SUBMIT_BATCH_SIZE));const results=await Promise.allSettled(batches.map(batch=>submitJobBatch(batch)));results.forEach((result,index)=>{const size=batches[index].length;if(result.status==='fulfilled'){submitted+=Math.min(size,Number(result.value)||0);failed+=Math.max(0,size-(Number(result.value)||0))}else failed+=size})}addEvent(`Submitted ${submitted} tasks to ${ids.length===1?ids[0]:`${ids.length} tenants`}${roundRobin?' in round-robin order':''}`);toast(failed?`${fmt(submitted)} submitted, ${fmt(failed)} failed`:`${fmt(submitted)} tasks submitted`);setTimeout(refresh,600)}finally{setLoadBusy(false)}}
-async function seedSampleTenants(){const button=$('seed-tenants');button.disabled=true;toast('Loading sample tenants…');const results=await Promise.allSettled(SAMPLE_TENANTS.map(tenant=>getJSON(`/api/v1/admin/tenants/${encodeURIComponent(tenant.id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:tenant.name,max_workers:tenant.max_workers})})));const failed=results.filter(result=>result.status==='rejected').length;button.disabled=false;if(failed){toast(`${SAMPLE_TENANTS.length-failed} tenants loaded, ${failed} failed`);return}addEvent('Loaded 3 sample tenants');toast('3 sample tenants loaded');await refresh()}
+function randomTenantSeed(){sampleTenantGeneration++;let entropy=0;if(globalThis.crypto?.getRandomValues){const values=new Uint32Array(1);globalThis.crypto.getRandomValues(values);entropy=values[0]}else entropy=Math.floor(Math.random()*0xffffffff);return (entropy^Date.now()^Math.imul(sampleTenantGeneration,0x9e3779b9))>>>0}
+async function seedSampleTenants(){const button=$('seed-tenants'),samples=LOAD.buildRandomTenantConfigs(S.tenants.map(tenant=>tenant.id),randomTenantSeed());button.disabled=true;toast(`Adding ${samples.length} random tenant configs…`);try{const results=await Promise.allSettled(samples.map(tenant=>getJSON(`/api/v1/admin/tenants/${encodeURIComponent(tenant.id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:tenant.name,max_workers:tenant.maxWorkers})}))),failed=results.filter(result=>result.status==='rejected').length,added=samples.length-failed;if(added)addEvent(`Added ${added} random tenant configs`);toast(failed?`${added} random tenants added, ${failed} failed`:`${added} random tenant configs added`);await refresh()}finally{button.disabled=false}}
 
 $('config-sidebar-toggle').addEventListener('click',()=>setSidebarCollapsed('config',!$('config-sidebar').classList.contains('is-collapsed')));$('workload-sidebar-toggle').addEventListener('click',()=>setSidebarCollapsed('workload',!$('workload-sidebar').classList.contains('is-collapsed')));
 $('open-tenant').addEventListener('click',()=>openTenant(null));$('edit-tenant').addEventListener('click',()=>{const tenant=S.tenants.find(item=>item.id===$('config-tenant').value);if(tenant)openTenant(tenant)});$('add-one').addEventListener('click',()=>submitTasks([$('quick-tenant').value]));$('add-all').addEventListener('click',()=>submitTasks(S.tenants.map(tenant=>tenant.id)));$('seed-tenants').addEventListener('click',seedSampleTenants);

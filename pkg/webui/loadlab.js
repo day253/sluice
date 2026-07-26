@@ -6,8 +6,20 @@ var SluiceLoadLab = (function () {
     maxTasks: 100000,
     maxTasksPerTenant: 5000,
     maxWaves: 20,
-    tenantPrefix: 'load-lab-'
+    tenantPrefix: 'load-lab-',
+    minRandomTenants: 3,
+    maxRandomTenants: 7
   });
+
+  const RANDOM_TENANT_ADJECTIVES = Object.freeze([
+    'Amber', 'Atlas', 'Blue', 'Cedar', 'Cloud', 'Copper',
+    'Delta', 'Evergreen', 'Maple', 'Nimbus', 'Northstar', 'Silver'
+  ]);
+  const RANDOM_TENANT_SECTORS = Object.freeze([
+    'Analytics', 'Commerce', 'Energy', 'Finance', 'Foods', 'Health',
+    'Logistics', 'Media', 'Mobility', 'Retail', 'Systems', 'Travel'
+  ]);
+  const RANDOM_TENANT_LIMITS = Object.freeze([5, 10, 20, 30, 50, 60, 100, 200, 500]);
 
   const RECIPES = Object.freeze([
     {
@@ -133,6 +145,50 @@ var SluiceLoadLab = (function () {
     return jobs;
   }
 
+  function normalizeSeed(value) {
+    const parsed = Number(value);
+    const seed = Number.isFinite(parsed) ? Math.trunc(parsed) >>> 0 : 0;
+    return seed || 0x9e3779b9;
+  }
+
+  function buildRandomTenantConfigs(existingIDs, seedValue) {
+    const existing = new Set((existingIDs || []).map(id => String(id)));
+    const seed = normalizeSeed(seedValue);
+    let state = seed;
+    const next = maximum => {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      return (state >>> 0) % maximum;
+    };
+    const count = LIMITS.minRandomTenants +
+      next(LIMITS.maxRandomTenants - LIMITS.minRandomTenants + 1);
+    const configs = [];
+    const names = new Set();
+    const generation = seed.toString(36).padStart(7, '0');
+    for (let index = 0; index < count; index++) {
+      const adjective = RANDOM_TENANT_ADJECTIVES[next(RANDOM_TENANT_ADJECTIVES.length)];
+      const sector = RANDOM_TENANT_SECTORS[next(RANDOM_TENANT_SECTORS.length)];
+      let name = `${adjective} ${sector}`;
+      if (names.has(name)) name += ` ${index + 1}`;
+      names.add(name);
+
+      const baseID = `sample-${generation}-${String(index + 1).padStart(2, '0')}`;
+      let id = baseID;
+      let collision = 1;
+      while (existing.has(id)) {
+        id = `${baseID}-${collision++}`;
+      }
+      existing.add(id);
+      configs.push({
+        id,
+        name,
+        maxWorkers: RANDOM_TENANT_LIMITS[next(RANDOM_TENANT_LIMITS.length)]
+      });
+    }
+    return configs;
+  }
+
   function splitWaves(jobs, requestedWaves) {
     const waveCount = Math.min(integer(requestedWaves, 1, 1, LIMITS.maxWaves), Math.max(1, jobs.length));
     const waves = [];
@@ -162,6 +218,7 @@ var SluiceLoadLab = (function () {
     RECIPES,
     normalizeOptions,
     buildTenantSpecs,
+    buildRandomTenantConfigs,
     buildRoundRobinJobs,
     splitWaves,
     summarize,

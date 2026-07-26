@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -98,6 +99,55 @@ func TestLoadLabComposesHotspotAndWaveAtomicOperations(t *testing.T) {
 	}
 }
 
+func TestLoadLabBuildsBoundedUniqueRandomTenantConfigs(t *testing.T) {
+	runtime := loadLabRuntime(t)
+	type tenantConfig struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		MaxWorkers int    `json:"maxWorkers"`
+	}
+	first := evaluateJSON[[]tenantConfig](
+		t, runtime, `SluiceLoadLab.buildRandomTenantConfigs([], 12345)`,
+	)
+	repeated := evaluateJSON[[]tenantConfig](
+		t, runtime, `SluiceLoadLab.buildRandomTenantConfigs([], 12345)`,
+	)
+	different := evaluateJSON[[]tenantConfig](
+		t, runtime, `SluiceLoadLab.buildRandomTenantConfigs([], 54321)`,
+	)
+	if len(first) < 3 || len(first) > 7 {
+		t.Fatalf("random tenant count = %d, want 3..7", len(first))
+	}
+	if !reflect.DeepEqual(first, repeated) {
+		t.Fatalf("same seed is not deterministic: first=%+v repeated=%+v", first, repeated)
+	}
+	if reflect.DeepEqual(first, different) {
+		t.Fatalf("different seeds produced identical configs: %+v", first)
+	}
+	allowedLimits := map[int]bool{
+		5: true, 10: true, 20: true, 30: true, 50: true,
+		60: true, 100: true, 200: true, 500: true,
+	}
+	seen := make(map[string]bool, len(first))
+	for _, tenant := range first {
+		if !strings.HasPrefix(tenant.ID, "sample-") || seen[tenant.ID] {
+			t.Fatalf("random tenant ID is not unique: %+v", first)
+		}
+		if tenant.Name == "" || !allowedLimits[tenant.MaxWorkers] {
+			t.Fatalf("invalid random tenant config: %+v", tenant)
+		}
+		seen[tenant.ID] = true
+	}
+	collisionSafe := evaluateJSON[[]tenantConfig](
+		t,
+		runtime,
+		`SluiceLoadLab.buildRandomTenantConfigs(["`+first[0].ID+`"], 12345)`,
+	)
+	if collisionSafe[0].ID == first[0].ID {
+		t.Fatalf("existing tenant was not protected from replacement: %+v", collisionSafe[0])
+	}
+}
+
 func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	Handler(http.NotFoundHandler()).ServeHTTP(
@@ -123,6 +173,7 @@ func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
 		`id="autoscaling-queue"`, `id="autoscaling-execution"`,
 		`id="autoscaling-telemetry"`, `/api/v1/admin/autoscaling`,
 		`idempotency_key:`, `buildRoundRobinJobs`,
+		`Add random tenants`, `buildRandomTenantConfigs`,
 		`<script src="/assets/loadlab.js"></script>`,
 	} {
 		if !strings.Contains(recorder.Body.String(), fragment) {
