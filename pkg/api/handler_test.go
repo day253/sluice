@@ -621,6 +621,46 @@ func TestDeleteTenant(t *testing.T) {
 	}
 }
 
+func TestDeleteAllTenantsRejectsUnfinishedThenDeletesInOneRequest(t *testing.T) {
+	h, fsm, _ := setupHandler(t)
+	router := newRouter(h)
+	applyOp(fsm, raftpkg.OpUpsertTenant, types.TenantConfig{
+		ID: "company-b", MaxWorkers: 20,
+	})
+	applyOp(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "pending-clear", TenantID: "company-a", Payload: `{}`,
+	})
+
+	blocked := httptest.NewRecorder()
+	router.ServeHTTP(
+		blocked,
+		httptest.NewRequest(http.MethodDelete, "/api/v1/admin/tenants", nil),
+	)
+	if blocked.Code != http.StatusConflict ||
+		!bytes.Contains(blocked.Body.Bytes(), []byte("1 unfinished tasks")) {
+		t.Fatalf("blocked delete all status=%d body=%s", blocked.Code, blocked.Body.String())
+	}
+	if got := len(fsm.GetAllTenants()); got != 2 {
+		t.Fatalf("blocked delete all retained %d tenants, want 2", got)
+	}
+
+	applyOp(fsm, raftpkg.OpCompleteTask, raftpkg.CompleteTaskData{
+		TaskID: "pending-clear", TenantID: "company-a", Result: "done",
+	})
+	deleted := httptest.NewRecorder()
+	router.ServeHTTP(
+		deleted,
+		httptest.NewRequest(http.MethodDelete, "/api/v1/admin/tenants", nil),
+	)
+	if deleted.Code != http.StatusOK ||
+		!bytes.Contains(deleted.Body.Bytes(), []byte(`"deleted":2`)) {
+		t.Fatalf("delete all status=%d body=%s", deleted.Code, deleted.Body.String())
+	}
+	if got := len(fsm.GetAllTenants()); got != 0 {
+		t.Fatalf("delete all retained %d tenants", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Admin — cluster
 // ---------------------------------------------------------------------------

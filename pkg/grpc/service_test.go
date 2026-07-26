@@ -2,10 +2,14 @@ package grpc
 
 import (
 	"context"
+	"encoding/json"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	hashicorpraft "github.com/hashicorp/raft"
 	"go.uber.org/zap"
 	googlegrpc "google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -25,6 +29,35 @@ type batchSpyQueue struct {
 	*queue.MemoryQueue
 	enqueueCalls int
 }
+
+type blockingCreateRaft struct {
+	fsm           *raft.FSM
+	createStarted chan struct{}
+	createRelease chan struct{}
+	createOnce    sync.Once
+	deleteApplies atomic.Int32
+}
+
+func (r *blockingCreateRaft) Apply(cmd []byte, _ int) raft.ApplyResult {
+	var envelope raft.Command
+	if err := json.Unmarshal(cmd, &envelope); err != nil {
+		return internalTestApplyResult{response: err}
+	}
+	if envelope.Op == raft.OpCreateTaskBatch {
+		r.createOnce.Do(func() { close(r.createStarted) })
+		<-r.createRelease
+	}
+	if envelope.Op == raft.OpDeleteAllTenants {
+		r.deleteApplies.Add(1)
+	}
+	response := r.fsm.Apply(&hashicorpraft.Log{
+		Data: cmd, Type: hashicorpraft.LogCommand,
+	})
+	return internalTestApplyResult{response: response}
+}
+
+func (r *blockingCreateRaft) IsLeader() bool     { return true }
+func (r *blockingCreateRaft) LeaderAddr() string { return "test:7000" }
 
 func newBatchSpyQueue() *batchSpyQueue {
 	return &batchSpyQueue{MemoryQueue: queue.NewMemoryQueue()}
@@ -112,6 +145,73 @@ func TestSubmitForwardsBeforeFollowerTenantValidation(t *testing.T) {
 	}
 	if task := leaderFSM.GetTask(resp.GetTaskId()); task == nil || task.TenantID != "tenant-a" {
 		t.Fatalf("leader task = %+v, want tenant-a", task)
+	}
+}
+
+func TestDeleteAllTenantsCannotOvertakeValidatedSubmission(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{
+		ID: "tenant-a", MaxWorkers: 2,
+	})
+	testRaft := &blockingCreateRaft{
+		fsm:           fsm,
+		createStarted: make(chan struct{}),
+		createRelease: make(chan struct{}),
+	}
+	service := NewService(
+		"leader",
+		queue.NewMemoryQueue(),
+		fsm,
+		testRaft,
+		nil,
+		zap.NewNop(),
+	)
+
+	submitted := make(chan error, 1)
+	go func() {
+		_, err := service.Submit(context.Background(), &grpcv1.SubmitRequest{
+			TenantId: "tenant-a", Payload: []byte(`{}`),
+		})
+		submitted <- err
+	}()
+	select {
+	case <-testRaft.createStarted:
+	case <-time.After(time.Second):
+		t.Fatal("submission did not reach the blocked Raft Apply")
+	}
+
+	cleared := make(chan error, 1)
+	go func() {
+		_, err := service.DeleteAllTenants(
+			context.Background(),
+			&grpcv1.DeleteAllTenantsRequest{},
+		)
+		cleared <- err
+	}()
+	select {
+	case err := <-cleared:
+		t.Fatalf("bulk delete overtook the uncommitted submission: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := testRaft.deleteApplies.Load(); got != 0 {
+		t.Fatalf("bulk delete reached Raft %d times before Create committed", got)
+	}
+
+	close(testRaft.createRelease)
+	if err := <-submitted; err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := <-cleared; status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("bulk delete error = %v, want FailedPrecondition", err)
+	}
+	if got := testRaft.deleteApplies.Load(); got != 1 {
+		t.Fatalf("bulk delete Raft applies = %d, want 1", got)
+	}
+	if got := len(fsm.GetAllTenants()); got != 1 {
+		t.Fatalf("bulk delete removed tenant despite unfinished work: %d remain", got)
+	}
+	if got := fsm.TaskPressureSnapshot().UnfinishedTasks; got != 1 {
+		t.Fatalf("unfinished tasks = %d, want 1", got)
 	}
 }
 

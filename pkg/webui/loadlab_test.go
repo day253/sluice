@@ -410,6 +410,40 @@ func TestDashboardFullyHidesCollapsedSidebars(t *testing.T) {
 	}
 }
 
+func TestDashboardOffersAtomicClearAllTenantsInConfigurationSidebar(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	Handler(http.NotFoundHandler()).ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d", recorder.Code)
+	}
+
+	page := recorder.Body.String()
+	configStart := strings.Index(page, `id="config-sidebar"`)
+	configEnd := strings.Index(page, `id="workload-sidebar"`)
+	if configStart < 0 || configEnd <= configStart {
+		t.Fatal("configuration sidebar boundaries are missing")
+	}
+	config := page[configStart:configEnd]
+	for _, fragment := range []string{
+		`id="clear-tenants"`,
+		`Clear all tenants`,
+		`getJSON('/api/v1/admin/tenants',{method:'DELETE'})`,
+		`Clearing ${fmt(count)} tenants in one Raft commit`,
+		`unfinished tasks are still visible`,
+		`Completed task history, nodes and Worker capacity are preserved`,
+	} {
+		if !strings.Contains(page, fragment) {
+			t.Errorf("bulk tenant clear contract is missing %q", fragment)
+		}
+	}
+	if !strings.Contains(config, `id="clear-tenants"`) {
+		t.Fatal("bulk tenant clear is outside the configuration sidebar")
+	}
+}
+
 func TestLoadLabAssetIsServedAsJavaScript(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	Handler(http.NotFoundHandler()).ServeHTTP(

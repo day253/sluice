@@ -25,6 +25,7 @@ type loadLabBrowserAPI struct {
 	workerCapacity    int
 	capacityWrites    int
 	allCapacityWrites int
+	clearTenantWrites int
 }
 
 func newLoadLabBrowserAPI() *loadLabBrowserAPI {
@@ -165,6 +166,14 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tenant := a.tenants[id]
 		a.mu.Unlock()
 		writeBrowserJSON(w, tenant)
+	case r.Method == http.MethodDelete &&
+		r.URL.Path == "/api/v1/admin/tenants":
+		a.mu.Lock()
+		deleted := len(a.tenants)
+		a.tenants = make(map[string]map[string]any)
+		a.clearTenantWrites++
+		a.mu.Unlock()
+		writeBrowserJSON(w, map[string]any{"deleted": deleted})
 	case r.URL.Path == "/api/v1/admin/tenants":
 		a.mu.Lock()
 		snapshot := make(map[string]map[string]any, len(a.tenants))
@@ -458,15 +467,29 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	if !strings.Contains(currentText, "6") || !strings.Contains(currentText, "All 6 tasks drained") {
 		t.Fatalf("current execution did not show completed load: %q", currentText)
 	}
+	if err := chromedp.Run(ctx,
+		chromedp.Evaluate(`window.confirm=()=>true`, nil),
+		chromedp.Click("#clear-tenants", chromedp.ByQuery),
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitForBrowserTenantCount(t, ctx, api, 0, 8*time.Second)
+	var clearToast string
+	if err := chromedp.Run(ctx, chromedp.Text("#toast", &clearToast, chromedp.ByQuery)); err != nil {
+		t.Fatal(err)
+	}
+	if clearToast != "3 tenants cleared" {
+		t.Fatalf("bulk clear toast = %q", clearToast)
+	}
 	api.mu.Lock()
 	defer api.mu.Unlock()
-	if len(api.tenants) != 3 || api.submitted != 7 ||
+	if len(api.tenants) != 0 || api.submitted != 7 ||
 		len(api.idempotencyKey) != 6 || api.capacityWrites != 1 ||
-		api.allCapacityWrites != 1 {
+		api.allCapacityWrites != 1 || api.clearTenantWrites != 1 {
 		t.Fatalf(
-			"browser operations = %d tenants, %d tasks, %d keys, %d single/%d all capacity writes",
+			"browser operations = %d tenants, %d tasks, %d keys, %d single/%d all capacity writes, %d tenant clears",
 			len(api.tenants), api.submitted, len(api.idempotencyKey),
-			api.capacityWrites, api.allCapacityWrites,
+			api.capacityWrites, api.allCapacityWrites, api.clearTenantWrites,
 		)
 	}
 }
@@ -583,6 +606,35 @@ func browserTenantSnapshot(api *loadLabBrowserAPI) map[string]map[string]any {
 		snapshot[id] = copy
 	}
 	return snapshot
+}
+
+func waitForBrowserTenantCount(
+	t *testing.T,
+	ctx context.Context,
+	api *loadLabBrowserAPI,
+	want int,
+	deadline time.Duration,
+) {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		api.mu.Lock()
+		count := len(api.tenants)
+		api.mu.Unlock()
+		var options int
+		err := chromedp.Run(
+			ctx,
+			chromedp.Evaluate(
+				`document.querySelectorAll("#config-tenant option:not([value=''])").length`,
+				&options,
+			),
+		)
+		if err == nil && count == want && options == want {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("browser tenant count did not reach %d", want)
 }
 
 func waitForTenantCountAtLeast(

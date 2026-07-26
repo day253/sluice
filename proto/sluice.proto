@@ -29,6 +29,9 @@ service Sluice {
   // Admin: delete a tenant.
   rpc DeleteTenant(DeleteTenantRequest) returns (DeleteTenantResponse);
 
+  // Admin: atomically delete every tenant after all unfinished work drains.
+  rpc DeleteAllTenants(DeleteAllTenantsRequest) returns (DeleteAllTenantsResponse);
+
   // Admin: list all tenants with inflight counts.
   rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
 
@@ -97,6 +100,12 @@ message DeleteTenantRequest {
 
 message DeleteTenantResponse {
   bool ok = 1;
+}
+
+message DeleteAllTenantsRequest {}
+
+message DeleteAllTenantsResponse {
+  int32 deleted = 1;
 }
 
 message ListTenantsRequest {}

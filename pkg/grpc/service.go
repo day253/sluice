@@ -44,6 +44,7 @@ type Service struct {
 	workAvailable func([]string)
 
 	submitForwardTimeout time.Duration
+	tenantMutationMu     sync.RWMutex
 
 	forwardMu     sync.Mutex
 	forwardAddr   string
@@ -109,6 +110,12 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 		defer cancel()
 		return client.SubmitBatch(forwardCtx, req)
 	}
+
+	// Keep tenant validation and the durable Create in one Leader-local read
+	// section. DeleteAllTenants takes the write side so a validated request
+	// cannot commit after the atomic clear and create orphaned work.
+	s.tenantMutationMu.RLock()
+	defer s.tenantMutationMu.RUnlock()
 
 	create := make([]raftpkg.CreateTaskData, len(req.Tasks))
 	resp := &grpcv1.SubmitBatchResponse{Tasks: make([]*grpcv1.SubmitResponse, len(req.Tasks))}
@@ -231,6 +238,8 @@ func (s *Service) UpsertTenant(ctx context.Context, req *grpcv1.UpsertTenantRequ
 		defer cancel()
 		return client.UpsertTenant(forwardCtx, req)
 	}
+	s.tenantMutationMu.Lock()
+	defer s.tenantMutationMu.Unlock()
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpUpsertTenant, types.TenantConfig{
 		ID: req.TenantId, Name: req.Name, MaxWorkers: int(req.MaxWorkers),
 	})
@@ -250,11 +259,48 @@ func (s *Service) DeleteTenant(ctx context.Context, req *grpcv1.DeleteTenantRequ
 		defer cancel()
 		return client.DeleteTenant(forwardCtx, req)
 	}
+	s.tenantMutationMu.Lock()
+	defer s.tenantMutationMu.Unlock()
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpDeleteTenant, raftpkg.DeleteTenantData{ID: req.TenantId})
 	if err := s.raft.Apply(cmd, 5000).Error(); err != nil {
 		return nil, status.Errorf(codes.Internal, "raft apply: %v", err)
 	}
 	return &grpcv1.DeleteTenantResponse{Ok: true}, nil
+}
+
+func (s *Service) DeleteAllTenants(ctx context.Context, req *grpcv1.DeleteAllTenantsRequest) (*grpcv1.DeleteAllTenantsResponse, error) {
+	if !s.raft.IsLeader() {
+		client, err := s.leaderClient()
+		if err != nil {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
+		forwardCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		return client.DeleteAllTenants(forwardCtx, req)
+	}
+
+	s.tenantMutationMu.Lock()
+	defer s.tenantMutationMu.Unlock()
+	cmd := raftpkg.MustMarshalCommand(
+		raftpkg.OpDeleteAllTenants,
+		raftpkg.DeleteAllTenantsData{},
+	)
+	result := s.raft.Apply(cmd, 5000)
+	if err := result.Error(); err != nil {
+		return nil, status.Errorf(codes.Internal, "raft apply: %v", err)
+	}
+	outcome, ok := result.Response().(*raftpkg.DeleteAllTenantsResult)
+	if !ok {
+		return nil, status.Error(codes.Internal, "delete all tenants returned an invalid response")
+	}
+	if outcome.Unfinished > 0 {
+		return nil, status.Errorf(
+			codes.FailedPrecondition,
+			"%d unfinished tasks must drain before deleting all tenants",
+			outcome.Unfinished,
+		)
+	}
+	return &grpcv1.DeleteAllTenantsResponse{Deleted: int32(outcome.Deleted)}, nil
 }
 
 // leaderClient returns a cached gRPC client to the current leader. External

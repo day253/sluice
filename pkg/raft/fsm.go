@@ -62,6 +62,8 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		return f.applyUpsertTenant(cmd.Data)
 	case OpDeleteTenant:
 		return f.applyDeleteTenant(cmd.Data)
+	case OpDeleteAllTenants:
+		return f.applyDeleteAllTenants(cmd.Data)
 	case OpNodeUp:
 		return f.applyNodeUp(cmd.Data)
 	case OpNodeDown:
@@ -220,6 +222,25 @@ func (f *FSM) applyDeleteTenant(data json.RawMessage) interface{} {
 	delete(f.state.Tenants, req.ID)
 	f.logger.Info("fsm: tenant deleted", zap.String("tenant", req.ID))
 	return nil
+}
+
+func (f *FSM) applyDeleteAllTenants(data json.RawMessage) interface{} {
+	var req DeleteAllTenantsData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+	if unfinished := len(f.state.Tasks); unfinished > 0 {
+		return &DeleteAllTenantsResult{Unfinished: unfinished}
+	}
+
+	deleted := len(f.state.Tenants)
+	f.state.Tenants = make(map[string]*types.TenantConfig)
+	for _, allocation := range f.state.Allocations {
+		allocation.Tenants = make(map[string]int)
+		allocation.Borrowed = make(map[string]int)
+	}
+	f.logger.Info("fsm: all tenants deleted", zap.Int("tenants", deleted))
+	return &DeleteAllTenantsResult{Deleted: deleted}
 }
 
 func (f *FSM) applyNodeUp(data json.RawMessage) interface{} {

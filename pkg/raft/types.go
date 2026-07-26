@@ -6,6 +6,7 @@ import "encoding/json"
 const (
 	OpUpsertTenant        = "upsert_tenant"
 	OpDeleteTenant        = "delete_tenant"
+	OpDeleteAllTenants    = "delete_all_tenants"
 	OpNodeUp              = "node_up"
 	OpNodeDown            = "node_down"
 	OpWorkerOffline       = "worker_offline"
@@ -82,6 +83,16 @@ type CompleteTaskData struct {
 // DeleteTenantData is the payload for OpDeleteTenant.
 type DeleteTenantData struct {
 	ID string `json:"id"`
+}
+
+// DeleteAllTenantsData is the payload for the atomic, idle-only bulk delete.
+type DeleteAllTenantsData struct{}
+
+// DeleteAllTenantsResult reports either the number of deleted configurations
+// or the unfinished-task count that prevented the operation.
+type DeleteAllTenantsResult struct {
+	Deleted    int `json:"deleted"`
+	Unfinished int `json:"unfinished"`
 }
 
 // ClaimBatchData is the payload for OpClaimBatch — claims multiple tasks

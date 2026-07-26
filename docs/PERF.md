@@ -1062,3 +1062,36 @@ average_batch=2, errors=0`，容量、allocation 与两个 Processor Pool 均通
 14.845s（1347.3 task/s），请求错误/最终 unfinished/重复执行仍为 0/0/0，integration
 阶段为 409.813s。该次比本节上一轮完整测试的 14.739s 慢约 0.7%，仍属本地 race
 单次波动；它确认 capability 探测只发生在容量控制请求上，没有进入任务热路径。
+
+### 7.16 原子清除租户与提交临界区（2026-07-26）
+
+TENANT-001 增加的是低频控制路径：一次 collection DELETE 由 Leader 写一条
+`delete_all_tenants` Raft entry，而不是浏览器按 tenant 循环写 N 条。为了让“提交已验证
+tenant 存在”和“清除全部 tenant”具有明确线性化顺序，Leader 的 SubmitBatch 从 tenant
+验证到 Create Apply 持有共享读锁，tenant upsert/delete/clear 持有独占写锁。并发
+Submit 彼此仍共享读锁，不会因此串行；锁等待不写指标、不进入 FSM snapshot，也不参与
+调度决策。Clear 只有在 replicated unfinished=0 时提交删除，否则一条日志返回整批拒绝。
+
+按仓库 PERF-001 固定形状重跑：Apple M4 Pro（14 logical CPU、48GiB、
+darwin/arm64、Go 1.26.5），`-race -count=1`，单故障域真实 7 replica/3 voter/4
+non-voter、单 Raft shard；每进程 80 槽，Leader 不执行，4 tenant×Limit 120，共 20000
+个约 10ms 小 JSON 任务。请求经真实 Follower HTTP 顺序提交，batch=1000、
+concurrency=1。对照是本次修改前、同一工作区同一轮 `make test` 的相同 Case。
+
+| 阶段 | 修改前 | TENANT-001 定向复跑 |
+|---|---:|---:|
+| 20k Follower HTTP durable submit | 2.799s | 2.888s |
+| accepted 后排空 | 10.600s | 10.400s |
+| submit 开始至排空 | 13.399s（1492.6 task/s） | 13.288s（1505.1 task/s） |
+| 请求错误 / 最终 unfinished / 单任务重复执行 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+提交阶段单轮慢约 3.2%，排空阶段快约 1.9%，端到端快约 0.8%；方向互相抵消且都是本地
+race 单次采样，不能宣称性能改善或回退。可确认的是共享读锁没有把并发 Submit 变成独占
+临界区，固定 20k 正常路径仍在 13.288s 内正确排空。新增清理控制路径的规模证据由
+TENANT-001 单测和真实三 voter Case 固定：有一条 gated inflight 时整批 409/0 删除，
+完成后一次请求删除两个 tenant、清空 allocation 当前镜像、保留 completed result，
+post-clear submit 返回 404 且原任务 exactly once。
+
+完整 `make test`（unit/browser/Chart/真实多节点均带 `-race`）随后通过，integration
+阶段为 407.615s；其中新增 TENANT-001 三 voter Case 定向运行 6.02s。整包耗时包含选举、
+故障恢复和新增 Case，不能与单独 20k 吞吐相互替代。

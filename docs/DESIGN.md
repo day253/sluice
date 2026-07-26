@@ -385,7 +385,7 @@ Claim，避免“Leader 已提交但响应未知”时产生重复执行。旧 C
   SubmitBatch(SubmitBatchRequest) → SubmitBatchResponse
   GetTask(GetTaskRequest) → TaskStatus
   WaitTask(WaitTaskRequest) → TaskStatus
-  UpsertTenant / DeleteTenant / ListTenants / ClusterStatus / Health
+  UpsertTenant / DeleteTenant / DeleteAllTenants / ListTenants / ClusterStatus / Health
 
 内部 (gRPC streaming, 节点间):
   AssignmentStream(bidi) — Follower 上报空闲槽位，Leader 批量选择并提交具体任务
@@ -1316,3 +1316,30 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **回归覆盖**：组件测试固定 sidebar token、无阴影外壳、group/图标和 48px rail；真实
   Chrome 检查 computed background/shadow/radius/accent/toggle 尺寸，同时重跑双栏折叠、
   刷新恢复、tenant/capacity/quick load/Load Lab 与排空。
+
+### TENANT-001：空闲时原子清除全部租户配置
+
+- **需求边界**：左侧配置栏提供一个 `Clear all tenants` 危险操作。浏览器只发一次
+  `DELETE /api/v1/admin/tenants`；Follower 经 gRPC 转发当前 Leader，Leader 用一条
+  `delete_all_tenants` Raft entry 原子修改 FSM。它不是浏览器循环调用单租户 DELETE，
+  因而 100 个测试 tenant 也不会产生 100 条配置日志或中途只删一部分。
+- **任务生命周期**：只要 replicated unfinished snapshot 中还有任意 pending/inflight，
+  FSM 就返回完整批次拒绝，HTTP 映射为 409。该操作不取消 accepted task、不提前结束
+  Processor、不删除 claim/result，也不依赖浏览器看到的可能滞后计数；任务排空后才允许
+  清理。Leader 的 tenant mutation write lock 与 Submit validation→Raft Apply read lock
+  形成临界区：已经验证 tenant 存在的提交要么先 durable Create，使 clear 被拒绝；要么
+  clear 先提交，随后提交在 Leader 验证阶段得到 tenant not found，不能形成孤儿任务。
+- **存储语义**：成功时删除 `FSMState.Tenants` 这一当前配置镜像，并清空每个
+  `NodeAllocation` 的 tenant/borrowed 当前镜像；节点身份、Raft membership、Worker
+  capacity override、bounded recent completed result 和 process-local 174 点指标历史均
+  保留。操作幂等；空集合返回 `deleted=0`。本次不实现“清空所有任务/结果/指标”、不删除
+  PVC、不重建 Raft 集群，也不改变单租户 DELETE 的历史语义。
+- **故障模型与恢复**：只有 committed clear 才返回成功；Leader 丢失、Follower 转发失败
+  或 Raft Apply 失败返回错误，调用方可安全重试。单条 FSM 命令先检查全部 unfinished 再
+  修改全部 tenant/allocation，snapshot/新 Leader 只会看到 clear 前或 clear 后状态，不会
+  看见部分删除。
+- **回归覆盖**：FSM 单测固定“有 unfinished 0 删除、完成后全删、allocation 清空且 result
+  保留”；gRPC 并发单测阻塞 Create Apply，证明 clear 不能越过已验证提交；HTTP 单测固定
+  409/200 JSON。真实 Chrome 从左栏点击并检查一次 collection DELETE；真实三 voter Case
+  经 Follower 创建两个 tenant、gated Processor、失败 clear、完成、成功 clear、全节点
+  收敛、post-clear 404 和 exactly-once final state。

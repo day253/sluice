@@ -1481,6 +1481,188 @@ func TestAtomicHundredTenantLoadThroughFollowerHTTP(t *testing.T) {
 	}
 }
 
+// TestClearAllTenantsThroughFollowerIsAtomicAndIdleOnly preserves
+// TENANT-001 across the real production boundary. A Follower forwards the
+// collection DELETE to the Leader; unfinished work rejects the whole command,
+// then one Raft entry removes every tenant and allocation after the task
+// reaches its durable final state.
+func TestClearAllTenantsThroughFollowerIsAtomicAndIdleOnly(t *testing.T) {
+	tc := newTestCluster(t, 3, 4)
+	defer tc.shutdown()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	client := &http.Client{Timeout: 15 * time.Second}
+	for _, tenantID := range []string{"clear-a", "clear-b"} {
+		request, err := http.NewRequest(
+			http.MethodPut,
+			"http://"+tc.httpAddrs[follower]+"/api/v1/admin/tenants/"+tenantID,
+			strings.NewReader(`{"name":"`+tenantID+`","max_workers":4}`),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil || response.StatusCode != http.StatusOK {
+			t.Fatalf(
+				"create %s status=%s body=%s read=%v",
+				tenantID,
+				response.Status,
+				payload,
+				readErr,
+			)
+		}
+	}
+	tc.waitFor(func() bool {
+		for _, nd := range tc.nodes {
+			if len(nd.RaftCluster().FSM().GetAllTenants()) != 2 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "two tenants replicate to every voter")
+	tc.waitAllocation(10 * time.Second)
+
+	started, release := tc.proc.gate("clear-a")
+	defer release()
+	submissionBody, err := json.Marshal(types.BatchTaskSubmitRequest{
+		Tasks: []types.TaskSubmitRequest{{
+			TenantID: "clear-a", Payload: json.RawMessage(`{"gate":true}`),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitResponse, err := client.Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+		"application/json",
+		bytes.NewReader(submissionBody),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var submitted types.BatchTaskResponse
+	if err := json.NewDecoder(submitResponse.Body).Decode(&submitted); err != nil {
+		submitResponse.Body.Close()
+		t.Fatal(err)
+	}
+	submitResponse.Body.Close()
+	if submitResponse.StatusCode != http.StatusAccepted ||
+		len(submitted.Tasks) != 1 {
+		t.Fatalf(
+			"submit gated task status=%s tasks=%d",
+			submitResponse.Status,
+			len(submitted.Tasks),
+		)
+	}
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("gated task did not begin execution")
+	}
+
+	clearTenants := func() (int, []byte) {
+		request, requestErr := http.NewRequest(
+			http.MethodDelete,
+			"http://"+tc.httpAddrs[follower]+"/api/v1/admin/tenants",
+			nil,
+		)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		response, requestErr := client.Do(request)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		payload, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		return response.StatusCode, payload
+	}
+
+	blockedStatus, blockedBody := clearTenants()
+	if blockedStatus != http.StatusConflict ||
+		!bytes.Contains(blockedBody, []byte("1 unfinished tasks")) {
+		t.Fatalf(
+			"unfinished clear status=%d body=%s",
+			blockedStatus,
+			blockedBody,
+		)
+	}
+	for index, nd := range tc.nodes {
+		if got := len(nd.RaftCluster().FSM().GetAllTenants()); got != 2 {
+			t.Fatalf("blocked clear left %d tenants on node-%d, want 2", got, index)
+		}
+	}
+
+	release()
+	taskID := submitted.Tasks[0].TaskID
+	tc.waitFor(func() bool {
+		result := tc.fsms().GetResult(taskID)
+		return result != nil && result.Status == types.TaskStatusDone
+	}, 10*time.Second, "gated task durable completion")
+	successStatus, successBody := clearTenants()
+	if successStatus != http.StatusOK ||
+		!bytes.Contains(successBody, []byte(`"deleted":2`)) {
+		t.Fatalf(
+			"idle clear status=%d body=%s",
+			successStatus,
+			successBody,
+		)
+	}
+	tc.waitFor(func() bool {
+		for _, nd := range tc.nodes {
+			fsm := nd.RaftCluster().FSM()
+			if len(fsm.GetAllTenants()) != 0 {
+				return false
+			}
+			for _, allocation := range fsm.GetAllAllocations() {
+				if len(allocation.Tenants) != 0 || len(allocation.Borrowed) != 0 {
+					return false
+				}
+			}
+			if result := fsm.GetResult(taskID); result == nil ||
+				result.Status != types.TaskStatusDone {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "atomic tenant clear replicates and preserves final result")
+	if got := tc.proc.processedTaskCount(taskID); got != 1 {
+		t.Fatalf("gated task processed %d times, want exactly once", got)
+	}
+
+	rejectedSubmit, err := client.Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+		"application/json",
+		bytes.NewReader(submissionBody),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectedBody, readErr := io.ReadAll(rejectedSubmit.Body)
+	rejectedSubmit.Body.Close()
+	if readErr != nil || rejectedSubmit.StatusCode != http.StatusNotFound {
+		t.Fatalf(
+			"post-clear submit status=%s body=%s read=%v",
+			rejectedSubmit.Status,
+			rejectedBody,
+			readErr,
+		)
+	}
+}
+
 // TestWorkloadAutoscalerReadsRealClusterBacklogAndScalesOnlyWorkers preserves
 // HPA-003 across the real Raft, follower HTTP, allocator, and execution path.
 // A gated Processor creates both pending and running work while the production

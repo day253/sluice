@@ -152,6 +152,69 @@ func TestApplyDeleteTenant(t *testing.T) {
 	}
 }
 
+func TestDeleteAllTenantsRequiresIdleStateAndPreservesCompletedHistory(t *testing.T) {
+	fsm := newTestFSM(t)
+	for _, tenantID := range []string{"tenant-a", "tenant-b"} {
+		applyCmd(t, fsm, OpUpsertTenant, types.TenantConfig{
+			ID: tenantID, MaxWorkers: 10,
+		})
+	}
+	applyCmd(t, fsm, OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"worker-1": {
+			NodeID: "worker-1",
+			Tenants: map[string]int{
+				"tenant-a": 6,
+				"tenant-b": 4,
+			},
+			Borrowed: map[string]int{"tenant-a": 2},
+		},
+	})
+	applyCmd(t, fsm, OpCreateTask, CreateTaskData{
+		TaskID: "unfinished", TenantID: "tenant-a", Payload: `{}`,
+	})
+
+	blocked := applyCmd(
+		t,
+		fsm,
+		OpDeleteAllTenants,
+		DeleteAllTenantsData{},
+	).(*DeleteAllTenantsResult)
+	if blocked.Deleted != 0 || blocked.Unfinished != 1 {
+		t.Fatalf("blocked bulk delete = %+v, want unfinished=1", blocked)
+	}
+	if got := len(fsm.GetAllTenants()); got != 2 {
+		t.Fatalf("blocked bulk delete retained %d tenants, want 2", got)
+	}
+	allocation, ok := fsm.GetAllocation("worker-1")
+	if !ok || sumWorkers(allocation.Tenants) != 10 || allocation.Borrowed["tenant-a"] != 2 {
+		t.Fatalf("blocked bulk delete changed allocation: %+v", allocation)
+	}
+
+	applyCmd(t, fsm, OpCompleteTask, CompleteTaskData{
+		TaskID: "unfinished", TenantID: "tenant-a", Result: "done",
+	})
+	deleted := applyCmd(
+		t,
+		fsm,
+		OpDeleteAllTenants,
+		DeleteAllTenantsData{},
+	).(*DeleteAllTenantsResult)
+	if deleted.Deleted != 2 || deleted.Unfinished != 0 {
+		t.Fatalf("successful bulk delete = %+v, want deleted=2", deleted)
+	}
+	if got := len(fsm.GetAllTenants()); got != 0 {
+		t.Fatalf("bulk delete retained %d tenants", got)
+	}
+	allocation, ok = fsm.GetAllocation("worker-1")
+	if !ok || len(allocation.Tenants) != 0 || len(allocation.Borrowed) != 0 {
+		t.Fatalf("bulk delete retained tenant allocation: %+v", allocation)
+	}
+	if result := fsm.GetResult("unfinished"); result == nil ||
+		result.Status != types.TaskStatusDone {
+		t.Fatalf("bulk delete removed completed history: %+v", result)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Node tests
 // ---------------------------------------------------------------------------

@@ -108,6 +108,7 @@ func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/tasks/{task_id}/wait", h.waitTask).Methods("GET")
 
 	r.HandleFunc("/api/v1/admin/tenants", h.listTenants).Methods("GET")
+	r.HandleFunc("/api/v1/admin/tenants", h.deleteAllTenants).Methods("DELETE")
 	r.HandleFunc("/api/v1/admin/tenants/{tenant_id}", h.upsertTenant).Methods("PUT")
 	r.HandleFunc("/api/v1/admin/tenants/{tenant_id}", h.deleteTenant).Methods("DELETE")
 
@@ -369,6 +370,18 @@ func (h *Handler) deleteTenant(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (h *Handler) deleteAllTenants(w http.ResponseWriter, r *http.Request) {
+	resp, err := h.svc.DeleteAllTenants(
+		r.Context(),
+		&grpcv1.DeleteAllTenantsRequest{},
+	)
+	if err != nil {
+		h.writeGRPCError(w, err)
+		return
+	}
+	h.writeJSON(w, http.StatusOK, map[string]int32{"deleted": resp.Deleted})
+}
+
 func (h *Handler) listTenants(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.svc.ListTenants(r.Context(), &grpcv1.ListTenantsRequest{})
 	if err != nil {
@@ -614,6 +627,8 @@ func (h *Handler) writeGRPCError(w http.ResponseWriter, err error) {
 		httpCode = http.StatusBadRequest
 	case codes.NotFound:
 		httpCode = http.StatusNotFound
+	case codes.FailedPrecondition:
+		httpCode = http.StatusConflict
 	case codes.DeadlineExceeded:
 		httpCode = http.StatusRequestTimeout
 	case codes.Unavailable:
