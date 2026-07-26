@@ -68,16 +68,54 @@ func TestDashboardChartsExposeRawJSONLinks(t *testing.T) {
 	}
 	body := recorder.Body.String()
 	for _, fragment := range []string{
+		`href="/api/v1/admin/autoscaling"`,
+		`aria-label="View autoscaling diagnostics as JSON"`,
 		`href="/api/v1/metrics?prefix=allocated-workers%3Anode%3A&amp;performance=0"`,
 		`aria-label="View worker allocation history as JSON"`,
 		`href="/api/v1/metrics?prefix=unfinished%3A&amp;performance=0"`,
 		`aria-label="View unfinished task history as JSON"`,
+		`aria-label="View performance diagnostics as JSON"`,
 		`aria-label="View Raft Apply history as JSON"`,
 		`aria-label="View scheduler history as JSON"`,
 		`target="_blank" rel="noopener"`,
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Errorf("dashboard is missing raw JSON link fragment %q", fragment)
+		}
+	}
+}
+
+func TestDashboardUsesOneCompactJSONLinkStyle(t *testing.T) {
+	handler := Handler(http.NotFoundHandler())
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	body := recorder.Body.String()
+	if count := strings.Count(body, `class="json-link"`); count != 8 {
+		t.Fatalf("compact JSON control count = %d, want 8", count)
+	}
+	for _, fragment := range []string{
+		`.json-link{display:inline-flex;align-items:center;border:0;background:transparent;`,
+		`padding:0;font-size:10px;`,
+		`aria-label="View current workload run as JSON">JSON ↗</button>`,
+		`aria-label="View saved workload run as JSON">JSON ↗</button>`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Errorf("dashboard is missing compact JSON control fragment %q", fragment)
+		}
+	}
+	for _, legacy := range []string{
+		`btn-link`,
+		`chart-json-link`,
+		`load-run-json`,
+		`View JSON ↗`,
+		`View raw JSON ↗`,
+	} {
+		if strings.Contains(body, legacy) {
+			t.Errorf("dashboard still contains legacy large/mixed JSON control %q", legacy)
 		}
 	}
 }

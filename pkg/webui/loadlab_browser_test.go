@@ -467,6 +467,40 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	if !strings.Contains(currentText, "6") || !strings.Contains(currentText, "All 6 tasks drained") {
 		t.Fatalf("current execution did not show completed load: %q", currentText)
 	}
+	var jsonControls struct {
+		Count       int     `json:"count"`
+		AllCompact  bool    `json:"allCompact"`
+		AllLabels   bool    `json:"allLabels"`
+		LegacyCount int     `json:"legacyCount"`
+		MaxHeight   float64 `json:"maxHeight"`
+	}
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`(() => {
+		const controls = [...document.querySelectorAll(".json-link")];
+		const heights = controls.map(control => control.getBoundingClientRect().height);
+		return {
+			count: controls.length,
+			allCompact: controls.every(control => {
+				const style = getComputedStyle(control);
+				return style.fontSize === "10px" &&
+					style.paddingTop === "0px" && style.paddingRight === "0px" &&
+					style.paddingBottom === "0px" && style.paddingLeft === "0px" &&
+					style.borderTopWidth === "0px" &&
+					!control.classList.contains("btn");
+			}),
+			allLabels: controls.every(control => control.textContent.trim() === "JSON ↗"),
+			legacyCount: document.querySelectorAll(
+				".btn-link,.chart-json-link,.load-run-json"
+			).length,
+			maxHeight: Math.max(0, ...heights),
+		};
+	})()`, &jsonControls)); err != nil {
+		t.Fatal(err)
+	}
+	if jsonControls.Count < 8 || !jsonControls.AllCompact ||
+		!jsonControls.AllLabels || jsonControls.LegacyCount != 0 ||
+		jsonControls.MaxHeight > 14 {
+		t.Fatalf("JSON controls are not uniformly compact: %+v", jsonControls)
+	}
 	if err := chromedp.Run(ctx,
 		chromedp.Evaluate(`window.confirm=()=>true`, nil),
 		chromedp.Click("#clear-tenants", chromedp.ByQuery),

@@ -733,6 +733,24 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   `ERR_BLOCKED_BY_CLIENT` 拦截裸 JSON 顶层导航，因此不把“自动浏览器新页渲染”描述为已覆盖；
   该限制不影响生产 HTTP 端点或 Dashboard 自身的同源 JSON 请求。
 
+### UI-006：原始 JSON 入口统一为紧凑链接
+
+- **需求**：Autoscaling、Worker allocation、Unfinished tasks、Performance 顶层诊断、两张
+  Performance 子图以及 Load Lab 当前/历史 run 的 JSON 入口统一显示为 `JSON ↗` 小号文本
+  链接。标题栏不再使用带边框、内边距和按钮高度的 `View JSON` 大按钮；负载记录也不再维护
+  独立的 9px 样式。
+- **交互与可访问性**：HTTP JSON 使用同一 `json-link` anchor 样式并继续
+  `target="_blank" rel="noopener"`；浏览器本地 run JSON 使用同一视觉样式的 button，
+  继续通过 Blob 新页打开。视觉文案统一，但每个入口保留描述具体数据源的 `aria-label`，
+  不能因紧凑化混淆 Autoscaling、Metrics、Leader performance 或某次 run。
+- **范围与存储**：本次只合并 CSS/文案，不删除任何原始 JSON 能力、不合并后端端点、不增加
+  Dashboard 请求，也不改变 174 点历史、Leader 代理、Load Lab `localStorage` 或 Raft/FSM
+  数据。小入口仍位于原面板语义上下文内。
+- **回归覆盖**：`pkg/webui.TestDashboardUsesOneCompactJSONLinkStyle` 固定唯一 class、10px、
+  零 border/padding、统一文案并禁止三套旧样式；真实 Chrome
+  `TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON` 在静态诊断链接和动态
+  current/history run 都出现后检查全部入口的 computed size、class、文案和旧控件数量。
+
 ### RESULT-001：每节点完成流放大 Raft 日志
 
 - **风险**：Assignment 修复后，大量节点可能同时完成任务；若 ResultStream 各自提交
