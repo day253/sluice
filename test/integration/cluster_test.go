@@ -3275,6 +3275,134 @@ func TestFullClusterRestartRecoversExpiredClaims(t *testing.T) {
 	t.Log("full restart: pending and expired inflight work drained exactly once")
 }
 
+// TestStatelessWorkerSurvivesResultStreamLossWithoutLocalRaft preserves
+// RECOVERY-004. A stateless execution process has no local Raft handle. If all
+// control voters are temporarily unavailable after business execution, the
+// result client must return a retryable commit error instead of dereferencing
+// a nil Raft fallback and crashing the Worker process. The durable inflight
+// claim remains authoritative and is retried after the control plane recovers.
+func TestStatelessWorkerSurvivesResultStreamLossWithoutLocalRaft(t *testing.T) {
+	const (
+		tenantID = "result-stream-recovery"
+		workerID = "result-stream-worker"
+	)
+	tc := newTestCluster(t, 3, 0)
+	defer tc.shutdown()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader before result-stream recovery case")
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(
+			raftpkg.OpSetControlNodes,
+			raftpkg.SetControlNodesData{NodeIDs: []string{"node-0", "node-1", "node-2"}},
+		),
+		5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("set control-only voters: %v", err)
+	}
+	tc.addTenant(tenantID, 1)
+
+	errorCore, errorLogs := observer.New(zap.ErrorLevel)
+	workerLogger := zap.New(errorCore)
+	execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+		NodeID: workerID, APIAddress: "127.0.0.1:0",
+		ControllerAddress: tc.httpAddrs[(leader+1)%len(tc.nodes)], TotalWorkers: 1,
+	}, tc.proc, workerLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = execution.Shutdown(5 * time.Second) }()
+	workerStopped := make(chan error, 1)
+	go func() { workerStopped <- execution.Start() }()
+
+	tc.waitFor(func() bool {
+		info := tc.fsms().GetAllNodes()[workerID]
+		allocation, allocated := tc.fsms().GetAllocation(workerID)
+		return info != nil && info.Status == types.NodeStatusUp &&
+			info.Role == types.NodeRoleWorker && allocated &&
+			sumIntegrationWorkers(allocation.Tenants) == 1 &&
+			sumIntegrationWorkers(execution.Pool().GetStatus()) == 1
+	}, 15*time.Second, "stateless Worker registers before result-stream loss")
+
+	started, release := tc.proc.gate(tenantID)
+	defer release()
+	submissionBody, err := json.Marshal(types.BatchTaskSubmitRequest{
+		Tasks: []types.TaskSubmitRequest{{
+			TenantID: tenantID, Payload: json.RawMessage(`{"case":"RECOVERY-004"}`),
+			IdempotencyKey: "recovery-004-result-stream-loss",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := (&http.Client{Timeout: 10 * time.Second}).Post(
+		"http://"+tc.httpAddrs[(leader+1)%len(tc.nodes)]+"/api/v1/tasks/batch",
+		"application/json",
+		bytes.NewReader(submissionBody),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusAccepted {
+		payload, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		t.Fatalf("submit recovery workload status=%s body=%s", response.Status, payload)
+	}
+	var accepted types.BatchTaskResponse
+	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if len(accepted.Tasks) != 1 {
+		t.Fatalf("accepted tasks = %d, want 1", len(accepted.Tasks))
+	}
+	taskID := accepted.Tasks[0].TaskID
+	select {
+	case got := <-started:
+		if got != taskID {
+			t.Fatalf("started task = %s, want %s", got, taskID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("stateless Processor did not start before control outage")
+	}
+
+	tc.stopAllForRestart()
+	release()
+	tc.waitFor(func() bool {
+		return errorLogs.FilterMessage(
+			"task result was not committed; lease recovery will retry the task",
+		).Len() > 0
+	}, 5*time.Second, "stateless Worker returns uncommitted result without crashing")
+	select {
+	case err := <-workerStopped:
+		t.Fatalf("stateless Worker stopped during result-stream outage: %v", err)
+	default:
+	}
+
+	tc.recreateAllForRestart()
+	for index := range tc.nodes {
+		go func(idx int) { _ = tc.nodes[idx].Start() }(index)
+	}
+	tc.waitAnyLeader(30 * time.Second)
+	tc.waitFor(func() bool {
+		result := tc.fsms().GetResult(taskID)
+		return result != nil && result.Status == types.TaskStatusDone
+	}, taskClaimRecoveryTimeout(), "uncommitted result recovers after controls restart")
+	if got := tc.proc.processedTaskCount(taskID); got != 2 {
+		t.Fatalf(
+			"task executions across uncommitted-result recovery = %d, want 2 "+
+				"(original execution plus lease retry)",
+			got,
+		)
+	}
+	if unfinished := tc.fsms().CountUnfinishedPerTenant()[tenantID]; unfinished != 0 {
+		t.Fatalf("unfinished tasks after result-stream recovery = %d, want 0", unfinished)
+	}
+}
+
 // TestLargePersistedBacklogRestoresAcrossFullClusterRestart preserves
 // RECOVERY-003. A control voter must rebuild a benchmark-sized pending set
 // after every process is replaced without needing any execution-plane state.

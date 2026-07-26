@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -30,6 +31,33 @@ type mockRaftApplier struct {
 type followerRaftApplier struct{ mockRaftApplier }
 
 func (f *followerRaftApplier) IsLeader() bool { return false }
+
+type failingTaskClient struct {
+	mu               sync.Mutex
+	err              error
+	claimAttempts    int
+	completeAttempts int
+}
+
+func (c *failingTaskClient) Claim(_, _, _ string) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.claimAttempts++
+	return false, c.err
+}
+
+func (c *failingTaskClient) Complete(_, _, _, _ string, _ bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.completeAttempts++
+	return c.err
+}
+
+func (c *failingTaskClient) attempts() (claim, complete int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.claimAttempts, c.completeAttempts
+}
 
 func (m *mockRaftApplier) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {
 	m.mu.Lock()
@@ -182,6 +210,34 @@ func (p *mockProcessor) processedCount() int {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+func TestStatelessPoolReturnsForwardingErrorsWithoutLocalRaftFallback(t *testing.T) {
+	forwardErr := errors.New("control stream unavailable")
+	client := &failingTaskClient{err: forwardErr}
+	pool := NewPool("stateless-worker", nil, nil, nil, &mockProcessor{}, zap.NewNop())
+	pool.DisableLegacyScheduling()
+	pool.SetClaimer(client)
+	pool.SetCompleter(client)
+
+	if err := pool.claimTask(&types.TaskRecord{
+		TaskID: "claim-during-rollout", TenantID: "tenant-a", Payload: `{}`,
+	}, false); !errors.Is(err, forwardErr) {
+		t.Fatalf("claim error = %v, want wrapped forwarding error", err)
+	}
+	if err := pool.completeTask(
+		"complete-during-rollout", "tenant-a", `{"ok":true}`, "", false,
+	); !errors.Is(err, forwardErr) {
+		t.Fatalf("completion error = %v, want wrapped forwarding error", err)
+	}
+	claimAttempts, completeAttempts := client.attempts()
+	if claimAttempts != 1 || completeAttempts != 3 {
+		t.Fatalf(
+			"forwarding attempts = claim %d complete %d, want 1/3",
+			claimAttempts,
+			completeAttempts,
+		)
+	}
+}
 
 func TestPoolReconcile_SpawnsWorkers(t *testing.T) {
 	q := queue.NewMemoryQueue()

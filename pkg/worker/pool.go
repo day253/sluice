@@ -517,6 +517,7 @@ func (p *Pool) findStealTask(tenantID string) *types.TaskRecord {
 // claimTask claims a task.  Uses streaming claim client if available
 // (works from any node); falls back to direct raft.Apply (leader only).
 func (p *Pool) claimTask(task *types.TaskRecord, steal bool) error {
+	var forwardErr error
 	if p.claimer != nil {
 		var ok bool
 		var err error
@@ -530,12 +531,22 @@ func (p *Pool) claimTask(task *types.TaskRecord, steal bool) error {
 			ok, err = p.claimer.Claim(task.TaskID, task.TenantID, task.Payload)
 		}
 		if err != nil {
+			forwardErr = err
 			p.logger.Warn("claim stream failed, trying raft", zap.Error(err))
 		} else if ok {
 			return nil
 		} else {
 			return fmt.Errorf("claim rejected")
 		}
+	}
+	if p.raft == nil {
+		if forwardErr != nil {
+			return fmt.Errorf(
+				"claim forwarding failed and no local raft fallback is configured: %w",
+				forwardErr,
+			)
+		}
+		return fmt.Errorf("claim unavailable: no forwarding client or local raft fallback is configured")
 	}
 	data := raftpkg.ClaimTaskData{
 		TaskID:   task.TaskID,
@@ -550,8 +561,8 @@ func (p *Pool) claimTask(task *types.TaskRecord, steal bool) error {
 
 // completeTask publishes the final result (done or failed) to Raft.
 func (p *Pool) completeTask(taskID, tenantID, result, errStr string, failed bool) error {
+	var lastErr error
 	if p.completer != nil {
-		var lastErr error
 		for attempt := 0; attempt < 3; attempt++ {
 			if lastErr = p.completer.Complete(taskID, tenantID, result, errStr, failed); lastErr == nil {
 				return nil
@@ -565,6 +576,15 @@ func (p *Pool) completeTask(taskID, tenantID, result, errStr string, failed bool
 			}
 		}
 		p.logger.Warn("result stream failed, trying raft", zap.Error(lastErr))
+	}
+	if p.raft == nil {
+		if lastErr != nil {
+			return fmt.Errorf(
+				"result forwarding failed and no local raft fallback is configured: %w",
+				lastErr,
+			)
+		}
+		return fmt.Errorf("result commit unavailable: no forwarding client or local raft fallback is configured")
 	}
 	op := raftpkg.OpCompleteTask
 	if failed {

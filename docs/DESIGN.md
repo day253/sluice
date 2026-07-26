@@ -185,6 +185,27 @@
   HTTP 持久化 20k pending，停止并重建全部进程后再注册无状态 Worker，要求全部
   exactly-once final state 排空。远程 MicroK8s 保留 235k 历史状态进行同一恢复门禁。
 
+### RECOVERY-004：无状态 Worker 的转发失败不能回退到空 Raft
+
+- **已复现故障**：远程 revision 63 在约 30 万积压和 90 个 Worker 下滚动 control。
+  ResultStream 断开后，少数 Worker 连续三次 Leader 转发失败；旧实现继续执行面向
+  combined-role 节点的 `p.raft.Apply` fallback，但 stateless Worker 按设计没有 Raft
+  handle，最终在 `completeTask` 空指针崩溃并由 Kubernetes 重启。ClaimStream 的失败
+  分支存在同样的潜在空指针。
+- **角色与失败语义**：只有 legacy combined-role 进程拥有本地 Raft fallback。
+  stateless Worker 的 Claim/Result 转发失败时返回带原始网络错误的未提交结果，释放本地
+  active 标记并保持 durable inflight claim；Leader 恢复后由既有 30 秒 claim lease
+  重新置 pending 和分配。Worker 进程不能崩溃，也不能把未得到 Raft ACK 的结果当作完成。
+- **正确性边界**：最终状态仍只由 Leader 经 Raft 提交一次；第一次 Processor 已执行但
+  完成结果未提交时，恢复后允许再次执行，因此业务 Processor/下游副作用仍必须幂等。
+  本 Case 不引入本地 Worker WAL、不缩短 lease、不让 Worker 自主决定 task owner，也不
+  把 result stream 的进程内错误写入 Raft/FSM/snapshot。
+- **回归覆盖**：Worker 单测对 nil local Raft 的 Claim/Result 转发错误直接断言返回而非
+  panic，并保留 Result 三次有界重试。真实集成启动三 control voter、Follower HTTP 和
+  stateless Worker，在 Processor 已开始后停止全部 control，再释放 Processor；要求
+  观察“结果未提交、等待 lease”而 Worker 进程仍存活，重建原 Raft 目录后任务以一次
+  lease retry 收敛到唯一 final state、最终 unfinished=0。
+
 ### DEPLOY-003：Worker 扩容不能占满 control rollout 的 Pod 配额
 
 - **已复现故障**：235k backlog 把 Worker autoscaler 推到 100；单节点 kubelet 最多接纳

@@ -971,3 +971,45 @@ termination 为空；17:36:43 的统一快照为 unfinished/pending/running=0/0/
 69.9/130.0/82.0/70.0/112.8MiB，证明 512Mi 的恢复尖峰余量过小而 2Gi 门禁未触发新的
 OOM。该窗口的 telemetry completed counter 为 232381，但 Leader epoch 与故障前的
 235k 初值不一致，因此只记录“有界恢复并排空”，不据此计算或宣称生产吞吐提升。
+
+### 7.14 ResultStream 断流恢复与正常路径复核（2026-07-26）
+
+RECOVERY-004 只在 stateless Worker 的 Claim/Result 转发已经失败、且没有本地 Raft
+handle 时把空指针 fallback 改为显式错误；转发成功、Leader batching、Raft Apply、
+pending selection 和 Processor 路径均未改变。为防止恢复修复意外影响正常消费，本轮重跑
+仓库固定的 PERF-001 形状，不把更早、代码阶段不同的单轮数值当作严格前后对比。
+
+环境为 Apple M4 Pro（14 logical CPU、48GiB、darwin/arm64、Go 1.26.5），
+`-race -count=1`，单故障域真实 7 replica/3 voter/4 non-voter、单 Raft shard。每个
+进程配置 80 个执行槽，Leader 不执行，最大 live Processor 容量为 480；四个 tenant
+各 Limit 120，共 20000 个小 JSON `{"index":N}` 任务，每条有唯一幂等键。请求经真实
+Follower `/api/v1/tasks/batch` 顺序提交，batch=1000、HTTP concurrency=1；测试
+Processor 每条固定约 10ms。
+
+| 阶段 | 耗时/结果 |
+|---|---:|
+| 20k Follower HTTP durable submit | 2.967s |
+| accepted 后排空 | 11.400s |
+| submit 开始至排空 | 14.367s（1392.1 task/s） |
+| 请求错误 / 最终 unfinished / 单任务重复执行 | 0 / 0 / 0 |
+
+该基线整个 Case 为 19.07 秒。文档 3 节保留的早期同名 Case 为
+submit=1.338s、drain=43.800s，但两者之间已经跨过角色拆分、全局 batching、pending
+索引和多次调度优化，不能把差值归因于本次 nil guard，也不能据此宣称本次性能提升；
+当前结论仅为正常成功路径未出现明显功能性回退。
+
+故障形状另由 RECOVERY-004 集成 Case 固定：三 voter、一个 1-slot stateless Worker，
+真实 Follower HTTP 接受一条任务并让 Processor 开始，随后全部 control 停止；结果转发
+失败时 Worker 保持存活，原 Bolt/Raft 目录重建后由 30 秒 lease 触发一次重执行，最终
+unfinished=0 且 final state 只提交一次。第一次业务执行已经发生却没有完成 ACK，所以
+该 Case 预期 Processor 调用数为 2；这是既有 at-least-once 副作用边界，不是重复 final
+commit。`-race` 下 Case 为 36.11 秒。
+
+远程触发证据来自 revision 63
+`localhost:32000/sluice:d8f05c2-20260726094705`：control rollout 时多个 Worker 的
+ResultStream 报 `not connected`，随后在 `pkg/worker.(*Pool).completeTask` 的 nil
+`p.raft.Apply` 以 SIGSEGV/exit 2 重启。该轮 backlog autoscaler 已按 queue depth
+从 5→15→30→60→90；90 Worker、9000 slots 时统一日志中的 completion rate 从约
+856 上升到峰值约 5102 task/s，unfinished 最终为 0，随后空闲缩容从 90→68→39。
+这个变化同时包含扩容、control rollout 和 Leader telemetry epoch 切换，只用于证明 HPA
+已响应及定位崩溃窗口，不作为可比较吞吐基线。
