@@ -227,6 +227,25 @@
   migration/Helm 之前；真实 MicroK8s 在 100 Worker/110 Pod 上限下复现 FailedScheduling，
   暂停并缩容后要求 control 5/5 rollout，再由 autoscaler 在 max=90 内恢复执行容量。
 
+### DEPLOY-004：部署门禁必须尊重单实例容量覆盖
+
+- **已复现故障**：revision 64 已完成 5 control/5 Worker rollout，但 `worker-0` 之前经
+  生产 API 持久配置为 1000 个 Processor slot，重启后 FSM 正确恢复为
+  `1000+4×100=1400`。旧 verifier 把 Kubernetes Ready 数硬乘启动默认
+  `5×100=500`，因此持续误报 topology 未收敛。
+- **配置与镜像边界**：`NodeInfo.TotalWorkers` 是当前 live 有效容量，
+  `CapacityOverride` 是 Raft 中的 durable 当前配置；它们都不是历史时序。Kubernetes
+  replica 数只能验证实例数量，不能反向覆盖每实例容量。部署门禁从同一 FSM nodes
+  snapshot 读取每个 up Worker 的 1..1000 容量并求和，同时要求每个 allocation 的 tenant
+  总数不超过其 owner 的实际容量。
+- **正确性与非目标**：allocation 仍只能属于 up Worker，control 容量必须为 0，重复
+  Node/allocation owner 仍拒绝。校验不修改 capacity override、不把配置重置为 Chart
+  默认、不改变 HPA replica recommendation，也不为容量变化新增 Raft 历史。
+- **回归覆盖**：Python validator 单测固定两个 Worker 为 1000/100 并接受 1100 总容量，
+  同时拒绝超出某实例实际容量的 allocation。生产 shell/Python 集成 Case 在 50→38 并发
+  缩容重试中让一个 Worker 为 1000，要求最终报告真实 4700 容量，而非
+  `38×100=3800`。
+
 ## 任务生命周期
 
 ```

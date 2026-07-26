@@ -15,7 +15,9 @@ import (
 // HPA-010 at the production shell/Python boundary. The first observation sees
 // 50 Ready replicas while the FSM already contains the post-scale 38 Workers;
 // the verifier must retry, re-read the StatefulSet, and accept the converged
-// 38-Worker topology instead of execing a cached, deleted Pod ordinal.
+// 38-Worker topology instead of execing a cached, deleted Pod ordinal. One
+// Worker also carries a durable 1000-slot capacity override, which must be
+// validated from the FSM instead of overwritten as replicas*startup-default.
 func TestRemoteTopologyVerificationRetriesConcurrentWorkerScaleDown(t *testing.T) {
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
@@ -65,9 +67,13 @@ esac
 		})
 	}
 	for index := 0; index < 38; index++ {
+		capacity := 100
+		if index == 0 {
+			capacity = 1000
+		}
 		nodes = append(nodes, topologyNode{
 			NodeID: fmt.Sprintf("worker-%d", index),
-			Role:   "worker", Status: "up", TotalWorkers: 100,
+			Role:   "worker", Status: "up", TotalWorkers: capacity,
 		})
 	}
 	nodesJSON, err := json.Marshal(map[string]any{"nodes": nodes})
@@ -77,7 +83,7 @@ esac
 
 	command := exec.Command(
 		filepath.Join(repositoryRoot, "scripts/verify-deployed-topology.sh"),
-		"sluice", "default", "5", "5", "100", "100", "60",
+		"sluice", "default", "5", "5", "100", "1000", "60",
 	)
 	command.Dir = repositoryRoot
 	command.Env = append(os.Environ(),
@@ -92,7 +98,10 @@ esac
 		t.Fatalf("scale-safe topology verification failed: %v\n%s", err, output)
 	}
 	if !strings.Contains(string(output), "controls=5 workers=50; retrying") ||
-		!strings.Contains(string(output), "controls=5 workers=38, Raft=5 voter/0 nonvoter") {
+		!strings.Contains(
+			string(output),
+			"controls=5 workers=38 capacity=4700, Raft=5 voter/0 nonvoter",
+		) {
 		t.Fatalf("verification did not observe and recover from concurrent scale-down:\n%s", output)
 	}
 	reads, err := os.ReadFile(statePath)

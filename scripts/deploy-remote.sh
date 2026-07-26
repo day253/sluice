@@ -441,7 +441,7 @@ fi
 printf '\n==> Verifying control and Worker topology\n'
 ./scripts/verify-deployed-topology.sh \
   "${RELEASE}" "${NAMESPACE}" 5 \
-  "${WORKER_MIN_REPLICAS}" "${WORKER_MAX_REPLICAS}" 100 \
+  "${WORKER_MIN_REPLICAS}" "${WORKER_MAX_REPLICAS}" 1000 \
   "${WORKER_SCALE_DOWN_STABILIZATION_SECONDS}"
 
 printf '\nDeployed %s\n' "${IMAGE}"

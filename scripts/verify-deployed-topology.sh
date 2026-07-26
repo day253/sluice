@@ -7,7 +7,7 @@ NAMESPACE="${2:?namespace is required}"
 EXPECTED_CONTROLS="${3:?expected control replicas are required}"
 MIN_WORKERS="${4:?minimum Worker replicas are required}"
 MAX_WORKERS="${5:?maximum Worker replicas are required}"
-WORKERS_PER_POD="${6:-100}"
+MAX_WORKERS_PER_POD="${6:-1000}"
 EXPECTED_SCALE_DOWN_STABILIZATION_SECONDS="${7:?expected scale-down stabilization is required}"
 MICROK8S_BIN="${MICROK8S_BIN:-microk8s}"
 VERIFY_ATTEMPTS="${TOPOLOGY_VERIFY_ATTEMPTS:-60}"
@@ -68,13 +68,13 @@ for _ in $(seq 1 "${VERIFY_ATTEMPTS}"); do
       last_allocations_json="$("${MICROK8S_BIN}" kubectl exec \
         --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
         wget -qO- 'http://127.0.0.1:9090/api/v1/admin/allocations' 2>/dev/null || true)"
-      worker_capacity="$((last_worker_ready * WORKERS_PER_POD))"
       if NODES_JSON="${last_nodes_json}" ALLOCATIONS_JSON="${last_allocations_json}" \
         python3 "$(dirname "$0")/validate-topology.py" \
           --controls "${EXPECTED_CONTROLS}" \
           --workers "${last_worker_ready}" \
-          --worker-capacity "${worker_capacity}" \
+          --max-worker-capacity "${MAX_WORKERS_PER_POD}" \
           >"${validation_log}" 2>&1; then
+        worker_capacity="$(cat "${validation_log}")"
         last_raft_status="$("${MICROK8S_BIN}" kubectl exec \
           --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
           wget -qO- 'http://127.0.0.1:9090/api/v1/admin/raft' 2>/dev/null || true)"
@@ -90,8 +90,8 @@ for _ in $(seq 1 "${VERIFY_ATTEMPTS}"); do
         fi
         if [ "${voter_count}" = "${EXPECTED_CONTROLS}" ] &&
           [ "${nonvoter_count}" = "0" ]; then
-          printf 'Topology verified: controls=%s workers=%s, Raft=%s voter/%s nonvoter\n' \
-            "${last_control_ready}" "${last_worker_ready}" \
+          printf 'Topology verified: controls=%s workers=%s capacity=%s, Raft=%s voter/%s nonvoter\n' \
+            "${last_control_ready}" "${last_worker_ready}" "${worker_capacity}" \
             "${voter_count}" "${nonvoter_count}"
           exit 0
         fi

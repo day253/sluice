@@ -18,7 +18,8 @@ func TestRemoteTopologyValidationAllowsHPAReplicaHistory(t *testing.T) {
 		TotalWorkers int    `json:"total_workers"`
 	}
 	type allocation struct {
-		NodeID string `json:"node_id"`
+		NodeID  string         `json:"node_id"`
+		Tenants map[string]int `json:"tenants,omitempty"`
 	}
 
 	controls := []node{
@@ -45,7 +46,7 @@ func TestRemoteTopologyValidationAllowsHPAReplicaHistory(t *testing.T) {
 			t.Fatal(err)
 		}
 		cmd := exec.Command("python3", "../../../scripts/validate-topology.py",
-			"--controls", "5", "--workers", "2", "--worker-capacity", "200")
+			"--controls", "5", "--workers", "2", "--max-worker-capacity", "1000")
 		cmd.Env = append(os.Environ(),
 			"NODES_JSON="+string(nodesJSON),
 			"ALLOCATIONS_JSON="+string(allocationsJSON),
@@ -70,6 +71,21 @@ func TestRemoteTopologyValidationAllowsHPAReplicaHistory(t *testing.T) {
 	t.Run("retained identity cannot replace an up worker", func(t *testing.T) {
 		nodes := append(append([]node{}, controls...), workers[0], downHistory)
 		run(t, nodes, []allocation{{NodeID: "worker-0"}}, false)
+	})
+	t.Run("durable per-instance capacity override is authoritative", func(t *testing.T) {
+		overriddenWorkers := append([]node{}, workers...)
+		overriddenWorkers[0].TotalWorkers = 1000
+		nodes := append(append([]node{}, controls...), overriddenWorkers...)
+		run(t, nodes, []allocation{
+			{NodeID: "worker-0", Tenants: map[string]int{"large": 1000}},
+			{NodeID: "worker-1", Tenants: map[string]int{"small": 100}},
+		}, true)
+	})
+	t.Run("allocation cannot exceed configured instance capacity", func(t *testing.T) {
+		nodes := append(append([]node{}, controls...), workers...)
+		run(t, nodes, []allocation{
+			{NodeID: "worker-1", Tenants: map[string]int{"overflow": 101}},
+		}, false)
 	})
 }
 
@@ -490,9 +506,10 @@ func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
 	for _, required := range []string{
 		`[ "${last_worker_ready}" -ge "${MIN_WORKERS}" ]`,
 		`[ "${last_worker_ready}" -le "${MAX_WORKERS}" ]`,
-		`worker_capacity="$((last_worker_ready * WORKERS_PER_POD))"`,
+		`MAX_WORKERS_PER_POD="${6:-1000}"`,
+		`worker_capacity="$(cat "${validation_log}")"`,
 		`--workers "${last_worker_ready}"`,
-		`--worker-capacity "${worker_capacity}"`,
+		`--max-worker-capacity "${MAX_WORKERS_PER_POD}"`,
 		`--scale-down-stabilization=${EXPECTED_SCALE_DOWN_STABILIZATION_SECONDS}s`,
 	} {
 		if !strings.Contains(source, required) {
@@ -501,6 +518,9 @@ func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
 	}
 	if strings.Contains(source, `--controls 5 --workers 50 --worker-capacity 5000`) {
 		t.Fatal("remote topology gate still requires the autoscaler to remain at its minimum")
+	}
+	if strings.Contains(source, `last_worker_ready * WORKERS_PER_POD`) {
+		t.Fatal("remote topology gate still overwrites durable per-instance capacity overrides")
 	}
 }
 
