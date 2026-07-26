@@ -246,6 +246,23 @@
   缩容重试中让一个 Worker 为 1000，要求最终报告真实 4700 容量，而非
   `38×100=3800`。
 
+### DEPLOY-005：大拓扑镜像不能通过进程环境传递
+
+- **已复现故障**：revision 67 在 90 Worker 和大量租户 allocation 下完成 rollout，
+  但部署门禁启动 Python validator 时偶发报
+  `/usr/bin/python3: Argument list too long`。随着任务排空、镜像缩小，同一次部署稍后
+  又能通过，说明失败来自 OS `ARG_MAX`，不是集群拓扑不一致。
+- **数据边界**：nodes/allocation 是部署校验读取的 FSM 当前镜像，大小随 live Worker
+  和租户数增长；它不是部署脚本的配置，也不应复制进子进程环境。生产 verifier 将两个
+  HTTP 响应分别写入仅本进程可见的临时文件，Python 通过文件路径读取并在退出时清理。
+- **正确性与非目标**：validator 仍对同一轮快照执行 control/Worker 数、角色、状态、
+  每实例容量和 allocation owner 上限校验；本变更不修改 FSM、Raft、allocation、
+  autoscaler 或任务生命周期。校验失败只输出 snapshot 字节数和具体 validator 错误，
+  不把完整租户镜像写入部署日志。
+- **回归覆盖**：单测通过文件接口校验超过 2 MiB 的 allocation JSON，并静态禁止生产
+  verifier 恢复 `NODES_JSON`/`ALLOCATIONS_JSON` 传参；集成测试执行真实 shell/Python
+  边界，以 5 control、90 Worker、120,000 个租户键要求一次报告 13,500 总容量。
+
 ## 任务生命周期
 
 ```

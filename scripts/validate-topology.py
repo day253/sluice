@@ -65,14 +65,28 @@ def topology_is_valid(
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--nodes-file")
+    parser.add_argument("--allocations-file")
     parser.add_argument("--controls", type=int, required=True)
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--max-worker-capacity", type=int, required=True)
     args = parser.parse_args()
 
     try:
-        nodes_payload = json.loads(os.environ["NODES_JSON"])
-        allocations_payload = json.loads(os.environ["ALLOCATIONS_JSON"])
+        if bool(args.nodes_file) != bool(args.allocations_file):
+            raise ValueError(
+                "--nodes-file and --allocations-file must be provided together"
+            )
+        if args.nodes_file:
+            with open(args.nodes_file, encoding="utf-8") as nodes_file:
+                nodes_payload = json.load(nodes_file)
+            with open(args.allocations_file, encoding="utf-8") as allocations_file:
+                allocations_payload = json.load(allocations_file)
+        else:
+            # Retain the environment input for direct callers while the production
+            # verifier uses files so large allocation snapshots never hit ARG_MAX.
+            nodes_payload = json.loads(os.environ["NODES_JSON"])
+            allocations_payload = json.loads(os.environ["ALLOCATIONS_JSON"])
         valid = topology_is_valid(
             nodes_payload,
             allocations_payload,
@@ -80,7 +94,7 @@ def main():
             args.workers,
             args.max_worker_capacity,
         )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
         valid = False
 
     if valid:

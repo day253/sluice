@@ -2,6 +2,7 @@ package charttest
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -45,12 +46,19 @@ func TestRemoteTopologyValidationAllowsHPAReplicaHistory(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		tempDir := t.TempDir()
+		nodesPath := tempDir + "/nodes.json"
+		allocationsPath := tempDir + "/allocations.json"
+		if err := os.WriteFile(nodesPath, nodesJSON, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(allocationsPath, allocationsJSON, 0o600); err != nil {
+			t.Fatal(err)
+		}
 		cmd := exec.Command("python3", "../../../scripts/validate-topology.py",
+			"--nodes-file", nodesPath,
+			"--allocations-file", allocationsPath,
 			"--controls", "5", "--workers", "2", "--max-worker-capacity", "1000")
-		cmd.Env = append(os.Environ(),
-			"NODES_JSON="+string(nodesJSON),
-			"ALLOCATIONS_JSON="+string(allocationsJSON),
-		)
 		err = cmd.Run()
 		if wantValid && err != nil {
 			t.Fatalf("expected topology to be valid: %v", err)
@@ -86,6 +94,17 @@ func TestRemoteTopologyValidationAllowsHPAReplicaHistory(t *testing.T) {
 		run(t, nodes, []allocation{
 			{NodeID: "worker-1", Tenants: map[string]int{"overflow": 101}},
 		}, false)
+	})
+	t.Run("large allocation snapshot is read from files", func(t *testing.T) {
+		tenants := make(map[string]int, 120000)
+		for index := 0; index < 120000; index++ {
+			tenants[fmt.Sprintf("tenant-%06d-with-a-long-stable-name", index)] = 0
+		}
+		nodes := append(append([]node{}, controls...), workers...)
+		run(t, nodes, []allocation{
+			{NodeID: "worker-0", Tenants: tenants},
+			{NodeID: "worker-1"},
+		}, true)
 	})
 }
 
@@ -510,6 +529,8 @@ func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
 		`worker_capacity="$(cat "${validation_log}")"`,
 		`--workers "${last_worker_ready}"`,
 		`--max-worker-capacity "${MAX_WORKERS_PER_POD}"`,
+		`--nodes-file "${nodes_snapshot}"`,
+		`--allocations-file "${allocations_snapshot}"`,
 		`--scale-down-stabilization=${EXPECTED_SCALE_DOWN_STABILIZATION_SECONDS}s`,
 	} {
 		if !strings.Contains(source, required) {
@@ -522,6 +543,10 @@ func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
 	if strings.Contains(source, `last_worker_ready * WORKERS_PER_POD`) {
 		t.Fatal("remote topology gate still overwrites durable per-instance capacity overrides")
 	}
+	if strings.Contains(source, `NODES_JSON="${last_nodes_json}"`) ||
+		strings.Contains(source, `ALLOCATIONS_JSON="${last_allocations_json}"`) {
+		t.Fatal("remote topology gate still passes unbounded snapshots through exec environment")
+	}
 }
 
 func TestRemoteTopologyValidationRetriesConcurrentScaleDown(t *testing.T) {
@@ -532,7 +557,10 @@ func TestRemoteTopologyValidationRetriesConcurrentScaleDown(t *testing.T) {
 	source := string(data)
 	loop := strings.Index(source, `for _ in $(seq 1 "${VERIFY_ATTEMPTS}")`)
 	workerRead := strings.Index(source, `last_worker_ready="$("${MICROK8S_BIN}" kubectl get`)
-	topologyRead := strings.Index(source, `last_nodes_json="$("${MICROK8S_BIN}" kubectl exec`)
+	topologyRead := strings.Index(
+		source,
+		`wget -qO- 'http://127.0.0.1:9090/api/v1/admin/nodes'`,
+	)
 	for _, required := range []string{
 		"Never cache", "statefulset/${WORKER_STATEFULSET}",
 		`Topology not yet converged`, `python3 "$(dirname "$0")/validate-topology.py"`,

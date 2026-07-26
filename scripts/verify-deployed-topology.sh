@@ -16,12 +16,12 @@ VERIFY_INTERVAL_SECONDS="${TOPOLOGY_VERIFY_INTERVAL_SECONDS:-1}"
 STATEFULSET="${RELEASE}-sluice"
 WORKER_STATEFULSET="${RELEASE}-sluice-worker"
 validation_log="$(mktemp)"
-trap 'rm -f "${validation_log}"' EXIT
+nodes_snapshot="$(mktemp)"
+allocations_snapshot="$(mktemp)"
+trap 'rm -f "${validation_log}" "${nodes_snapshot}" "${allocations_snapshot}"' EXIT
 
 last_control_ready=0
 last_worker_ready=0
-last_nodes_json=
-last_allocations_json=
 last_raft_status=
 last_autoscaler_args=
 
@@ -62,14 +62,17 @@ for _ in $(seq 1 "${VERIFY_ATTEMPTS}"); do
         wget -qO- 'http://127.0.0.1:9090/api/v1/health' >/dev/null 2>&1 &&
       "${MICROK8S_BIN}" kubectl exec --namespace "${NAMESPACE}" "pod/${probe_worker}" -- \
         wget -qO- 'http://127.0.0.1:9090/api/v1/health' >/dev/null 2>&1; then
-      last_nodes_json="$("${MICROK8S_BIN}" kubectl exec \
+      "${MICROK8S_BIN}" kubectl exec \
         --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
-        wget -qO- 'http://127.0.0.1:9090/api/v1/admin/nodes' 2>/dev/null || true)"
-      last_allocations_json="$("${MICROK8S_BIN}" kubectl exec \
+        wget -qO- 'http://127.0.0.1:9090/api/v1/admin/nodes' \
+        >"${nodes_snapshot}" 2>/dev/null || true
+      "${MICROK8S_BIN}" kubectl exec \
         --namespace "${NAMESPACE}" "pod/${probe_control}" -- \
-        wget -qO- 'http://127.0.0.1:9090/api/v1/admin/allocations' 2>/dev/null || true)"
-      if NODES_JSON="${last_nodes_json}" ALLOCATIONS_JSON="${last_allocations_json}" \
-        python3 "$(dirname "$0")/validate-topology.py" \
+        wget -qO- 'http://127.0.0.1:9090/api/v1/admin/allocations' \
+        >"${allocations_snapshot}" 2>/dev/null || true
+      if python3 "$(dirname "$0")/validate-topology.py" \
+          --nodes-file "${nodes_snapshot}" \
+          --allocations-file "${allocations_snapshot}" \
           --controls "${EXPECTED_CONTROLS}" \
           --workers "${last_worker_ready}" \
           --max-worker-capacity "${MAX_WORKERS_PER_POD}" \
@@ -105,10 +108,12 @@ for _ in $(seq 1 "${VERIFY_ATTEMPTS}"); do
   fi
 done
 
-printf 'Topology did not converge: controls=%s workers=%s autoscaler_args=%s nodes=%s allocations=%s Raft=%s\n' \
+nodes_bytes="$(wc -c <"${nodes_snapshot}" | tr -d '[:space:]')"
+allocations_bytes="$(wc -c <"${allocations_snapshot}" | tr -d '[:space:]')"
+printf 'Topology did not converge: controls=%s workers=%s autoscaler_args=%s nodes_bytes=%s allocations_bytes=%s Raft=%s\n' \
   "${last_control_ready}" "${last_worker_ready}" \
   "${last_autoscaler_args}" \
-  "${last_nodes_json}" "${last_allocations_json}" "${last_raft_status}" >&2
+  "${nodes_bytes}" "${allocations_bytes}" "${last_raft_status}" >&2
 if [ -s "${validation_log}" ]; then
   cat "${validation_log}" >&2
 fi
