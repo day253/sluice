@@ -1,12 +1,58 @@
 package node
 
 import (
+	"context"
 	"slices"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/types"
 )
+
+func TestWaitForRaftLeaderKeepsProcessAliveAcrossRetryWindows(t *testing.T) {
+	var waits atomic.Int32
+	var warnings atomic.Int32
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	ok := waitForRaftLeader(
+		ctx,
+		time.Millisecond,
+		func(time.Duration) bool {
+			return waits.Add(1) == 3
+		},
+		func() {
+			warnings.Add(1)
+		},
+	)
+	if !ok {
+		t.Fatal("leader wait stopped before a later quorum became available")
+	}
+	if waits.Load() != 3 || warnings.Load() != 2 {
+		t.Fatalf("leader wait calls=%d warnings=%d, want 3 and 2", waits.Load(), warnings.Load())
+	}
+}
+
+func TestWaitForRaftLeaderStopsOnlyWhenNodeContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var waits atomic.Int32
+	ok := waitForRaftLeader(
+		ctx,
+		time.Millisecond,
+		func(time.Duration) bool {
+			if waits.Add(1) == 2 {
+				cancel()
+			}
+			return false
+		},
+		func() {},
+	)
+	if ok || waits.Load() != 2 {
+		t.Fatalf("cancelled leader wait returned ok=%t after %d calls", ok, waits.Load())
+	}
+}
 
 func TestResolveLeaderAPIAddressUsesRegisteredOrRaftHost(t *testing.T) {
 	tests := []struct {

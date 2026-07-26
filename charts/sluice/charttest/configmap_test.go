@@ -89,6 +89,29 @@ func TestWorkerEntrypointUsesStableServiceIPInsteadOfClusterDNS(t *testing.T) {
 	}
 }
 
+func TestControlStatefulSetCanRecoverAllRaftVotersInParallel(t *testing.T) {
+	data, err := os.ReadFile("../templates/statefulset.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, required := range []string{
+		"podManagementPolicy: Parallel",
+		"livenessProbe:",
+		"tcpSocket:",
+		"port: {{ .Values.raftPort }}",
+		"readinessProbe:",
+		"path: /api/v1/health",
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("control StatefulSet recovery contract is missing %q", required)
+		}
+	}
+	if strings.Contains(source, "podManagementPolicy: OrderedReady") {
+		t.Fatal("persisted Raft voters can still deadlock behind OrderedReady")
+	}
+}
+
 func TestWorkerAutoscalingTargetsOnlyStatelessStatefulSet(t *testing.T) {
 	hpaData, err := os.ReadFile("../templates/hpa.yaml")
 	if err != nil {
@@ -209,6 +232,35 @@ func TestRemoteDeployWaitsForWorkloadAutoscalerMinimum(t *testing.T) {
 		`--set worker.autoscaling.scaleDownStabilizationSeconds=`,
 	) {
 		t.Fatal("remote deployment writes scale-down stabilization outside the workload config")
+	}
+}
+
+func TestRemoteDeployMigratesControlPolicyWithoutDeletingPodsOrPVCs(t *testing.T) {
+	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	migration := strings.Index(source, "Migrating control StatefulSet to parallel Raft recovery")
+	upgrade := strings.Index(source, "Upgrading Helm release")
+	for _, required := range []string{
+		`control_policy="$(microk8s kubectl get statefulset`,
+		`[ "${control_policy}" != "Parallel" ]`,
+		`--cascade=orphan --wait=true`,
+		`control_pods_before=`,
+		`control_pods_after=`,
+		`Control policy migration did not preserve Pods`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("remote control policy migration is missing %q", required)
+		}
+	}
+	if migration < 0 || upgrade < 0 || migration >= upgrade {
+		t.Fatal("immutable control policy must migrate before Helm upgrade")
+	}
+	if strings.Contains(source, `kubectl delete pvc`) ||
+		strings.Contains(source, `--cascade=foreground`) {
+		t.Fatal("control policy migration may not delete Raft PVCs or cascade to Pods")
 	}
 }
 

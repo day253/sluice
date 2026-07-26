@@ -81,16 +81,17 @@ func TestWorkerBenchmarkCommandTerminates(t *testing.T) {
 
 // testCluster holds all the state needed for a multi-node integration test.
 type testCluster struct {
-	tb                         testing.TB
-	nodes                      []*node.Node
-	dirs                       []string
-	raftAddrs                  []string
-	httpAddrs                  []string
-	proc                       *recordingProcessor
-	workers                    int
-	maxVoters                  int
-	disableVoterReconciliation bool
-	allocatorInterval          time.Duration
+	tb                          testing.TB
+	nodes                       []*node.Node
+	dirs                        []string
+	raftAddrs                   []string
+	httpAddrs                   []string
+	proc                        *recordingProcessor
+	workers                     int
+	maxVoters                   int
+	disableVoterReconciliation  bool
+	allocatorInterval           time.Duration
+	leaderElectionRetryInterval time.Duration
 
 	mu      sync.Mutex
 	results map[string]*types.TaskResult // taskID → final result (polled from FSM)
@@ -457,6 +458,16 @@ func (tc *testCluster) killNode(i int) {
 // mirroring a StatefulSet rollout or a full Kubernetes cluster restart.
 func (tc *testCluster) restartAll() {
 	tc.tb.Helper()
+	tc.stopAllForRestart()
+	tc.recreateAllForRestart()
+	for i := range tc.nodes {
+		go func(idx int) { _ = tc.nodes[idx].Start() }(i)
+	}
+	tc.waitAnyLeader(30 * time.Second)
+}
+
+func (tc *testCluster) stopAllForRestart() {
+	tc.tb.Helper()
 	for i, nd := range tc.nodes {
 		if nd == nil {
 			continue
@@ -466,32 +477,32 @@ func (tc *testCluster) restartAll() {
 		}
 		tc.nodes[i] = nil
 	}
+}
 
+func (tc *testCluster) recreateAllForRestart() {
+	tc.tb.Helper()
 	logger := zap.NewNop()
 	if os.Getenv("SLUICE_TEST_LOGS") != "" {
 		logger, _ = zap.NewDevelopment()
 	}
 	for i := range tc.nodes {
 		nd, err := node.New(node.Config{
-			NodeID:                     fmt.Sprintf("node-%d", i),
-			APIAddress:                 tc.httpAddrs[i],
-			RaftAddress:                tc.raftAddrs[i],
-			DataDir:                    tc.dirs[i],
-			Bootstrap:                  i == 0,
-			TotalWorkers:               tc.workers,
-			MaxRaftVoters:              tc.maxVoters,
-			DisableVoterReconciliation: tc.disableVoterReconciliation,
-			AllocatorInterval:          tc.allocatorInterval,
+			NodeID:                      fmt.Sprintf("node-%d", i),
+			APIAddress:                  tc.httpAddrs[i],
+			RaftAddress:                 tc.raftAddrs[i],
+			DataDir:                     tc.dirs[i],
+			Bootstrap:                   i == 0,
+			TotalWorkers:                tc.workers,
+			MaxRaftVoters:               tc.maxVoters,
+			DisableVoterReconciliation:  tc.disableVoterReconciliation,
+			AllocatorInterval:           tc.allocatorInterval,
+			LeaderElectionRetryInterval: tc.leaderElectionRetryInterval,
 		}, tc.proc, logger)
 		if err != nil {
 			tc.tb.Fatalf("recreate node-%d: %v", i, err)
 		}
 		tc.nodes[i] = nd
 	}
-	for i := range tc.nodes {
-		go func(idx int) { _ = tc.nodes[idx].Start() }(i)
-	}
-	tc.waitAnyLeader(30 * time.Second)
 }
 
 // fsms returns the FSM of the first running node (for queries).
@@ -3262,6 +3273,99 @@ func TestFullClusterRestartRecoversExpiredClaims(t *testing.T) {
 		}
 	}
 	t.Log("full restart: pending and expired inflight work drained exactly once")
+}
+
+// TestStaggeredFullClusterRestartKeepsVotersAliveAcrossElectionRetryWindows
+// reproduces CTRL-005. After a host restart, one persisted voter may start well
+// before the other members. It must keep its Raft transport alive across
+// multiple reporting windows so the later voters can form quorum. Once quorum
+// returns, the real follower HTTP -> Leader Raft -> allocation -> Worker ->
+// final-state path must still drain exactly once.
+func TestStaggeredFullClusterRestartKeepsVotersAliveAcrossElectionRetryWindows(t *testing.T) {
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	tc.stopAllForRestart()
+	tc.leaderElectionRetryInterval = 150 * time.Millisecond
+	tc.recreateAllForRestart()
+
+	firstExited := make(chan error, 1)
+	go func() {
+		firstExited <- tc.nodes[0].Start()
+	}()
+	select {
+	case err := <-firstExited:
+		t.Fatalf("first persisted voter exited before later voters started: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	for i := 1; i < len(tc.nodes); i++ {
+		go func(idx int) { _ = tc.nodes[idx].Start() }(i)
+	}
+	tc.waitAnyLeader(15 * time.Second)
+	tc.waitNodes(3, 10*time.Second)
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader after staggered restart")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	client := &http.Client{Timeout: time.Second}
+	tc.waitFor(func() bool {
+		response, err := client.Get("http://" + tc.httpAddrs[follower] + "/api/v1/health")
+		if err != nil {
+			return false
+		}
+		_ = response.Body.Close()
+		return response.StatusCode == http.StatusOK
+	}, 10*time.Second, "recovered follower HTTP")
+
+	tenantBody := []byte(`{"name":"Staggered restart","max_workers":20}`)
+	tc.waitFor(func() bool {
+		req, err := http.NewRequest(
+			http.MethodPut,
+			"http://"+tc.httpAddrs[follower]+"/api/v1/admin/tenants/staggered-restart",
+			bytes.NewReader(tenantBody),
+		)
+		if err != nil {
+			return false
+		}
+		req.Header.Set("Content-Type", "application/json")
+		response, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		_ = response.Body.Close()
+		return response.StatusCode == http.StatusOK
+	}, 10*time.Second, "tenant upsert through recovered follower HTTP")
+	tc.waitAllocation(10 * time.Second)
+
+	body := []byte(`{"tenant_id":"staggered-restart","payload":{"source":"staggered-restart"}}`)
+	client.Timeout = 5 * time.Second
+	resp, err := client.Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		t.Fatalf("POST through recovered follower: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		data, _ := io.ReadAll(resp.Body)
+		t.Fatalf("recovered follower status = %d, want 202; body=%s", resp.StatusCode, data)
+	}
+	var task types.TaskResponse
+	if err := json.NewDecoder(resp.Body).Decode(&task); err != nil {
+		t.Fatalf("decode recovered follower response: %v", err)
+	}
+	tc.waitFor(func() bool {
+		result := tc.fsms().GetResult(task.TaskID)
+		return result != nil && result.Status == types.TaskStatusDone
+	}, 30*time.Second, "staggered restart task final state")
+	if count := tc.proc.processedTaskCount(task.TaskID); count != 1 {
+		t.Fatalf("staggered restart task processed %d times, want once", count)
+	}
 }
 
 func taskClaimRecoveryTimeout() time.Duration {

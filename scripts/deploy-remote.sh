@@ -222,6 +222,31 @@ else
   printf 'No existing release found; migration is not needed.\n'
 fi
 
+control_policy="$(microk8s kubectl get statefulset "${STATEFULSET}" \
+  --namespace "${NAMESPACE}" -o jsonpath='{.spec.podManagementPolicy}' \
+  2>/dev/null || true)"
+if [ -n "${control_policy}" ] && [ "${control_policy}" != "Parallel" ]; then
+  printf '\n==> Migrating control StatefulSet to parallel Raft recovery\n'
+  control_pods_before="$(microk8s kubectl get pods \
+    --namespace "${NAMESPACE}" \
+    -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control" \
+    --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  # podManagementPolicy is immutable. Orphaning preserves every running Pod
+  # and PVC; the Helm upgrade immediately recreates the controller with the
+  # Parallel policy and adopts those identities before rolling the new image.
+  microk8s kubectl delete statefulset "${STATEFULSET}" \
+    --namespace "${NAMESPACE}" --cascade=orphan --wait=true
+  control_pods_after="$(microk8s kubectl get pods \
+    --namespace "${NAMESPACE}" \
+    -l "app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control" \
+    --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${control_pods_after}" -ne "${control_pods_before}" ]; then
+    printf 'Control policy migration did not preserve Pods: before=%s after=%s\n' \
+      "${control_pods_before}" "${control_pods_after}" >&2
+    exit 1
+  fi
+fi
+
 printf '\n==> Upgrading Helm release\n'
 microk8s helm3 upgrade --install "${RELEASE}" ./charts/sluice \
   --namespace "${NAMESPACE}" \

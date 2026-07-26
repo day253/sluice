@@ -55,6 +55,11 @@ type Config struct {
 	// AllocatorInterval overrides the 3s periodic liveness tick. Production
 	// normally leaves it zero; protocol tests may extend it to prove event wakes.
 	AllocatorInterval time.Duration
+	// LeaderElectionRetryInterval controls only how often startup reports that
+	// quorum is still unavailable. A control process never exits solely because
+	// this interval elapsed. Production defaults to 30s; recovery integration
+	// tests shorten it to reproduce staggered full-cluster restarts.
+	LeaderElectionRetryInterval time.Duration
 }
 
 // ---------------------------------------------------------------------------
@@ -235,8 +240,22 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 func (n *Node) Start() error {
 	n.logger.Info("waiting for raft leader election...")
-	if !n.tenantMgr.WaitForLeader(30 * time.Second) {
-		return fmt.Errorf("timed out waiting for raft leader")
+	leaderRetry := n.cfg.LeaderElectionRetryInterval
+	if leaderRetry <= 0 {
+		leaderRetry = 30 * time.Second
+	}
+	if !waitForRaftLeader(
+		n.ctx,
+		leaderRetry,
+		n.tenantMgr.WaitForLeader,
+		func() {
+			n.logger.Warn(
+				"raft leader still unavailable; keeping control process alive",
+				zap.Duration("retry_interval", leaderRetry),
+			)
+		},
+	) {
+		return n.Shutdown(30 * time.Second)
 	}
 
 	if err := n.raftCluster.RegisterNodeWithRole(
@@ -283,6 +302,25 @@ func (n *Node) Start() error {
 	}
 
 	return n.Shutdown(30 * time.Second)
+}
+
+func waitForRaftLeader(
+	ctx context.Context,
+	retryInterval time.Duration,
+	wait func(time.Duration) bool,
+	onRetry func(),
+) bool {
+	for {
+		if wait(retryInterval) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			onRetry()
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

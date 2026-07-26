@@ -7,7 +7,10 @@ metadata:
 spec:
   serviceName: {{ include "sluice.headless-svc" . }}
   replicas: {{ .Values.control.replicas }}
-  podManagementPolicy: OrderedReady
+  # Existing Raft voters must be allowed to restart together after a host or
+  # cluster outage. OrderedReady deadlocks when every persisted member needs a
+  # quorum before its HTTP readiness endpoint can start.
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       {{- include "sluice.labels" . | nindent 6 }}
@@ -72,9 +75,8 @@ spec:
             initialDelaySeconds: {{ .Values.probes.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.periodSeconds }}
           livenessProbe:
-            httpGet:
-              path: /api/v1/health
-              port: {{ .Values.apiPort }}
+            tcpSocket:
+              port: {{ .Values.raftPort }}
             initialDelaySeconds: {{ add .Values.probes.initialDelaySeconds 10 }}
             periodSeconds: {{ .Values.probes.periodSeconds }}
           {{- end }}

@@ -140,12 +140,18 @@ func TestDashboardKeepsWorkloadWritesInSidebarAndMonitoringMainReadOnly(t *testi
 	}
 
 	page := recorder.Body.String()
+	configStart := strings.Index(page, `<aside id="config-sidebar"`)
 	sidebarStart := strings.Index(page, `<aside id="workload-sidebar"`)
-	sidebarEnd := strings.Index(page, `</aside>`)
+	if configStart < 0 || sidebarStart < 0 {
+		t.Fatalf("dashboard sidebars are missing: config=%d workload=%d", configStart, sidebarStart)
+	}
+	sidebarEndOffset := strings.Index(page[sidebarStart:], `</aside>`)
+	sidebarEnd := sidebarStart + sidebarEndOffset
 	monitoringStart := strings.Index(page, `<div id="monitoring-main"`)
-	if sidebarStart < 0 || sidebarEnd <= sidebarStart || monitoringStart <= sidebarEnd {
+	if sidebarEndOffset < 0 || sidebarEnd <= sidebarStart || monitoringStart < 0 {
 		t.Fatalf(
-			"dashboard regions are not ordered sidebar then monitoring: sidebar=%d..%d monitoring=%d",
+			"dashboard regions are missing: config=%d workload=%d..%d monitoring=%d",
+			configStart,
 			sidebarStart,
 			sidebarEnd,
 			monitoringStart,
@@ -159,9 +165,6 @@ func TestDashboardKeepsWorkloadWritesInSidebarAndMonitoringMainReadOnly(t *testi
 		`id="quick-count"`,
 		`id="add-one"`,
 		`id="add-all"`,
-		`id="seed-tenants"`,
-		`id="open-tenant"`,
-		`id="edit-tenant"`,
 		`id="load-run-custom"`,
 	} {
 		if !strings.Contains(sidebar, fragment) {
@@ -186,6 +189,104 @@ func TestDashboardKeepsWorkloadWritesInSidebarAndMonitoringMainReadOnly(t *testi
 	} {
 		if strings.Contains(monitoring, fragment) {
 			t.Errorf("monitoring main still contains workload write control %q", fragment)
+		}
+	}
+}
+
+func TestDashboardSeparatesConfigurationMonitoringAndLoadSidebars(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	Handler(http.NotFoundHandler()).ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d", recorder.Code)
+	}
+
+	page := recorder.Body.String()
+	region := func(id string) string {
+		t.Helper()
+		start := strings.Index(page, `<aside id="`+id+`"`)
+		if start < 0 {
+			t.Fatalf("dashboard is missing %s", id)
+		}
+		endOffset := strings.Index(page[start:], `</aside>`)
+		if endOffset < 0 {
+			t.Fatalf("dashboard %s is not closed", id)
+		}
+		return page[start : start+endOffset]
+	}
+	config := region("config-sidebar")
+	workload := region("workload-sidebar")
+	monitoringStart := strings.Index(page, `<div id="monitoring-main"`)
+	monitoringEnd := strings.Index(page, `</main>`)
+	if monitoringStart < 0 || monitoringEnd <= monitoringStart {
+		t.Fatal("dashboard monitoring main is missing")
+	}
+	monitoring := page[monitoringStart:monitoringEnd]
+
+	for _, fragment := range []string{
+		`id="config-tenant"`,
+		`id="open-tenant"`,
+		`id="edit-tenant"`,
+		`id="seed-tenants"`,
+		`id="worker-capacity-node"`,
+		`id="worker-capacity-value"`,
+		`id="worker-capacity-apply"`,
+		`id="config-sidebar-toggle"`,
+		`aria-controls="config-sidebar-body"`,
+	} {
+		if !strings.Contains(config, fragment) {
+			t.Errorf("configuration sidebar is missing %q", fragment)
+		}
+	}
+	for _, fragment := range []string{
+		`id="quick-tenant"`,
+		`id="quick-count"`,
+		`id="add-one"`,
+		`id="add-all"`,
+		`id="load-lab"`,
+		`id="load-run-custom"`,
+		`id="workload-sidebar-toggle"`,
+		`aria-controls="workload-sidebar-body"`,
+	} {
+		if !strings.Contains(workload, fragment) {
+			t.Errorf("workload sidebar is missing %q", fragment)
+		}
+	}
+	for _, fragment := range []string{
+		`id="quick-tenant"`,
+		`id="add-one"`,
+		`id="worker-capacity-apply"`,
+		`id="open-tenant"`,
+	} {
+		if strings.Contains(monitoring, fragment) {
+			t.Errorf("monitoring main contains write control %q", fragment)
+		}
+	}
+	for _, crossRegion := range []struct {
+		name     string
+		region   string
+		fragment string
+	}{
+		{name: "configuration", region: config, fragment: `id="add-one"`},
+		{name: "configuration", region: config, fragment: `id="load-run-custom"`},
+		{name: "workload", region: workload, fragment: `id="worker-capacity-apply"`},
+		{name: "workload", region: workload, fragment: `id="edit-tenant"`},
+	} {
+		if strings.Contains(crossRegion.region, crossRegion.fragment) {
+			t.Errorf("%s sidebar contains misplaced control %q", crossRegion.name, crossRegion.fragment)
+		}
+	}
+	for _, fragment := range []string{
+		`SIDEBAR_STATE_KEY='sluice.dashboard.sidebars.v1'`,
+		`setSidebarCollapsed('config'`,
+		`setSidebarCollapsed('workload'`,
+		`localStorage.setItem(SIDEBAR_STATE_KEY`,
+		`grid-template-areas:"config main workload"`,
+	} {
+		if !strings.Contains(page, fragment) {
+			t.Errorf("collapsible three-column contract is missing %q", fragment)
 		}
 	}
 }

@@ -102,6 +102,29 @@
   `TestStatelessWorkerRoleSplit` 切换 3-voter Leader 后持续跨过生产五秒 grace，要求 Worker
   始终 up、有 allocation，随后继续 exactly-once 排空任务。
 
+### CTRL-005：全控制面重启不能在选主前自杀
+
+- **已复现故障**：远程主机重启后，5 个带原 PVC 的 control 都在 term 138 附近发起
+  pre-vote，但容器启动退避彼此错开。每个进程等待 Leader 30 秒后主动 fatal 退出，
+  `/api/v1/health` 又只在选主后的 `Start` 阶段监听；HTTP liveness 继续杀进程。
+  StatefulSet 使用 `OrderedReady`，因此 Helm 也不能并行替换这个没有任何 Ready Pod 的
+  集群。最终 5 个 voter 全部 CrashLoop、Leader 永远为空，Worker autoscaler 因未知信号
+  保留 100 副本。
+- **恢复语义**：30 秒只作为“仍无 Leader”的告警间隔，不再是进程寿命。Raft transport
+  必须持续存活，直到后续 voter 到达形成 quorum，或 Node context/进程信号明确结束。
+  control StatefulSet 改为 `Parallel`，liveness 只探测 Raft TCP 端口，readiness 仍要求
+  真实 HTTP health；因此无 Leader 的成员可以存活但不会承接业务流量。该变化不降低
+  quorum、不强制 bootstrap、不修改 Raft 日志/PVC，也不把无 Leader 报成业务 Ready。
+- **升级边界**：`podManagementPolicy` 是不可变字段。远程部署检测旧
+  `OrderedReady` controller 时，仅以 `--cascade=orphan` 删除 StatefulSet controller，
+  前后核对 control Pod 数量不变；Helm 随即用 `Parallel` 重建并接管原 Pod/PVC。禁止删除
+  PVC、清空 Raft 或用单节点强制恢复绕过已提交日志。
+- **回归覆盖**：Node 单测固定跨多个 election retry window 仍继续等待、只在 context
+  结束时退出；Chart/部署单测固定 Parallel、Raft TCP liveness 和 orphan-preserving
+  migration。真实 3-voter 集成持久化 membership 后先只启动一个 voter，跨过多个缩短的
+  retry window 再启动其余 voter，要求重新选主，并经真实 Follower HTTP、Leader Raft、
+  allocation、Worker 和 final-state 路径 exactly-once 排空。
+
 ## 任务生命周期
 
 ```
@@ -1074,11 +1097,11 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 
 ### UI-LOAD-002：写操作侧栏与只读监控主区
 
-- **界面边界**：桌面布局把单 tenant/all tenant 快速加任务、样例 tenant、tenant
-  新建/修改、负载 recipe、自定义 workload、执行历史以及实例并发配置统一放进左侧
-  `Workload builder`。右侧主区只显示集群摘要、Worker 分配、tenant unfinished、
-  autoscaling/performance 信号和 tenant allocation 表，不在表格行内混入加任务或编辑
-  入口。
+- **初始界面边界**：桌面布局先把单 tenant/all tenant 快速加任务、样例 tenant、tenant
+  新建/修改、负载 recipe、自定义 workload、执行历史以及实例并发配置从主区移入 sticky
+  sidebar。主区只显示集群摘要、Worker 分配、tenant unfinished、autoscaling/performance
+  信号和 tenant allocation 表，不在表格行内混入加任务或编辑入口。UI-LOAD-003 在保留
+  该只读主区边界的前提下继续把这一个混合侧栏拆成左右两类。
 - **响应式行为**：宽屏侧栏固定在 topbar 下并独立滚动，监控主区持续可见；窄于 900px
   时不再强行挤压图表，监控主区排在 workload builder 前面。布局变化不改变每秒轮询、
   174 点历史、JSON 链接、任务提交顺序、浏览器执行历史或任何 Raft/FSM 数据。
@@ -1086,3 +1109,23 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   sidebar 且主区表格只读；真实 Chrome 使用 1440px viewport 验证两栏几何关系、核心
   图表归属和主表无写按钮，并继续完成 tenant 创建、Worker capacity 修改与 round-robin
   任务提交，防止只改外观却破坏真实入口。
+
+### UI-LOAD-003：配置、监控与负载三栏分离
+
+- **三类职责**：桌面左栏 `Configuration & limits` 只放长期配置入口：tenant 新建/编辑、
+  样例 tenant、保证 Worker Limit，以及单个 live Worker Pod 的 Processor slot 上限。
+  中间继续是只读负载、分配、HPA 和性能观测。右栏 `Workload builder` 只负责给既有
+  tenant 快速加任务，以及组合 Load Lab 的模拟 tenant pool、quota profile 和任务流。
+  Load Lab 的“prepare tenants”属于构造测试负载的一步，不替代左栏对普通 tenant 的日常
+  配置管理。
+- **数据边界**：tenant Limit 和单 Pod capacity override 都是经生产 API/Raft 保存的当前
+  配置镜像；不为每次配置变化新增历史时序。左右栏的折叠状态只写浏览器
+  `localStorage`，不进入 API、Raft、FSM、Snapshot 或指标。折叠仅释放中间监控宽度，
+  不暂停一秒刷新，也不停止已提交或正在排空的任务。
+- **响应式和可访问性**：桌面几何固定为左配置、中监控、右负载，两个 sticky sidebar
+  独立滚动和独立折叠；按钮维护 `aria-expanded`/`aria-controls`。窄于 900px 时仍先显示
+  监控，再显示配置和负载，折叠标签恢复为横向，避免为了三栏压窄时序图。
+- **回归覆盖**：组件测试固定三个区域的写入口归属、相互排斥、只读主区和
+  `localStorage` 状态协议；真实 Chrome 1440px 验证左/中/右几何关系，双侧栏折叠后监控
+  变宽、刷新后状态恢复、再展开，并继续走真实 tenant 创建、单 Pod capacity 写入、
+  quick load、batch load 和排空路径。

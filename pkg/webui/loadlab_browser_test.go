@@ -216,47 +216,114 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	defer cancel()
 
 	var layout struct {
+		ConfigInSidebar    bool    `json:"configInSidebar"`
 		LoadInSidebar      bool    `json:"loadInSidebar"`
 		ChartsInMonitoring bool    `json:"chartsInMonitoring"`
 		LoadInMonitoring   bool    `json:"loadInMonitoring"`
 		WriteInTable       bool    `json:"writeInTable"`
-		SidebarLeft        float64 `json:"sidebarLeft"`
-		SidebarRight       float64 `json:"sidebarRight"`
+		ConfigLeft         float64 `json:"configLeft"`
+		ConfigRight        float64 `json:"configRight"`
 		MonitoringLeft     float64 `json:"monitoringLeft"`
+		MonitoringRight    float64 `json:"monitoringRight"`
+		WorkloadLeft       float64 `json:"workloadLeft"`
+		WorkloadRight      float64 `json:"workloadRight"`
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
 		chromedp.WaitVisible("#load-lab", chromedp.ByQuery),
 		chromedp.Evaluate(`(() => {
-			const sidebar = document.querySelector("#workload-sidebar");
+			const config = document.querySelector("#config-sidebar");
+			const workload = document.querySelector("#workload-sidebar");
 			const monitoring = document.querySelector("#monitoring-main");
-			const sideRect = sidebar.getBoundingClientRect();
+			const configRect = config.getBoundingClientRect();
+			const workloadRect = workload.getBoundingClientRect();
 			const monitoringRect = monitoring.getBoundingClientRect();
 			return {
-				loadInSidebar: sidebar.contains(document.querySelector("#load-lab")) &&
-					sidebar.contains(document.querySelector("#add-one")) &&
-					sidebar.contains(document.querySelector("#add-all")),
+				configInSidebar: config.contains(document.querySelector("#config-tenant")) &&
+					config.contains(document.querySelector("#edit-tenant")) &&
+					config.contains(document.querySelector("#worker-capacity-apply")),
+				loadInSidebar: workload.contains(document.querySelector("#load-lab")) &&
+					workload.contains(document.querySelector("#add-one")) &&
+					workload.contains(document.querySelector("#add-all")),
 				chartsInMonitoring: monitoring.contains(document.querySelector("#workers-chart")) &&
 					monitoring.contains(document.querySelector("#tenant-unfinished-chart")),
 				loadInMonitoring: monitoring.contains(document.querySelector("#load-lab")),
 				writeInTable: Boolean(document.querySelector("#tenant-list [data-action=load]")),
-				sidebarLeft: sideRect.left,
-				sidebarRight: sideRect.right,
+				configLeft: configRect.left,
+				configRight: configRect.right,
 				monitoringLeft: monitoringRect.left,
+				monitoringRight: monitoringRect.right,
+				workloadLeft: workloadRect.left,
+				workloadRight: workloadRect.right,
 			};
 		})()`, &layout),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !layout.ConfigInSidebar || !layout.LoadInSidebar || !layout.ChartsInMonitoring ||
+		layout.LoadInMonitoring || layout.WriteInTable ||
+		layout.ConfigLeft >= layout.MonitoringLeft ||
+		layout.ConfigRight > layout.MonitoringLeft ||
+		layout.MonitoringRight > layout.WorkloadLeft ||
+		layout.WorkloadLeft >= layout.WorkloadRight {
+		t.Fatalf("dashboard configuration/monitor/workload layout = %+v", layout)
+	}
+
+	var collapsed struct {
+		ConfigCollapsed   bool    `json:"configCollapsed"`
+		WorkloadCollapsed bool    `json:"workloadCollapsed"`
+		ConfigExpanded    string  `json:"configExpanded"`
+		WorkloadExpanded  string  `json:"workloadExpanded"`
+		MonitoringWidth   float64 `json:"monitoringWidth"`
+		StateConfig       bool    `json:"stateConfig"`
+		StateWorkload     bool    `json:"stateWorkload"`
+	}
+	readCollapsedState := chromedp.Evaluate(`(() => {
+		const state = JSON.parse(localStorage.getItem("sluice.dashboard.sidebars.v1") || "{}");
+		return {
+			configCollapsed: document.querySelector("#config-sidebar").classList.contains("is-collapsed"),
+			workloadCollapsed: document.querySelector("#workload-sidebar").classList.contains("is-collapsed"),
+			configExpanded: document.querySelector("#config-sidebar-toggle").getAttribute("aria-expanded"),
+			workloadExpanded: document.querySelector("#workload-sidebar-toggle").getAttribute("aria-expanded"),
+			monitoringWidth: document.querySelector("#monitoring-main").getBoundingClientRect().width,
+			stateConfig: Boolean(state.config),
+			stateWorkload: Boolean(state.workload),
+		};
+	})()`, &collapsed)
+	if err := chromedp.Run(ctx,
+		chromedp.Click("#config-sidebar-toggle", chromedp.ByQuery),
+		chromedp.Click("#workload-sidebar-toggle", chromedp.ByQuery),
+		readCollapsedState,
+	); err != nil {
+		t.Fatal(err)
+	}
+	initialMonitoringWidth := layout.MonitoringRight - layout.MonitoringLeft
+	if !collapsed.ConfigCollapsed || !collapsed.WorkloadCollapsed ||
+		collapsed.ConfigExpanded != "false" || collapsed.WorkloadExpanded != "false" ||
+		!collapsed.StateConfig || !collapsed.StateWorkload ||
+		collapsed.MonitoringWidth <= initialMonitoringWidth {
+		t.Fatalf("collapsed sidebars did not expand monitoring area: initial=%f collapsed=%+v", initialMonitoringWidth, collapsed)
+	}
+	if err := chromedp.Run(ctx,
+		chromedp.Reload(),
+		chromedp.WaitVisible("#monitoring-main", chromedp.ByQuery),
+		readCollapsedState,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !collapsed.ConfigCollapsed || !collapsed.WorkloadCollapsed ||
+		collapsed.ConfigExpanded != "false" || collapsed.WorkloadExpanded != "false" {
+		t.Fatalf("sidebar collapse state was not restored after reload: %+v", collapsed)
+	}
+	if err := chromedp.Run(ctx,
+		chromedp.Click("#config-sidebar-toggle", chromedp.ByQuery),
+		chromedp.Click("#workload-sidebar-toggle", chromedp.ByQuery),
 		chromedp.SetValue("#load-tenant-count", "3", chromedp.ByQuery),
 		chromedp.SetValue("#load-tasks-per-tenant", "2", chromedp.ByQuery),
 		chromedp.SetValue("#load-quota", "4", chromedp.ByQuery),
 		chromedp.Click("#load-create-tenants", chromedp.ByQuery),
 	); err != nil {
 		t.Fatal(err)
-	}
-	if !layout.LoadInSidebar || !layout.ChartsInMonitoring ||
-		layout.LoadInMonitoring || layout.WriteInTable ||
-		layout.SidebarLeft >= layout.MonitoringLeft ||
-		layout.SidebarRight > layout.MonitoringLeft {
-		t.Fatalf("dashboard workload/monitor layout = %+v", layout)
 	}
 	var capacity, allocated, nodeSummary, workerLegend, cpuAdmission, cpuNote string
 	var queuePressure, executionPressure, cpuPressure, telemetryCoverage string
