@@ -227,6 +227,11 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 		MonitoringRight    float64 `json:"monitoringRight"`
 		WorkloadLeft       float64 `json:"workloadLeft"`
 		WorkloadRight      float64 `json:"workloadRight"`
+		ConfigBackground   string  `json:"configBackground"`
+		ConfigShadow       string  `json:"configShadow"`
+		ConfigRadius       string  `json:"configRadius"`
+		GroupBackground    string  `json:"groupBackground"`
+		ToggleWidth        float64 `json:"toggleWidth"`
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
@@ -238,6 +243,9 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 			const configRect = config.getBoundingClientRect();
 			const workloadRect = workload.getBoundingClientRect();
 			const monitoringRect = monitoring.getBoundingClientRect();
+			const configPanelStyle = getComputedStyle(config.querySelector(".sidebar-panel"));
+			const quickStyle = getComputedStyle(document.querySelector("#quick-load"));
+			const toggleRect = document.querySelector("#config-sidebar-toggle").getBoundingClientRect();
 			return {
 				configInSidebar: config.contains(document.querySelector("#config-tenant")) &&
 					config.contains(document.querySelector("#edit-tenant")) &&
@@ -255,6 +263,11 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 				monitoringRight: monitoringRect.right,
 				workloadLeft: workloadRect.left,
 				workloadRight: workloadRect.right,
+				configBackground: configPanelStyle.backgroundColor,
+				configShadow: configPanelStyle.boxShadow,
+				configRadius: configPanelStyle.borderRadius,
+				groupBackground: quickStyle.backgroundColor,
+				toggleWidth: toggleRect.width,
 			};
 		})()`, &layout),
 	); err != nil {
@@ -265,7 +278,12 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 		layout.ConfigLeft >= layout.MonitoringLeft ||
 		layout.ConfigRight > layout.MonitoringLeft ||
 		layout.MonitoringRight > layout.WorkloadLeft ||
-		layout.WorkloadLeft >= layout.WorkloadRight {
+		layout.WorkloadLeft >= layout.WorkloadRight ||
+		layout.ConfigBackground != "rgb(248, 250, 252)" ||
+		layout.ConfigShadow != "none" ||
+		layout.ConfigRadius != "12px" ||
+		layout.GroupBackground != "rgb(241, 245, 249)" ||
+		layout.ToggleWidth != 28 {
 		t.Fatalf("dashboard configuration/monitor/workload layout = %+v", layout)
 	}
 

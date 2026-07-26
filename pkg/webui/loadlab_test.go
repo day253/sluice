@@ -291,6 +291,35 @@ func TestDashboardSeparatesConfigurationMonitoringAndLoadSidebars(t *testing.T) 
 	}
 }
 
+func TestDashboardUsesShadcnStyleSidebarShell(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	Handler(http.NotFoundHandler()).ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d", recorder.Code)
+	}
+
+	page := recorder.Body.String()
+	for _, fragment := range []string{
+		`--sidebar:#f8fafc`,
+		`--sidebar-border:#e2e8f0`,
+		`.dashboard-sidebar .sidebar-panel{overflow:hidden;border-color:var(--sidebar-border);border-radius:12px;background:var(--sidebar);box-shadow:none}`,
+		`.app-shell.config-collapsed{--config-width:48px}`,
+		`.app-shell.workload-collapsed{--workload-width:48px}`,
+		`class="sidebar-brand-icon"`,
+		`class="sidebar-config-section sidebar-group"`,
+		`class="sidebar-group sidebar-recipe-group"`,
+		`class="sidebar-group-label">Load presets`,
+		`class="sidebar-group sidebar-runtime-group"`,
+	} {
+		if !strings.Contains(page, fragment) {
+			t.Errorf("shadcn-style sidebar shell is missing %q", fragment)
+		}
+	}
+}
+
 func TestLoadLabAssetIsServedAsJavaScript(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	Handler(http.NotFoundHandler()).ServeHTTP(

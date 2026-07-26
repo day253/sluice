@@ -925,3 +925,49 @@ HPA-009 首轮本地完整 `make test` 的 integration 阶段为 274.886 秒；�
 Worker target 4→3→9、control 恒为 3、100 条任务 exactly-once；HPA-010/HPA-011
 进程级 Case 执行生产 shell 和真实 Python validator，验证 50/38 瞬时不一致会重试且
 live 60 秒参数缺失时不能通过部署门禁。
+
+### 7.13 大持久积压恢复与 control 资源隔离（2026-07-26）
+
+RECOVERY-003 不改变提交、Claim/Complete batching、Leader 唯一分配、Processor 或
+snapshot 格式；它把 Helm 中 control/FSM 与 stateless Worker 的 cgroup 预算拆开，并给
+远程部署增加 OOM/restart 与 rollout Pod headroom 门禁。因此本节使用固定形状的“持久
+pending→全 control 重启→新 Worker 排空”恢复基线，不把先前普通运行态 20k 吞吐结论
+直接沿用到这次恢复路径。
+
+本地基线运行于 Apple M4 Pro（14 logical CPU、48GiB、darwin/arm64、Go 1.26.5），
+`-race -count=1`，单故障域内真实 3 voter/0 non-voter。一个 tenant 经真实 Follower
+`/api/v1/tasks/batch` 顺序提交 20000 条，batch=500、HTTP concurrency=1；payload 固定为
+`{"case":"RECOVERY-003"}` 且每条有唯一幂等键。提交阶段没有执行节点，全部 task 先成为
+durable pending；随后停止并从原 Bolt/Raft 目录重建全部 voter，确认每个 FSM 都恢复
+20000 unfinished，再注册一个 100-slot stateless Worker。测试 Processor 每条固定约
+10ms，不模拟远程 50～200ms demo workload。
+
+| 阶段 | 耗时/结果 |
+|---|---:|
+| 20k Follower HTTP durable submit | 2.620s |
+| 全 3 voter restart、选主、三份 FSM 恢复 | 1.918s |
+| 新 100-slot Worker 注册后排空 | 61.400s |
+| submit 开始至排空 | 65.938s（303.3 task/s） |
+| 请求错误 / 最终 unfinished / 单任务重复执行 | 0 / 0 / 0 |
+
+排空阶段约 325.7 task/s，低于远程 50-Worker 运行态基线是预期的：该 Case 只有一个
+Worker Pod，allocation borrowing 从小探测逐步增长，而且打开 race detector；它只用于
+同形恢复回归，不能和 7.10～7.12 的 ThinkPad/MicroK8s、不同 Processor、动态多 Pod
+运行态作百分比比较。整个测试 82.325 秒，包含初始集群 bootstrap、membership join、
+断言和 shutdown。
+
+真实远程事件运行于同一 ThinkPad L14 Gen 2（Ryzen 7 PRO 5850U、16 logical CPU、
+60GiB）、单节点 MicroK8s、5 voter/0 non-voter。约 235k unfinished 恢复时，旧
+`512Mi` control limit 让五个 voter 反复 `OOMKilled/137`，同时 100 Worker 把 kubelet
+推到 110 Pod 上限，新的 control ordinal 报 `FailedScheduling: Too many pods`。宿主机
+当时仍约 54GiB available，故两处限制分别是 container cgroup 和 kubelet Pod quota，
+不是主机资源耗尽。
+
+保持全部 PVC/task 后，先暂停 autoscaler、把 Worker 降到 5，再把五个 control 从原 PVC
+以 `request=512Mi, limit=2Gi` 并行恢复。17:34:04 后五个新容器均为 restart=0、last
+termination 为空；17:36:43 的统一快照为 unfinished/pending/running=0/0/0、5 Worker、
+500 slots、5 reporters，Raft 为 5 voter/0 non-voter。五个 control 的 cgroup
+`memory.peak` 分别约 347.8/407.1/373.3/351.4/396.2MiB，当前约
+69.9/130.0/82.0/70.0/112.8MiB，证明 512Mi 的恢复尖峰余量过小而 2Gi 门禁未触发新的
+OOM。该窗口的 telemetry completed counter 为 232381，但 Leader epoch 与故障前的
+235k 初值不一致，因此只记录“有界恢复并排空”，不据此计算或宣称生产吞吐提升。

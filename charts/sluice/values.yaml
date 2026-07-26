@@ -2,11 +2,28 @@
 # and never execute business Processor work.
 control:
   replicas: 5
+  # Raft voters restore the complete FSM task set into memory. Keep this
+  # budget independent from stateless Workers: a large durable backlog must
+  # not make every voter restart under a Worker-sized cgroup limit.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
 
 # Stateless execution plane. These Pods have stable identities for allocation
 # and session fencing, but no PVC and no Raft membership.
 worker:
   replicas: 50
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
   # Autoscaling only changes the stateless Worker StatefulSet. "workload"
   # directly uses unfinished backlog and allocated Worker utilization and does
   # not require metrics-server. "hpa" renders a native autoscaling/v2 HPA for
@@ -82,14 +99,6 @@ persistence:
   enabled: true
   size: 1Gi
   # storageClass: ""  # default StorageClass
-
-resources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    memory: 512Mi
 
 # Readiness / liveness probes.
 probes:

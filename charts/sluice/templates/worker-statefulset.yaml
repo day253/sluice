@@ -55,7 +55,7 @@ spec:
               mountPath: /entrypoint.sh
               subPath: entrypoint.sh
               readOnly: true
-          {{- with .Values.resources }}
+          {{- with .Values.worker.resources }}
           resources: {{ toYaml . | nindent 12 }}
           {{- end }}
           {{- if .Values.probes.enabled }}

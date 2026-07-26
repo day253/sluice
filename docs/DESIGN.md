@@ -116,9 +116,9 @@
   真实 HTTP health；因此无 Leader 的成员可以存活但不会承接业务流量。该变化不降低
   quorum、不强制 bootstrap、不修改 Raft 日志/PVC，也不把无 Leader 报成业务 Ready。
 - **升级边界**：`podManagementPolicy` 是不可变字段。远程部署检测旧
-  `OrderedReady` controller 时，仅以 `--cascade=orphan` 删除 StatefulSet controller，
-  前后核对 control Pod 数量不变；Helm 随即用 `Parallel` 重建并接管原 Pod/PVC。禁止删除
-  PVC、清空 Raft 或用单节点强制恢复绕过已提交日志。
+  `OrderedReady` controller 时，先以 `--cascade=orphan` 删除 StatefulSet controller
+  并核对 control Pod 数量不变；DEPLOY-002 再安全重建 orphan Pod，同时保持 PVC 数不变。
+  禁止删除 PVC、清空 Raft 或用单节点强制恢复绕过已提交日志。
 - **回归覆盖**：Node 单测固定跨多个 election retry window 仍继续等待、只在 context
   结束时退出；Chart/部署单测固定 Parallel、Raft TCP liveness 和 orphan-preserving
   migration。真实 3-voter 集成持久化 membership 后先只启动一个 voter，跨过多个缩短的
@@ -142,6 +142,69 @@
   `helm template "${RELEASE}"`，并固定 validation 在 migration 之前。真实远程
   MicroK8s 从旧 OrderedReady/HTTP probe release 执行同一脚本，要求 dry-run 通过、
   迁移前后 Pod/PVC 保持、随后升级和拓扑门禁完成。
+
+### DEPLOY-002：Parallel 创建不等于 Parallel 滚动更新
+
+- **已复现故障**：把旧 control StatefulSet orphan 后直接由新 `Parallel` controller
+  接管，最高 ordinal 会先按 `RollingUpdate` 重建；Kubernetes 对 StatefulSet
+  RollingUpdate 仍按 ordinal 等待 Ready，`podManagementPolicy=Parallel` 只放宽首次创建、
+  扩缩容和删除。其余旧 voter 同时 CrashLoop 时，新 Pod 无法单独形成 quorum，rollout
+  永久卡在最高 ordinal。
+- **迁移事务**：部署脚本先记录 control Pod/PVC 数，使用 `--cascade=orphan` 只删除旧
+  controller 并确认 Pod 数未变；随后按 control 标签删除全部 orphan Pod，等待 Pod 数归零，
+  再确认 PVC 数完全未变。Helm 才创建新的 Parallel controller，使所有持久 voter 同时从
+  各自原 PVC 恢复。任何 Pod 未删除或 PVC 数变化都立即停止部署。
+- **边界与非目标**：迁移不删除 PVC、不重写 Raft log、不强制单节点 bootstrap、不更改
+  voter 集合。普通已是 `Parallel` 的后续镜像升级继续使用 StatefulSet RollingUpdate；
+  大状态恢复的资源门禁由 RECOVERY-003 独立约束。
+- **回归覆盖**：脚本单测固定 orphan→删除 control Pods→PVC 不变→Helm upgrade 的顺序；
+  真实远程 MicroK8s 从旧 OrderedReady/CrashLoop voter 集合迁移，要求 5 个原 PVC voter
+  同时恢复并保持 5 voter/0 non-voter。
+
+### RECOVERY-003：大持久积压恢复需要独立的 control 资源预算
+
+- **已复现故障**：control 和 stateless Worker 曾共用 `512Mi` memory limit。远程五 voter
+  在恢复约 235k unfinished task 的 FSM 镜像时均达到 cgroup 上限并以
+  `OOMKilled/137` 循环退出，造成 quorum/Worker stream 抖动；宿主机仍有约 54Gi
+  available，故障不是节点总内存耗尽。
+- **存储与内存边界**：task pending/inflight/final state 仍是 Raft log、snapshot 和 FSM
+  的 durable 数据，每个 voter 恢复完整 shard 状态；不会因内存压力自动丢弃或清空任务。
+  control 默认 request/limit 为 `512Mi/2Gi`，Worker 继续 `128Mi/512Mi`，两类模板读取各自
+  resource 配置。该值是当前单 shard 演示容量基线，不是无限 backlog 的容量承诺。
+- **部署恢复与门禁**：若 live controller 已是 `Parallel` 且 Pod last termination 已出现
+  OOM，脚本在 Helm 前先把 control StatefulSet patch 到目标独立预算，并同时删除全部
+  control Pod，让原 PVC voter 并行恢复到 5/5；旧 OrderedReady 仍走 DEPLOY-002 的
+  controller migration。Helm rollout 完成后再连续观察 30 秒 5/5 Ready、restart counter
+  不增长且 last termination 不为 OOMKilled，才允许最终拓扑验收。门禁是只读观测，不写
+  Raft、不参与调度，也不把 restart 当任务恢复协议。
+- **非目标**：本次不改变 FSM 编码、snapshot 格式、task retention 或 multi-Raft 分片；
+  更大的生产 shard 仍应按任务对象实际内存做容量规划，超出单 shard 边界时通过 shard
+  拆分扩展，不依赖无限提高容器 limit。
+- **回归覆盖**：Chart 单测固定 control/Worker 独立预算和模板归属，部署脚本单测固定
+  Parallel OOM voter 重建顺序与 OOM/restart 门禁；真实三 voter集成经 Follower batch
+  HTTP 持久化 20k pending，停止并重建全部进程后再注册无状态 Worker，要求全部
+  exactly-once final state 排空。远程 MicroK8s 保留 235k 历史状态进行同一恢复门禁。
+
+### DEPLOY-003：Worker 扩容不能占满 control rollout 的 Pod 配额
+
+- **已复现故障**：235k backlog 把 Worker autoscaler 推到 100；单节点 kubelet 最多接纳
+  110 Pods。control StatefulSet 更新到 2Gi 时，新 `control-4` 因 `Too many pods` 无法
+  调度，而 autoscaler 又会立即补回刚释放的 Worker 槽位，控制面资源修复本身被执行面
+  阻塞。
+- **部署事务**：镜像成功 push 后、任何 Raft/Helm mutation 前，若已有 workload
+  autoscaler，先缩到 0；再把 stateless Worker StatefulSet 缩到配置的保温下限，按 Pod
+  实际数量有界等待至 `<=min`。随后 Helm 统一恢复 autoscaler，并由 backlog 在新上限内
+  扩容。Worker 正常 shutdown 仍排空已开始 Processor，pending/inflight/final-state 语义
+  不变。
+- **目标机容量边界**：通用 Chart 仍允许 `maxReplicas=100`；远程单节点部署默认 max=90，
+  为 5 control、autoscaler、registry 与 kube-system 留出至少十个执行 Pod 之外的调度槽。
+  多节点生产集群可按真实 kubelet 配额显式覆盖该值。
+- **非目标与门禁**：不自动扩 control、不抢占运行中任务、不清 backlog，也不把临时
+  Worker 缩容写进 Raft 协议。三分钟内不能收敛到保温 Pod 数则部署失败，不带着未知 Pod
+  压力继续迁移。
+- **回归覆盖**：脚本单测固定 autoscaler=0→Worker=min→实际 Pod 数门禁，且必须在 Raft
+  migration/Helm 之前；真实 MicroK8s 在 100 Worker/110 Pod 上限下复现 FailedScheduling，
+  暂停并缩容后要求 control 5/5 rollout，再由 autoscaler 在 max=90 内恢复执行容量。
 
 ## 任务生命周期
 
@@ -1147,3 +1210,16 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   `localStorage` 状态协议；真实 Chrome 1440px 验证左/中/右几何关系，双侧栏折叠后监控
   变宽、刷新后状态恢复、再展开，并继续走真实 tenant 创建、单 Pod capacity 写入、
   quick load、batch load 和排空路径。
+
+### UI-LOAD-004：shadcn 风格的双侧栏视觉壳
+
+- **视觉范围**：左右栏使用接近 shadcn Sidebar 的 neutral token、细边框、无浮层阴影、
+  12px 外壳、紧凑 32px 表单/按钮、group label、轻量 accent group 和 48px 折叠 rail。
+  标题图标使用内联线性 SVG，不引入 React、Tailwind、shadcn runtime 或外部字体/图标
+  下载，远程单文件 WebUI 仍可离线部署。
+- **行为边界**：只改变 CSS token、分组 DOM 和视觉密度；UI-LOAD-003 的左配置/中只读
+  监控/右负载职责、生产 API、每秒刷新、174 点历史、JSON 链接、localStorage 折叠协议及
+  Raft/FSM 均不变。
+- **回归覆盖**：组件测试固定 sidebar token、无阴影外壳、group/图标和 48px rail；真实
+  Chrome 检查 computed background/shadow/radius/accent/toggle 尺寸，同时重跑双栏折叠、
+  刷新恢复、tenant/capacity/quick load/Load Lab 与排空。

@@ -3275,6 +3275,173 @@ func TestFullClusterRestartRecoversExpiredClaims(t *testing.T) {
 	t.Log("full restart: pending and expired inflight work drained exactly once")
 }
 
+// TestLargePersistedBacklogRestoresAcrossFullClusterRestart preserves
+// RECOVERY-003. A control voter must rebuild a benchmark-sized pending set
+// after every process is replaced without needing any execution-plane state.
+// The workload enters through the real follower batch HTTP boundary, survives
+// the real three-voter Raft stores, and drains through a newly registered
+// stateless Worker after restart.
+func TestLargePersistedBacklogRestoresAcrossFullClusterRestart(t *testing.T) {
+	const (
+		tenantID  = "large-persisted-restart"
+		taskCount = 20_000
+		batchSize = 500
+	)
+	tc := newTestCluster(t, 3, 0)
+	defer tc.shutdown()
+	tc.addTenant(tenantID, 100)
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader before large-backlog submission")
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(
+			raftpkg.OpSetControlNodes,
+			raftpkg.SetControlNodesData{NodeIDs: []string{"node-0", "node-1", "node-2"}},
+		),
+		5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("set control-only voters: %v", err)
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	client := &http.Client{Timeout: 20 * time.Second}
+	taskIDs := make([]string, 0, taskCount)
+	submitStarted := time.Now()
+	for batchStart := 0; batchStart < taskCount; batchStart += batchSize {
+		submission := types.BatchTaskSubmitRequest{
+			Tasks: make([]types.TaskSubmitRequest, 0, batchSize),
+		}
+		for index := batchStart; index < batchStart+batchSize; index++ {
+			idempotencyKey := fmt.Sprintf("recovery-003-%05d", index)
+			submission.Tasks = append(submission.Tasks, types.TaskSubmitRequest{
+				TenantID:       tenantID,
+				Payload:        json.RawMessage(`{"case":"RECOVERY-003"}`),
+				IdempotencyKey: idempotencyKey,
+			})
+		}
+		body, err := json.Marshal(submission)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := client.Post(
+			"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+			"application/json",
+			bytes.NewReader(body),
+		)
+		if err != nil {
+			t.Fatalf("submit persisted batch %d: %v", batchStart/batchSize, err)
+		}
+		if response.StatusCode != http.StatusAccepted {
+			payload, _ := io.ReadAll(response.Body)
+			response.Body.Close()
+			t.Fatalf(
+				"submit persisted batch %d status=%s body=%s",
+				batchStart/batchSize,
+				response.Status,
+				payload,
+			)
+		}
+		var accepted types.BatchTaskResponse
+		if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+			response.Body.Close()
+			t.Fatalf("decode persisted batch %d: %v", batchStart/batchSize, err)
+		}
+		response.Body.Close()
+		if len(accepted.Tasks) != batchSize {
+			t.Fatalf(
+				"persisted batch %d accepted=%d, want %d",
+				batchStart/batchSize,
+				len(accepted.Tasks),
+				batchSize,
+			)
+		}
+		for _, task := range accepted.Tasks {
+			taskIDs = append(taskIDs, task.TaskID)
+		}
+	}
+	submitElapsed := time.Since(submitStarted)
+
+	tc.waitFor(func() bool {
+		for _, nd := range tc.nodes {
+			if nd == nil ||
+				nd.RaftCluster().FSM().CountUnfinishedPerTenant()[tenantID] != taskCount {
+				return false
+			}
+		}
+		return true
+	}, 20*time.Second, "large pending set replicated before restart")
+
+	restartStarted := time.Now()
+	tc.restartAll()
+	tc.waitFor(func() bool {
+		for _, nd := range tc.nodes {
+			if nd == nil ||
+				nd.RaftCluster().FSM().CountUnfinishedPerTenant()[tenantID] != taskCount {
+				return false
+			}
+		}
+		return true
+	}, 20*time.Second, "large pending set restored on every voter")
+	for index, nd := range tc.nodes {
+		if got := nd.RaftCluster().FSM().CountUnfinishedPerTenant()[tenantID]; got != taskCount {
+			t.Fatalf("node-%d restored unfinished=%d, want %d", index, got, taskCount)
+		}
+	}
+	restartElapsed := time.Since(restartStarted)
+
+	leader = tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader after large-backlog restart")
+	}
+	follower = (leader + 1) % len(tc.nodes)
+	execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+		NodeID:            "recovery-003-worker",
+		APIAddress:        "127.0.0.1:0",
+		ControllerAddress: tc.httpAddrs[follower],
+		TotalWorkers:      100,
+	}, tc.proc, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = execution.Shutdown(5 * time.Second) }()
+	go func() { _ = execution.Start() }()
+
+	tc.waitFor(func() bool {
+		info := tc.fsms().GetAllNodes()["recovery-003-worker"]
+		return info != nil && info.Status == types.NodeStatusUp &&
+			info.Role == types.NodeRoleWorker
+	}, 15*time.Second, "stateless Worker registers after control recovery")
+	tc.waitFor(func() bool {
+		allocation, ok := tc.fsms().GetAllocation("recovery-003-worker")
+		if !ok {
+			return false
+		}
+		allocated := sumIntegrationWorkers(allocation.Tenants)
+		return allocated > 0 &&
+			sumIntegrationWorkers(execution.Pool().GetStatus()) == allocated
+	}, 15*time.Second, "restored tenant allocation reaches stateless Worker")
+	drainStarted := time.Now()
+	tc.waitFor(func() bool {
+		return tc.fsms().CountUnfinishedPerTenant()[tenantID] == 0
+	}, 120*time.Second, "large restored backlog drains")
+	drainElapsed := time.Since(drainStarted)
+
+	for _, taskID := range taskIDs {
+		if count := tc.proc.processedTaskCount(taskID); count != 1 {
+			t.Fatalf("restored task %s processed %d times, want once", taskID, count)
+		}
+	}
+	t.Logf(
+		"RECOVERY-003: submit=%s restart-and-restore=%s drain=%s tasks=%d batch=%d",
+		submitElapsed,
+		restartElapsed,
+		drainElapsed,
+		taskCount,
+		batchSize,
+	)
+}
+
 // TestStaggeredFullClusterRestartKeepsVotersAliveAcrossElectionRetryWindows
 // reproduces CTRL-005. After a host restart, one persisted voter may start well
 // before the other members. It must keep its Raft transport alive across

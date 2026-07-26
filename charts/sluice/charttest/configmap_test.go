@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 )
 
 func TestRemoteTopologyValidationAllowsHPAReplicaHistory(t *testing.T) {
@@ -109,6 +111,61 @@ func TestControlStatefulSetCanRecoverAllRaftVotersInParallel(t *testing.T) {
 	}
 	if strings.Contains(source, "podManagementPolicy: OrderedReady") {
 		t.Fatal("persisted Raft voters can still deadlock behind OrderedReady")
+	}
+}
+
+func TestControlAndWorkerResourceBudgetsAreIndependent(t *testing.T) {
+	type resources struct {
+		Requests map[string]string `json:"requests"`
+		Limits   map[string]string `json:"limits"`
+	}
+	type values struct {
+		Control struct {
+			Resources resources `json:"resources"`
+		} `json:"control"`
+		Worker struct {
+			Resources resources `json:"resources"`
+		} `json:"worker"`
+		Resources *resources `json:"resources"`
+	}
+
+	valuesData, err := os.ReadFile("../values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chartValues values
+	if err := yaml.Unmarshal(valuesData, &chartValues); err != nil {
+		t.Fatal(err)
+	}
+	if chartValues.Resources != nil {
+		t.Fatal("control and Worker still share one top-level resource budget")
+	}
+	if got := chartValues.Control.Resources.Limits["memory"]; got != "2Gi" {
+		t.Fatalf("control memory limit = %q, want 2Gi for large FSM recovery", got)
+	}
+	if got := chartValues.Worker.Resources.Limits["memory"]; got != "512Mi" {
+		t.Fatalf("Worker memory limit = %q, want independent 512Mi budget", got)
+	}
+	if chartValues.Control.Resources.Limits["memory"] ==
+		chartValues.Worker.Resources.Limits["memory"] {
+		t.Fatal("control and Worker memory limits are not independently sized")
+	}
+
+	controlData, err := os.ReadFile("../templates/statefulset.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerData, err := os.ReadFile("../templates/worker-statefulset.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(controlData), ".Values.control.resources") ||
+		strings.Contains(string(controlData), ".Values.worker.resources") {
+		t.Fatal("control StatefulSet does not use only the control resource budget")
+	}
+	if !strings.Contains(string(workerData), ".Values.worker.resources") ||
+		strings.Contains(string(workerData), ".Values.control.resources") {
+		t.Fatal("Worker StatefulSet does not use only the Worker resource budget")
 	}
 }
 
@@ -235,7 +292,7 @@ func TestRemoteDeployWaitsForWorkloadAutoscalerMinimum(t *testing.T) {
 	}
 }
 
-func TestRemoteDeployMigratesControlPolicyWithoutDeletingPodsOrPVCs(t *testing.T) {
+func TestRemoteDeployMigratesControlPolicyWithoutDeletingPVCs(t *testing.T) {
 	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -292,6 +349,135 @@ func TestRemoteDeployServerDryRunIsolatedFromLiveImmutableControl(t *testing.T) 
 	migration := strings.Index(source, "Migrating control StatefulSet to parallel Raft recovery")
 	if validation < 0 || migration < 0 || validation >= migration {
 		t.Fatal("isolated preflight must finish before mutating the live controller")
+	}
+}
+
+func TestRemoteDeployRecreatesOrphanedControlPodsBeforeHelmUpgrade(t *testing.T) {
+	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, required := range []string{
+		`StatefulSet RollingUpdate still waits for the highest old Pod`,
+		`control_pvcs_before=`,
+		`microk8s kubectl delete pods`,
+		`app.kubernetes.io/component=control`,
+		`control_pods_remaining=`,
+		`[ "${control_pods_remaining}" -ne 0 ]`,
+		`control_pvcs_after=`,
+		`[ "${control_pvcs_after}" -ne "${control_pvcs_before}" ]`,
+		`Control Pod recreation did not preserve PVCs`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("remote persisted-voter recreation is missing %q", required)
+		}
+	}
+	orphan := strings.Index(source, `--cascade=orphan --wait=true`)
+	recreateOffset := -1
+	recreate := -1
+	if orphan >= 0 {
+		recreateOffset = strings.Index(source[orphan:], `microk8s kubectl delete pods`)
+		if recreateOffset >= 0 {
+			recreate = orphan + recreateOffset
+		}
+	}
+	upgrade := strings.Index(source, "Upgrading Helm release")
+	if orphan < 0 || recreateOffset < 0 || upgrade < 0 ||
+		orphan >= recreate || recreate >= upgrade {
+		t.Fatal("old control Pods must be orphaned, removed, then recreated by Helm")
+	}
+	if strings.Contains(source, `kubectl delete pvc`) {
+		t.Fatal("persisted-voter recreation may not delete Raft PVCs")
+	}
+}
+
+func TestRemoteDeployRejectsControlOOMAndRestartChurn(t *testing.T) {
+	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, required := range []string{
+		`CONTROL_STABILITY_SECONDS="${CONTROL_STABILITY_SECONDS:-30}"`,
+		`Verifying control recovery remains stable under persisted state`,
+		`control_restarts_before=`,
+		`control_restarts_now=`,
+		`control_last_reasons=`,
+		`grep -q '=OOMKilled$'`,
+		`Control recovery was OOMKilled under the persisted FSM`,
+		`[ "${control_ready}" -ne 5 ]`,
+		`[ "${control_restarts_now}" != "${control_restarts_before}" ]`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("remote control recovery gate is missing %q", required)
+		}
+	}
+	stability := strings.Index(source, "Verifying control recovery remains stable")
+	topology := strings.Index(source, "Verifying control and Worker topology")
+	if stability < 0 || topology < 0 || stability >= topology {
+		t.Fatal("control stability must pass before final topology acceptance")
+	}
+}
+
+func TestRemoteDeployRecreatesOOMLimitedParallelVotersBeforeUpgrade(t *testing.T) {
+	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, required := range []string{
+		`CONTROL_MEMORY_LIMIT="${CONTROL_MEMORY_LIMIT:-2Gi}"`,
+		`control_oom_count=`,
+		`grep -c '^OOMKilled$'`,
+		`[ "${control_policy}" = "Parallel" ]`,
+		`Recovering OOM-limited persisted voters in parallel`,
+		`kubectl set resources statefulset "${STATEFULSET}"`,
+		`--limits="cpu=${CONTROL_CPU_LIMIT},memory=${CONTROL_MEMORY_LIMIT}"`,
+		`kubectl delete pods`,
+		`rollout status "statefulset/${STATEFULSET}"`,
+		`--set control.resources.limits.memory="${CONTROL_MEMORY_LIMIT}"`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("remote OOM voter recovery is missing %q", required)
+		}
+	}
+	recovery := strings.Index(source, "Recovering OOM-limited persisted voters in parallel")
+	migration := strings.Index(source, "Migrating existing Raft members")
+	upgrade := strings.Index(source, "Upgrading Helm release")
+	if recovery < 0 || migration < 0 || upgrade < 0 ||
+		recovery >= migration || migration >= upgrade {
+		t.Fatal("OOM-limited voters must recover before Raft migration and Helm upgrade")
+	}
+}
+
+func TestRemoteDeployReservesControlRolloutPodHeadroom(t *testing.T) {
+	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, required := range []string{
+		`WORKER_MAX_REPLICAS="${WORKER_MAX_REPLICAS:-90}"`,
+		`Reserving control-plane rollout capacity`,
+		`kubectl scale deployment "${RELEASE}-sluice-worker-autoscaler"`,
+		`--namespace "${NAMESPACE}" --replicas=0`,
+		`kubectl scale statefulset "${WORKER_STATEFULSET}"`,
+		`--namespace "${NAMESPACE}" --replicas="${WORKER_MIN_REPLICAS}"`,
+		`worker_pods_remaining=`,
+		`[ "${worker_pods_remaining}" -le "${WORKER_MIN_REPLICAS}" ]`,
+		`Worker scale-down did not reserve control rollout capacity`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("remote rollout headroom gate is missing %q", required)
+		}
+	}
+	reserve := strings.Index(source, "Reserving control-plane rollout capacity")
+	migration := strings.Index(source, "Migrating existing Raft members")
+	upgrade := strings.Index(source, "Upgrading Helm release")
+	if reserve < 0 || migration < 0 || upgrade < 0 ||
+		reserve >= migration || migration >= upgrade {
+		t.Fatal("Worker rollout headroom must be reserved before Raft migration and Helm mutation")
 	}
 }
 
