@@ -231,12 +231,30 @@ func (c *Cluster) RegisterNodeWithRole(httpAddr string, totalWorkers int, role s
 // AddVoter adds a new voting member to the cluster.  Call this on the
 // leader when a new node wants to join.
 func (c *Cluster) AddVoter(nodeID, raftAddr string) error {
+	c.membershipMu.Lock()
+	defer c.membershipMu.Unlock()
 	future := c.raft.AddVoter(
 		raft.ServerID(nodeID),
 		raft.ServerAddress(raftAddr),
 		0, 0,
 	)
 	return future.Error()
+}
+
+// WithStableMembership holds the same lock used by production membership
+// changes while fn checks peer capabilities and commits a protocol-sensitive
+// log entry. This closes the check/apply race for rolling upgrades.
+func (c *Cluster) WithStableMembership(
+	fn func(MembershipStatus) error,
+) error {
+	c.membershipMu.Lock()
+	defer c.membershipMu.Unlock()
+	configuration, err := c.configurationLocked()
+	if err != nil {
+		return err
+	}
+	_, leaderID := c.raft.LeaderWithID()
+	return fn(membershipStatus(configuration, leaderID))
 }
 
 // AddServer adds or repairs a member while bounding the voting quorum.

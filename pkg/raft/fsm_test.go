@@ -33,6 +33,14 @@ func applyCmd(t *testing.T, fsm *FSM, op string, data interface{}) interface{} {
 	return resp
 }
 
+func sumWorkers(workers map[string]int) int {
+	total := 0
+	for _, count := range workers {
+		total += count
+	}
+	return total
+}
+
 // ---------------------------------------------------------------------------
 // Tenant tests
 // ---------------------------------------------------------------------------
@@ -267,6 +275,65 @@ func TestSetWorkerCapacityRejectsInvalidTarget(t *testing.T) {
 				t.Fatalf("invalid capacity request unexpectedly succeeded: %+v", test.request)
 			}
 		})
+	}
+}
+
+func TestSetWorkerCapacitiesValidatesEveryTargetBeforeAtomicMutation(t *testing.T) {
+	fsm := newTestFSM(t)
+	for _, nodeID := range []string{"worker-0", "worker-1"} {
+		applyCmd(t, fsm, OpNodeUp, types.NodeInfo{
+			ID: nodeID, Role: types.NodeRoleWorker, TotalWorkers: 10,
+		})
+	}
+	applyCmd(t, fsm, OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"worker-0": {
+			NodeID: "worker-0", Tenants: map[string]int{"tenant-a": 8},
+			Borrowed: map[string]int{"tenant-a": 3},
+		},
+		"worker-1": {
+			NodeID: "worker-1", Tenants: map[string]int{"tenant-b": 8},
+			Borrowed: map[string]int{"tenant-b": 3},
+		},
+	})
+
+	response := fsm.Apply(&raft.Log{
+		Data: MustMarshalCommand(OpSetWorkerCapacities, SetWorkerCapacitiesData{
+			NodeIDs: []string{"worker-0", "missing", "worker-1"}, TotalWorkers: 4,
+		}),
+		Type: raft.LogCommand,
+	})
+	if _, ok := response.(error); !ok {
+		t.Fatal("batch with an invalid target unexpectedly succeeded")
+	}
+	for _, nodeID := range []string{"worker-0", "worker-1"} {
+		node := fsm.GetAllNodes()[nodeID]
+		if node.TotalWorkers != 10 || node.CapacityOverride != 0 {
+			t.Fatalf("failed batch partially changed %s: %+v", nodeID, node)
+		}
+		allocation, _ := fsm.GetAllocation(nodeID)
+		if sumWorkers(allocation.Tenants) != 8 {
+			t.Fatalf("failed batch partially trimmed %s: %+v", nodeID, allocation)
+		}
+	}
+
+	response = fsm.Apply(&raft.Log{
+		Data: MustMarshalCommand(OpSetWorkerCapacities, SetWorkerCapacitiesData{
+			NodeIDs: []string{"worker-0", "worker-1"}, TotalWorkers: 4,
+		}),
+		Type: raft.LogCommand,
+	})
+	if response != nil {
+		t.Fatalf("valid all-worker capacity update returned %v", response)
+	}
+	for _, nodeID := range []string{"worker-0", "worker-1"} {
+		node := fsm.GetAllNodes()[nodeID]
+		if node.TotalWorkers != 4 || node.CapacityOverride != 4 {
+			t.Fatalf("atomic batch did not update %s: %+v", nodeID, node)
+		}
+		allocation, _ := fsm.GetAllocation(nodeID)
+		if sumWorkers(allocation.Tenants) != 4 {
+			t.Fatalf("atomic batch did not safely trim %s: %+v", nodeID, allocation)
+		}
 	}
 }
 

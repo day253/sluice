@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -4146,6 +4147,215 @@ func TestWorkerInstanceCapacityAPIConvergesRuntimeAndSurvivesRestart(t *testing.
 		}
 		return true
 	}, 10*time.Second, "replacement process preserves Raft capacity override")
+}
+
+// TestAllWorkerCapacitiesAPIAtomicallyConvergesEveryLiveWorker preserves
+// CAPACITY-002 across follower HTTP forwarding, a real three-voter Raft
+// control plane, one atomic capacity entry, global allocation reconciliation,
+// AllocationPush and two independent stateless Processor pools.
+func TestAllWorkerCapacitiesAPIAtomicallyConvergesEveryLiveWorker(t *testing.T) {
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no Raft leader")
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(
+			raftpkg.OpSetControlNodes,
+			raftpkg.SetControlNodesData{NodeIDs: []string{"node-0", "node-1", "node-2"}},
+		),
+		5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("migrate voters to control-only role: %v", err)
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpNodeUp, types.NodeInfo{
+			ID: "bulk-worker-retained", Role: types.NodeRoleWorker,
+			TotalWorkers: 7,
+		}),
+		5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("register retained Worker identity: %v", err)
+	}
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(
+			raftpkg.OpWorkerOffline,
+			raftpkg.WorkerOfflineData{ID: "bulk-worker-retained"},
+		),
+		5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("mark retained Worker identity down: %v", err)
+	}
+
+	workers := make([]*node.StatelessWorker, 0, 2)
+	for _, workerID := range []string{"bulk-worker-0", "bulk-worker-1"} {
+		execution, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
+			NodeID: workerID, APIAddress: "127.0.0.1:0",
+			ControllerAddress: tc.httpAddrs[(leader+1)%len(tc.nodes)],
+			TotalWorkers:      3,
+		}, tc.proc, zap.NewNop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		workers = append(workers, execution)
+		go func(worker *node.StatelessWorker) { _ = worker.Start() }(execution)
+	}
+	defer func() {
+		for _, execution := range workers {
+			_ = execution.Shutdown(5 * time.Second)
+		}
+	}()
+
+	tc.addTenant("bulk-capacity-a", 4)
+	tc.addTenant("bulk-capacity-b", 4)
+	tc.waitFor(func() bool {
+		nodes := tc.fsms().GetAllNodes()
+		for _, workerID := range []string{"bulk-worker-0", "bulk-worker-1"} {
+			info := nodes[workerID]
+			if info == nil || info.Status != types.NodeStatusUp ||
+				info.TotalWorkers != 3 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "two live Worker instances register")
+
+	currentLeader := tc.leaderIdx()
+	if currentLeader < 0 {
+		t.Fatal("leader disappeared before capacity update")
+	}
+	follower := (currentLeader + 1) % len(tc.nodes)
+	unsupported := (currentLeader + 2) % len(tc.nodes)
+	legacyControl := httptest.NewServer(http.NotFoundHandler())
+	defer legacyControl.Close()
+	if err := tc.nodes[currentLeader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpNodeUp, types.NodeInfo{
+			ID: "node-" + strconv.Itoa(unsupported), Role: types.NodeRoleControl,
+			Address:     strings.TrimPrefix(legacyControl.URL, "http://"),
+			RaftAddress: tc.raftAddrs[unsupported], TotalWorkers: 0,
+		}),
+		5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("publish old control capability endpoint: %v", err)
+	}
+
+	setAllCapacities := func() *http.Response {
+		body, marshalErr := json.Marshal(map[string]int{"total_workers": 2})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		request, requestErr := http.NewRequest(
+			http.MethodPut,
+			"http://"+tc.httpAddrs[follower]+"/api/v1/admin/nodes/capacity",
+			bytes.NewReader(body),
+		)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, requestErr := (&http.Client{Timeout: 15 * time.Second}).Do(request)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		return response
+	}
+	rejected := setAllCapacities()
+	rejectedBody, _ := io.ReadAll(rejected.Body)
+	rejected.Body.Close()
+	if rejected.StatusCode != http.StatusServiceUnavailable ||
+		!bytes.Contains(rejectedBody, []byte("does not advertise Raft operation")) {
+		t.Fatalf(
+			"mixed-version capacity status=%s body=%s",
+			rejected.Status, rejectedBody,
+		)
+	}
+	for _, workerID := range []string{"bulk-worker-0", "bulk-worker-1"} {
+		info := tc.fsms().GetAllNodes()[workerID]
+		if info.TotalWorkers != 3 || info.CapacityOverride != 0 {
+			t.Fatalf("mixed-version rejection partially changed %s: %+v", workerID, info)
+		}
+	}
+	if err := tc.nodes[currentLeader].RaftCluster().GetRaft().Apply(
+		raftpkg.MustMarshalCommand(raftpkg.OpNodeUp, types.NodeInfo{
+			ID: "node-" + strconv.Itoa(unsupported), Role: types.NodeRoleControl,
+			Address:     tc.httpAddrs[unsupported],
+			RaftAddress: tc.raftAddrs[unsupported], TotalWorkers: 0,
+		}),
+		5*time.Second,
+	).Error(); err != nil {
+		t.Fatalf("restore upgraded control capability endpoint: %v", err)
+	}
+
+	response := setAllCapacities()
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(response.Body)
+		t.Fatalf("set all capacities status=%s body=%s", response.Status, payload)
+	}
+	var result types.WorkerCapacityBatchResponse
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Updated != 2 || result.TotalWorkers != 2 ||
+		len(result.Nodes) != 2 ||
+		result.Nodes[0].NodeID != "bulk-worker-0" ||
+		result.Nodes[1].NodeID != "bulk-worker-1" {
+		t.Fatalf("all-worker capacity response = %+v", result)
+	}
+
+	tc.waitFor(func() bool {
+		for _, control := range tc.nodes {
+			nodes := control.RaftCluster().FSM().GetAllNodes()
+			for _, workerID := range []string{"bulk-worker-0", "bulk-worker-1"} {
+				info := nodes[workerID]
+				if info == nil || info.TotalWorkers != 2 ||
+					info.CapacityOverride != 2 {
+					return false
+				}
+				if allocation, ok := control.RaftCluster().FSM().GetAllocation(workerID); ok &&
+					sumIntegrationWorkers(allocation.Tenants) > 2 {
+					return false
+				}
+			}
+			retained := nodes["bulk-worker-retained"]
+			if retained == nil || retained.Status != types.NodeStatusDown ||
+				retained.TotalWorkers != 7 || retained.CapacityOverride != 0 {
+				return false
+			}
+		}
+		for _, execution := range workers {
+			if sumIntegrationWorkers(execution.Pool().GetStatus()) > 2 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "one bulk capacity command converges every FSM and Worker pool")
+
+	performanceResponse, err := (&http.Client{Timeout: 10 * time.Second}).Get(
+		"http://" + tc.httpAddrs[follower] + "/api/v1/admin/performance?history=0",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer performanceResponse.Body.Close()
+	if performanceResponse.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(performanceResponse.Body)
+		t.Fatalf(
+			"all-worker performance status=%s body=%s",
+			performanceResponse.Status, payload,
+		)
+	}
+	var diagnostics metricspkg.PerformanceDiagnostics
+	if err := json.NewDecoder(performanceResponse.Body).Decode(&diagnostics); err != nil {
+		t.Fatal(err)
+	}
+	operation := diagnostics.Current.Raft[raftpkg.OpSetWorkerCapacities]
+	if operation.Applies != 1 || operation.Items != 2 ||
+		operation.AverageBatch != 2 || operation.Errors != 0 {
+		t.Fatalf("all-worker observed Raft shape = %+v", operation)
+	}
 }
 
 // TestLeaderAssignmentUsesWorkerCPULoadFeedback preserves SCHED-006 at the

@@ -18,12 +18,13 @@ import (
 )
 
 type loadLabBrowserAPI struct {
-	mu             sync.Mutex
-	tenants        map[string]map[string]any
-	submitted      int
-	idempotencyKey map[string]bool
-	workerCapacity int
-	capacityWrites int
+	mu                sync.Mutex
+	tenants           map[string]map[string]any
+	submitted         int
+	idempotencyKey    map[string]bool
+	workerCapacity    int
+	capacityWrites    int
+	allCapacityWrites int
 }
 
 func newLoadLabBrowserAPI() *loadLabBrowserAPI {
@@ -122,6 +123,28 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeBrowserJSON(w, map[string]any{
 			"node_id": "worker-0", "total_workers": request.TotalWorkers,
 			"capacity_override": request.TotalWorkers,
+		})
+	case r.Method == http.MethodPut &&
+		r.URL.Path == "/api/v1/admin/nodes/capacity":
+		var request struct {
+			TotalWorkers int `json:"total_workers"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil ||
+			request.TotalWorkers < 1 || request.TotalWorkers > 1000 {
+			http.Error(w, `{"error":"bad all-worker capacity"}`, http.StatusBadRequest)
+			return
+		}
+		a.mu.Lock()
+		a.workerCapacity = request.TotalWorkers
+		a.allCapacityWrites++
+		a.mu.Unlock()
+		writeBrowserJSON(w, map[string]any{
+			"total_workers": request.TotalWorkers,
+			"updated":       1,
+			"nodes": []map[string]any{{
+				"node_id": "worker-0", "total_workers": request.TotalWorkers,
+				"capacity_override": request.TotalWorkers,
+			}},
 		})
 	case r.Method == http.MethodPut &&
 		strings.HasPrefix(r.URL.Path, "/api/v1/admin/tenants/"):
@@ -377,6 +400,19 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 		t.Fatal(err)
 	}
 	waitForWorkerCapacity(t, ctx, api, 7, 8*time.Second)
+	if err := chromedp.Run(ctx,
+		chromedp.Evaluate(
+			`const select=document.querySelector("#worker-capacity-node");
+			 select.value="__all__";
+			 select.dispatchEvent(new Event("change",{bubbles:true}))`,
+			nil,
+		),
+		chromedp.SetValue("#worker-capacity-value", "9", chromedp.ByQuery),
+		chromedp.Click("#worker-capacity-apply", chromedp.ByQuery),
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitForAllWorkerCapacity(t, ctx, api, 9, 8*time.Second)
 	waitForLoadLabStatus(t, ctx, "completed", 8*time.Second)
 
 	if err := chromedp.Run(ctx,
@@ -406,10 +442,12 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	api.mu.Lock()
 	defer api.mu.Unlock()
 	if len(api.tenants) != 3 || api.submitted != 7 ||
-		len(api.idempotencyKey) != 6 || api.capacityWrites != 1 {
+		len(api.idempotencyKey) != 6 || api.capacityWrites != 1 ||
+		api.allCapacityWrites != 1 {
 		t.Fatalf(
-			"browser operations = %d tenants, %d tasks, %d keys, %d capacity writes",
-			len(api.tenants), api.submitted, len(api.idempotencyKey), api.capacityWrites,
+			"browser operations = %d tenants, %d tasks, %d keys, %d single/%d all capacity writes",
+			len(api.tenants), api.submitted, len(api.idempotencyKey),
+			api.capacityWrites, api.allCapacityWrites,
 		)
 	}
 }
@@ -460,6 +498,40 @@ func waitForWorkerCapacity(
 	t.Fatalf(
 		"Worker capacity UI metric=%q status=%q, want %d",
 		metric, status, want,
+	)
+}
+
+func waitForAllWorkerCapacity(
+	t *testing.T,
+	ctx context.Context,
+	api *loadLabBrowserAPI,
+	want int,
+	deadline time.Duration,
+) {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	var metric, status, button string
+	for time.Now().Before(end) {
+		api.mu.Lock()
+		got := api.workerCapacity
+		writes := api.allCapacityWrites
+		api.mu.Unlock()
+		err := chromedp.Run(
+			ctx,
+			chromedp.Text("#metric-capacity", &metric, chromedp.ByQuery),
+			chromedp.Text("#worker-capacity-status", &status, chromedp.ByQuery),
+			chromedp.Text("#worker-capacity-apply", &button, chromedp.ByQuery),
+		)
+		if err == nil && got == want && writes == 1 && metric == fmt.Sprint(want) &&
+			strings.Contains(status, fmt.Sprintf("all currently %d slots", want)) &&
+			button == "Apply to all" {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf(
+		"all-Worker capacity UI metric=%q status=%q button=%q, want %d",
+		metric, status, button, want,
 	)
 }
 

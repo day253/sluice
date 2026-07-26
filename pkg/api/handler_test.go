@@ -174,6 +174,29 @@ func TestRaftStatusEndpointReportsBoundedMembership(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesAdvertiseAtomicWorkerCapacityOperation(t *testing.T) {
+	h, _, _ := setupHandler(t)
+	router := newRouter(h)
+	request := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/admin/capabilities",
+		nil,
+	)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("capabilities status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var capabilities types.AdminCapabilities
+	if err := json.Unmarshal(recorder.Body.Bytes(), &capabilities); err != nil {
+		t.Fatal(err)
+	}
+	if len(capabilities.RaftOperations) != 1 ||
+		capabilities.RaftOperations[0] != raftpkg.OpSetWorkerCapacities {
+		t.Fatalf("capabilities = %+v", capabilities)
+	}
+}
+
 func TestPerformanceEndpointReturnsConfiguredLeaderDiagnostics(t *testing.T) {
 	h, _, _ := setupHandler(t)
 	localOnly := false
@@ -701,6 +724,78 @@ func TestSetWorkerCapacityEndpointValidatesAndDelegates(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("invalid requests reached mutation callback %d times", calls)
+	}
+}
+
+func TestSetAllWorkerCapacitiesEndpointValidatesAndDelegatesOnce(t *testing.T) {
+	h, _, _ := setupHandler(t)
+	calls := 0
+	gotWorkers := 0
+	h.SetAllWorkerCapacitiesFunc(func(
+		_ context.Context,
+		totalWorkers int,
+	) (types.WorkerCapacityBatchResponse, error) {
+		calls++
+		gotWorkers = totalWorkers
+		return types.WorkerCapacityBatchResponse{
+			TotalWorkers: totalWorkers,
+			Updated:      2,
+			Nodes: []types.WorkerCapacityResponse{
+				{
+					NodeID: "worker-0", TotalWorkers: totalWorkers,
+					CapacityOverride: totalWorkers,
+				},
+				{
+					NodeID: "worker-1", TotalWorkers: totalWorkers,
+					CapacityOverride: totalWorkers,
+				},
+			},
+		}, nil
+	})
+	router := newRouter(h)
+
+	request := httptest.NewRequest(
+		http.MethodPut,
+		"/api/v1/admin/nodes/capacity",
+		bytes.NewReader([]byte(`{"total_workers":300}`)),
+	)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || calls != 1 || gotWorkers != 300 {
+		t.Fatalf(
+			"all-worker capacity status=%d calls=%d workers=%d body=%s",
+			recorder.Code, calls, gotWorkers, recorder.Body.String(),
+		)
+	}
+	var response types.WorkerCapacityBatchResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Updated != 2 || len(response.Nodes) != 2 ||
+		response.TotalWorkers != 300 {
+		t.Fatalf("all-worker capacity response = %+v", response)
+	}
+
+	for name, body := range map[string]string{
+		"zero":         `{"total_workers":0}`,
+		"over maximum": `{"total_workers":1001}`,
+		"invalid JSON": `{`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(
+				http.MethodPut,
+				"/api/v1/admin/nodes/capacity",
+				bytes.NewReader([]byte(body)),
+			)
+			out := httptest.NewRecorder()
+			router.ServeHTTP(out, req)
+			if out.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d want=400 body=%s", out.Code, out.Body.String())
+			}
+		})
+	}
+	if calls != 1 {
+		t.Fatalf("invalid all-worker requests reached mutation callback %d times", calls)
 	}
 }
 

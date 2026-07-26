@@ -1013,3 +1013,43 @@ ResultStream 报 `not connected`，随后在 `pkg/worker.(*Pool).completeTask` �
 856 上升到峰值约 5102 task/s，unfinished 最终为 0，随后空闲缩容从 90→68→39。
 这个变化同时包含扩容、control rollout 和 Leader telemetry epoch 切换，只用于证明 HPA
 已响应及定位崩溃窗口，不作为可比较吞吐基线。
+
+### 7.15 全 Worker 容量原子批量配置（2026-07-26）
+
+CAPACITY-002 新增的是低频控制路径：Follower 把一次
+`PUT /api/v1/admin/nodes/capacity` 转发 Leader，Leader 固定当前 live Worker ID 后用一条
+`OpSetWorkerCapacities` Raft entry 更新全部实例，再执行一次全局 allocation reconcile。
+提交前会在 membership lock 内用同一个 3 秒总 deadline 逐个本机 HTTP 确认全部
+voter/non-voter 的只读 capability；正常同版本本地网络下该控制路径开销不进入任务热路径，
+旧版或不可达 peer 会让操作在 Raft Apply 前失败。
+它没有改变 task submit、pending selection、Assignment/Result stream、Claim/Complete
+batching 或 Processor 路径。与浏览器逐 Pod 发 N 次写相比，共识写入从 N 条容量日志固定为
+1 条；process-local performance diagnostics 将 `items` 记录为目标 Worker 数，保留 Apply
+latency、errors 和 average batch 的原始 JSON 可见性。
+
+按仓库 PERF-001 固定形状重跑：Apple M4 Pro（14 logical CPU、48GiB、
+darwin/arm64、Go 1.26.5），`-race -count=1`，单故障域真实 7 replica/3 voter/4
+non-voter、单 Raft shard；每进程 80 槽，Leader 不执行，4 tenant×Limit 120，共 20000
+个约 10ms 小 JSON 任务。请求经真实 Follower HTTP 顺序提交，batch=1000、
+concurrency=1。
+
+| 阶段 | 定向单次 | 完整 `make test` 内复跑 |
+|---|---:|---:|
+| 20k Follower HTTP durable submit | 3.207s | 2.939s |
+| accepted 后排空 | 12.000s | 11.801s |
+| submit 开始至排空 | 15.207s（1315.1 task/s） | 14.739s（1356.9 task/s） |
+| 请求错误 / 最终 unfinished / 单任务重复执行 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+同形 7.14 单轮为 14.367s/1392.1 task/s，本轮两次分别慢约 5.8% 和 2.6%；这些都是本地
+race 单次采样，且新增分支不在任务热路径，不能把波动归因为容量批量命令，也不能宣称吞吐
+改善。可以确认的是正常任务路径没有功能性回退，20k 两轮都在 15.207s 内正确排空。完整
+`make test` 的 integration 阶段为 408.457s。新增真实 CAPACITY-002 Case 另外使用
+3 voter/两个 3-slot stateless Worker，从 Follower 发一次批量请求并收敛到每实例 2 槽；
+Leader diagnostics 必须显示 `set_worker_capacities: applies=1, items=2,
+average_batch=2, errors=0`，容量、allocation 与两个 Processor Pool 均通过。
+
+补上 rolling-upgrade capability gate 与 membership check/Apply 临界区后，再次完整运行
+`make test`：同一 PERF-001 的 submit=3.045s、drain=11.800s、端到端
+14.845s（1347.3 task/s），请求错误/最终 unfinished/重复执行仍为 0/0/0，integration
+阶段为 409.813s。该次比本节上一轮完整测试的 14.739s 慢约 0.7%，仍属本地 race
+单次波动；它确认 capability 探测只发生在容量控制请求上，没有进入任务热路径。

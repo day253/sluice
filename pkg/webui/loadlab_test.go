@@ -114,7 +114,9 @@ func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
 		`id="load-stop"`, `data-load-json=`,
 		`id="worker-capacity-node"`, `id="worker-capacity-value"`,
 		`id="worker-capacity-apply"`, `Processor slots`,
-		`/capacity`, `body:JSON.stringify({total_workers:totalWorkers})`,
+		`allValue='__all__'`, `All live Worker Pods`,
+		`'/api/v1/admin/nodes/capacity'`,
+		`body:JSON.stringify({total_workers:totalWorkers})`,
 		`id="performance-cpu-admission"`, `CPU admission`,
 		`load_throttled_requests`, `worker_loads`,
 		`id="autoscaling-title"`, `Autoscaling pressure`,
@@ -233,6 +235,7 @@ func TestDashboardSeparatesConfigurationMonitoringAndLoadSidebars(t *testing.T) 
 		`id="worker-capacity-node"`,
 		`id="worker-capacity-value"`,
 		`id="worker-capacity-apply"`,
+		`all live Worker Pods`,
 		`id="config-sidebar-toggle"`,
 		`aria-controls="config-sidebar-body"`,
 	} {

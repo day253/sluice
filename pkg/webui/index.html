@@ -75,9 +75,9 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
         </div>
         <div class="sidebar-config-section sidebar-group" aria-labelledby="worker-capacity-title">
           <div class="sidebar-section-title" id="worker-capacity-title">Worker Pod capacity</div>
-          <div class="sidebar-section-note">Set the execution concurrency for one live Worker Pod. This is independent from tenant Limit.</div>
+          <div class="sidebar-section-note">Set execution concurrency for one or every live Worker Pod. This is independent from tenant Limit.</div>
           <div class="worker-capacity-config">
-            <div class="load-field"><label for="worker-capacity-node">Worker Pod</label><select id="worker-capacity-node" aria-label="Worker instance"></select></div>
+            <div class="load-field"><label for="worker-capacity-node">Worker Pod</label><select id="worker-capacity-node" aria-label="Worker instance or all live Worker Pods"></select></div>
             <div class="load-field"><label for="worker-capacity-value">Processor slots</label><input id="worker-capacity-value" type="number" min="1" max="1000" step="1" value="100"></div>
             <button id="worker-capacity-apply" class="btn btn-secondary" type="button">Apply capacity</button>
             <div id="worker-capacity-status" class="worker-capacity-status">Select a live Worker instance. This does not change tenant Limit.</div>
@@ -286,24 +286,33 @@ function updateLoadBuilderSummary(){
 }
 function liveWorkerNodes(){return S.nodes.filter(node=>node.role==='worker'&&node.status==='up').sort(compareNodes)}
 function renderWorkerCapacity(syncInput=false){
-  const select=$('worker-capacity-node'),input=$('worker-capacity-value'),button=$('worker-capacity-apply'),status=$('worker-capacity-status'),nodes=liveWorkerNodes(),previous=select.value,options=nodes.map(node=>`<option value="${esc(node.node_id)}">${esc(shortNode(node.node_id))} · ${fmt(node.total_workers)} slots</option>`).join('');
+  const select=$('worker-capacity-node'),input=$('worker-capacity-value'),button=$('worker-capacity-apply'),status=$('worker-capacity-status'),nodes=liveWorkerNodes(),previous=select.value,allValue='__all__',nodeOptions=nodes.map(node=>`<option value="${esc(node.node_id)}">${esc(shortNode(node.node_id))} · ${fmt(node.total_workers)} slots</option>`).join(''),options=nodeOptions+(nodes.length?`<option value="${allValue}">All live Worker Pods · ${fmt(nodes.length)} pods</option>`:'');
   if(select.innerHTML!==options)select.innerHTML=options;
-  if(nodes.some(node=>node.node_id===previous))select.value=previous;
+  if(previous===allValue||nodes.some(node=>node.node_id===previous))select.value=previous;
+  const allSelected=select.value===allValue;
   const selected=nodes.find(node=>node.node_id===select.value);
-  select.disabled=workerCapacityBusy||!selected;button.disabled=workerCapacityBusy||!selected;input.disabled=workerCapacityBusy||!selected;
-  if(!selected){status.textContent='No live Worker instances are available.';return}
+  const hasTarget=allSelected?nodes.length>0:!!selected;
+  select.disabled=workerCapacityBusy||!hasTarget;button.disabled=workerCapacityBusy||!hasTarget;input.disabled=workerCapacityBusy||!hasTarget;
+  button.textContent=allSelected?'Apply to all':'Apply capacity';
+  if(!hasTarget){status.textContent='No live Worker instances are available.';return}
+  if(allSelected){
+    const capacities=[...new Set(nodes.map(node=>Number(node.total_workers||0)))];
+    if(syncInput||document.activeElement!==input)input.value=capacities.length===1?capacities[0]:'';
+    status.textContent=capacities.length===1?`${fmt(nodes.length)} live Pods · all currently ${fmt(capacities[0])} slots · one atomic Raft update.`:`${fmt(nodes.length)} live Pods · mixed current capacities · one atomic Raft update.`;
+    return
+  }
   if(syncInput||document.activeElement!==input)input.value=selected.total_workers;
   status.textContent=`Effective ${fmt(selected.total_workers)} slots · ${Number(selected.capacity_override||0)>0?'Raft override persists across restart':'startup default'} · tenant Limit is unchanged.`;
 }
 async function applyWorkerCapacity(){
-  const nodeID=$('worker-capacity-node').value,totalWorkers=Math.round(Number($('worker-capacity-value').value));
+  const nodeID=$('worker-capacity-node').value,totalWorkers=Math.round(Number($('worker-capacity-value').value)),allSelected=nodeID==='__all__';
   if(!nodeID){toast('No live Worker instance selected');return}
   if(!Number.isFinite(totalWorkers)||totalWorkers<1||totalWorkers>1000){toast('Processor slots must be between 1 and 1,000');return}
-  workerCapacityBusy=true;renderWorkerCapacity();toast(`Updating ${shortNode(nodeID)} to ${fmt(totalWorkers)} slots…`);
+  workerCapacityBusy=true;renderWorkerCapacity();toast(allSelected?`Updating every live Worker Pod to ${fmt(totalWorkers)} slots…`:`Updating ${shortNode(nodeID)} to ${fmt(totalWorkers)} slots…`);
   try{
-    const result=await getJSON(`/api/v1/admin/nodes/${encodeURIComponent(nodeID)}/capacity`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({total_workers:totalWorkers})});
-    addEvent(`Worker ${shortNode(nodeID)} capacity changed to ${result.total_workers}`);
-    toast(`${shortNode(nodeID)} now has ${fmt(result.total_workers)} Processor slots`);
+    const path=allSelected?'/api/v1/admin/nodes/capacity':`/api/v1/admin/nodes/${encodeURIComponent(nodeID)}/capacity`,result=await getJSON(path,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({total_workers:totalWorkers})});
+    if(allSelected){addEvent(`${result.updated} live Worker Pods changed to ${result.total_workers} slots`);toast(`${fmt(result.updated)} Worker Pods now have ${fmt(result.total_workers)} Processor slots`)}
+    else{addEvent(`Worker ${shortNode(nodeID)} capacity changed to ${result.total_workers}`);toast(`${shortNode(nodeID)} now has ${fmt(result.total_workers)} Processor slots`)}
     await refresh()
   }catch(error){toast(`Could not update Worker capacity: ${error.message}`)}
   finally{workerCapacityBusy=false;renderWorkerCapacity(true)}

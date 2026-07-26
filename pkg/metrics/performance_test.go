@@ -77,6 +77,16 @@ func TestCommandShapeCountsReplicatedItems(t *testing.T) {
 			}),
 			op: raftpkg.OpCompleteBatch, items: 3,
 		},
+		{
+			name: "all worker capacities",
+			command: raftpkg.MustMarshalCommand(
+				raftpkg.OpSetWorkerCapacities,
+				raftpkg.SetWorkerCapacitiesData{
+					NodeIDs: []string{"worker-0", "worker-1", "worker-2"},
+				},
+			),
+			op: raftpkg.OpSetWorkerCapacities, items: 3,
+		},
 		{name: "single", command: raftpkg.MustMarshalCommand(raftpkg.OpUpsertTenant, map[string]any{"id": "t"}), op: raftpkg.OpUpsertTenant, items: 1},
 		{name: "invalid", command: []byte("not-json"), op: "unknown", items: 0},
 	}

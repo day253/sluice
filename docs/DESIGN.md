@@ -829,6 +829,39 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   3-voter Raft、Leader allocation、AllocationPush、stateless Pool 完成 3→1→4，并以
   启动默认 3 重启同 ID，最终仍保持 override 4。
 
+### CAPACITY-002：一次性修改全部 live Worker 容量
+
+- **需求边界**：WebUI 的 `Worker Pod capacity` 下拉框同时提供稳定排序的单 Pod 和
+  `All live Worker Pods`。后者调用 `PUT /api/v1/admin/nodes/capacity`，请求仍为
+  `{"total_workers":1..1000}`，只修改 Leader 取样时所有 `role=worker,status=up` 的实例；
+  control、retained down Worker、Pod 副本数、tenant Limit 和 CPU/内存配置均不在范围内。
+- **原子性与并发拓扑**：Leader 对 live Worker ID 排序并固定为
+  `OpSetWorkerCapacities` 的目标集合，一条 Raft entry 内先验证容量范围、非空、无重复及每个
+  目标仍为 live Worker，然后才统一更新 `TotalWorkers/CapacityOverride` 并逐实例安全裁剪
+  allocation。因此拓扑并发变化要么排在此 entry 之前并使整批失败，要么排在之后；不会出现
+  前几个 Pod 已改、后几个未改。取样后新上线的 Worker 不属于本次操作，调用方可再次执行。
+- **滚动升级兼容性**：新 Raft op 在旧 control 上不能被静默提交。每个新 control 通过只读
+  `/api/v1/admin/capabilities` 声明支持的 op；Leader 在 production membership lock 内对
+  当前全部 voter/non-voter 做 capability 握手，并在保持同一 membership 的情况下提交
+  entry。任一 retained/down/旧版/不可达 control 未确认支持时整批返回失败且不产生该日志，
+  关闭 capability-check 与 Apply 之间加入旧成员的竞态。握手是 process-local 读，不写
+  Raft/FSM/Snapshot。
+- **收敛与失败模型**：Follower 只把一次批量请求转发 Leader，不展开为逐 Pod HTTP/Raft
+  写。容量 entry 提交后 Leader 同步执行一次全局 allocator reconcile，成功响应包含排序后
+  的目标快照和更新数量；Leader/quorum 或 reconcile 失败沿用 CAPACITY-001 的安全裁剪与
+  周期恢复语义。缩容不取消已开始的 Processor 任务。
+- **存储与非目标**：批量配置仍是 Raft/FSM/Snapshot 中每个稳定 Worker ID 的当前镜像，
+  不新增容量历史、不把性能诊断写入共识、不自动改变 HPA 目标，也不承诺未来加入的 Pod 继承本次
+  override。Leader 现有 process-local performance diagnostics 会把这条 Apply 记录为
+  `set_worker_capacities`，`items` 等于本次 Worker 数，便于看 Apply latency 和 batch
+  fill，但这些诊断不进入 Raft/Snapshot。若需要统一启动默认值，应修改 Helm 配置并滚动
+  部署，不由本 API 隐式承担。
+- **覆盖**：FSM 单测先混入不存在的目标，要求两个合法 Worker 的容量和 allocation 均完全
+  不变，再验证成功批次统一安全裁剪；API 单测固定一次委托和范围校验；Chrome 端到端从
+  `All live Worker Pods` 完成一次批量设置。真实
+  `TestAllWorkerCapacitiesAPIAtomicallyConvergesEveryLiveWorker` 经 Follower HTTP、
+  3-voter Raft、两个 stateless Worker、全局 allocation 与两个 Processor Pool 验证收敛。
+
 ### SCHED-006：Leader 基于 Worker 实际 CPU 反馈分配任务
 
 - **需求边界**：任务的 CPU 成本可以相差很大，静态 `TotalWorkers` 只能限制最大并发，

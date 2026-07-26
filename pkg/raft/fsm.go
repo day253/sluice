@@ -74,6 +74,8 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 		return f.applySetControlNodes(cmd.Data)
 	case OpSetWorkerCapacity:
 		return f.applySetWorkerCapacity(cmd.Data)
+	case OpSetWorkerCapacities:
+		return f.applySetWorkerCapacities(cmd.Data)
 	case OpCreateTask:
 		return f.applyCreateTask(cmd.Data)
 	case OpCreateTaskBatch:
@@ -268,6 +270,51 @@ func (f *FSM) applySetWorkerCapacity(data json.RawMessage) interface{} {
 	f.trimNodeAllocation(req.NodeID, req.TotalWorkers)
 	f.logger.Info("fsm: worker capacity updated",
 		zap.String("node", req.NodeID),
+		zap.Int("total_workers", req.TotalWorkers),
+	)
+	return nil
+}
+
+func (f *FSM) applySetWorkerCapacities(data json.RawMessage) interface{} {
+	var req SetWorkerCapacitiesData
+	if err := json.Unmarshal(data, &req); err != nil {
+		return err
+	}
+	if req.TotalWorkers < 1 || req.TotalWorkers > types.MaxWorkerCapacityPerInstance {
+		return fmt.Errorf(
+			"worker capacity must be between 1 and %d",
+			types.MaxWorkerCapacityPerInstance,
+		)
+	}
+	if len(req.NodeIDs) == 0 {
+		return fmt.Errorf("at least one live worker is required")
+	}
+	seen := make(map[string]struct{}, len(req.NodeIDs))
+	for _, nodeID := range req.NodeIDs {
+		if _, duplicate := seen[nodeID]; duplicate {
+			return fmt.Errorf("duplicate worker %s", nodeID)
+		}
+		seen[nodeID] = struct{}{}
+		node, ok := f.state.Nodes[nodeID]
+		if !ok {
+			return fmt.Errorf("node %s not found", nodeID)
+		}
+		if node.Role != types.NodeRoleWorker {
+			return fmt.Errorf("node %s is not a worker", nodeID)
+		}
+		if node.Status != types.NodeStatusUp {
+			return fmt.Errorf("worker %s is not live", nodeID)
+		}
+	}
+
+	for _, nodeID := range req.NodeIDs {
+		node := f.state.Nodes[nodeID]
+		node.TotalWorkers = req.TotalWorkers
+		node.CapacityOverride = req.TotalWorkers
+		f.trimNodeAllocation(nodeID, req.TotalWorkers)
+	}
+	f.logger.Info("fsm: live worker capacities updated",
+		zap.Int("workers", len(req.NodeIDs)),
 		zap.Int("total_workers", req.TotalWorkers),
 	)
 	return nil

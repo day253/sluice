@@ -4,23 +4,24 @@ import "encoding/json"
 
 // FSM operation codes serialised into the Raft log.
 const (
-	OpUpsertTenant      = "upsert_tenant"
-	OpDeleteTenant      = "delete_tenant"
-	OpNodeUp            = "node_up"
-	OpNodeDown          = "node_down"
-	OpWorkerOffline     = "worker_offline"
-	OpRetireNode        = "retire_node"
-	OpSetControlNodes   = "set_control_nodes"
-	OpSetWorkerCapacity = "set_worker_capacity"
-	OpCreateTask        = "create_task"
-	OpCreateTaskBatch   = "create_task_batch"
-	OpClaimTask         = "claim_task"
-	OpCompleteTask      = "complete_task"
-	OpFailTask          = "fail_task"
-	OpClaimBatch        = "claim_batch"
-	OpCompleteBatch     = "complete_batch"
-	OpRequeueTasks      = "requeue_tasks"
-	OpUpdateAllocation  = "update_allocation"
+	OpUpsertTenant        = "upsert_tenant"
+	OpDeleteTenant        = "delete_tenant"
+	OpNodeUp              = "node_up"
+	OpNodeDown            = "node_down"
+	OpWorkerOffline       = "worker_offline"
+	OpRetireNode          = "retire_node"
+	OpSetControlNodes     = "set_control_nodes"
+	OpSetWorkerCapacity   = "set_worker_capacity"
+	OpSetWorkerCapacities = "set_worker_capacities"
+	OpCreateTask          = "create_task"
+	OpCreateTaskBatch     = "create_task_batch"
+	OpClaimTask           = "claim_task"
+	OpCompleteTask        = "complete_task"
+	OpFailTask            = "fail_task"
+	OpClaimBatch          = "claim_batch"
+	OpCompleteBatch       = "complete_batch"
+	OpRequeueTasks        = "requeue_tasks"
+	OpUpdateAllocation    = "update_allocation"
 )
 
 // ---------------------------------------------------------------------------
@@ -124,6 +125,14 @@ type WorkerOfflineData struct {
 type SetWorkerCapacityData struct {
 	NodeID       string `json:"node_id"`
 	TotalWorkers int    `json:"total_workers"`
+}
+
+// SetWorkerCapacitiesData changes a fixed Leader snapshot of live Worker
+// instances in one Raft entry. The FSM validates every target before mutating
+// any of them, so a concurrent topology change cannot produce a partial edit.
+type SetWorkerCapacitiesData struct {
+	NodeIDs      []string `json:"node_ids"`
+	TotalWorkers int      `json:"total_workers"`
 }
 
 // RetireNodeData permanently removes a process identity which no longer

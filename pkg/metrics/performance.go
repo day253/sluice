@@ -399,6 +399,10 @@ func commandShape(command []byte) (string, int) {
 		var data map[string]json.RawMessage
 		_ = json.Unmarshal(envelope.Data, &data)
 		return envelope.Op, len(data)
+	case raftpkg.OpSetWorkerCapacities:
+		var data raftpkg.SetWorkerCapacitiesData
+		_ = json.Unmarshal(envelope.Data, &data)
+		return envelope.Op, len(data.NodeIDs)
 	default:
 		return envelope.Op, 1
 	}

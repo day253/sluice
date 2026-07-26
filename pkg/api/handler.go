@@ -25,14 +25,15 @@ import (
 // Handler adapts the gRPC Sluice service to HTTP REST.  Every endpoint
 // converts the HTTP request to a gRPC call and the response back to JSON.
 type Handler struct {
-	nodeID             string
-	svc                *grpcpkg.Service
-	joinFunc           func(nodeID, raftAddr, httpAddr string, workers int) error
-	workerRegisterFunc func(types.NodeInfo) error
-	workerCapacityFunc func(context.Context, string, int) (types.WorkerCapacityResponse, error)
-	raftStatusFunc     func() (raftpkg.MembershipStatus, error)
-	performanceFunc    func(context.Context, bool, bool) (metrics.PerformanceDiagnostics, error)
-	collector          interface {
+	nodeID                  string
+	svc                     *grpcpkg.Service
+	joinFunc                func(nodeID, raftAddr, httpAddr string, workers int) error
+	workerRegisterFunc      func(types.NodeInfo) error
+	workerCapacityFunc      func(context.Context, string, int) (types.WorkerCapacityResponse, error)
+	allWorkerCapacitiesFunc func(context.Context, int) (types.WorkerCapacityBatchResponse, error)
+	raftStatusFunc          func() (raftpkg.MembershipStatus, error)
+	performanceFunc         func(context.Context, bool, bool) (metrics.PerformanceDiagnostics, error)
+	collector               interface {
 		Query(name, includePrefix, excludePrefix string) ([]MetricsData, int)
 	}
 	logger *zap.Logger
@@ -78,6 +79,14 @@ func (h *Handler) SetWorkerCapacityFunc(
 	h.workerCapacityFunc = fn
 }
 
+// SetAllWorkerCapacitiesFunc configures one Raft-backed atomic update for the
+// current complete set of live stateless Worker instances.
+func (h *Handler) SetAllWorkerCapacitiesFunc(
+	fn func(context.Context, int) (types.WorkerCapacityBatchResponse, error),
+) {
+	h.allWorkerCapacitiesFunc = fn
+}
+
 // SetRaftStatusFunc configures the read-only consensus membership endpoint.
 func (h *Handler) SetRaftStatusFunc(fn func() (raftpkg.MembershipStatus, error)) {
 	h.raftStatusFunc = fn
@@ -103,9 +112,11 @@ func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/admin/tenants/{tenant_id}", h.deleteTenant).Methods("DELETE")
 
 	r.HandleFunc("/api/v1/admin/nodes", h.listNodes).Methods("GET")
+	r.HandleFunc("/api/v1/admin/nodes/capacity", h.setAllWorkerCapacities).Methods("PUT")
 	r.HandleFunc("/api/v1/admin/nodes/{node_id}/capacity", h.setWorkerCapacity).Methods("PUT")
 	r.HandleFunc("/api/v1/admin/allocations", h.getAllocations).Methods("GET")
 	r.HandleFunc("/api/v1/admin/raft", h.raftStatus).Methods("GET")
+	r.HandleFunc("/api/v1/admin/capabilities", h.capabilities).Methods("GET")
 	r.HandleFunc("/api/v1/admin/performance", h.performance).Methods("GET")
 	r.HandleFunc("/api/v1/admin/autoscaling", h.autoscaling).Methods("GET")
 
@@ -127,6 +138,12 @@ func (h *Handler) raftStatus(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	h.writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) capabilities(w http.ResponseWriter, _ *http.Request) {
+	h.writeJSON(w, http.StatusOK, types.AdminCapabilities{
+		RaftOperations: []string{raftpkg.OpSetWorkerCapacities},
+	})
 }
 
 func (h *Handler) performance(w http.ResponseWriter, r *http.Request) {
@@ -439,6 +456,39 @@ func (h *Handler) setWorkerCapacity(w http.ResponseWriter, r *http.Request) {
 	response, err := h.workerCapacityFunc(r.Context(), nodeID, req.TotalWorkers)
 	if err != nil {
 		h.writeError(w, http.StatusServiceUnavailable, "worker capacity update failed: "+err.Error())
+		return
+	}
+	h.writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) setAllWorkerCapacities(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TotalWorkers int `json:"total_workers"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "invalid body: "+err.Error())
+		return
+	}
+	if req.TotalWorkers < 1 || req.TotalWorkers > types.MaxWorkerCapacityPerInstance {
+		h.writeError(
+			w,
+			http.StatusBadRequest,
+			"total_workers must be between 1 and "+
+				strconv.Itoa(types.MaxWorkerCapacityPerInstance),
+		)
+		return
+	}
+	if h.allWorkerCapacitiesFunc == nil {
+		h.writeError(w, http.StatusInternalServerError, "all-worker capacity update not configured")
+		return
+	}
+	response, err := h.allWorkerCapacitiesFunc(r.Context(), req.TotalWorkers)
+	if err != nil {
+		h.writeError(
+			w,
+			http.StatusServiceUnavailable,
+			"all-worker capacity update failed: "+err.Error(),
+		)
 		return
 	}
 	h.writeJSON(w, http.StatusOK, response)

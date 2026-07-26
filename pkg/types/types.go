@@ -60,6 +60,20 @@ type WorkerCapacityResponse struct {
 	CapacityOverride int    `json:"capacity_override"`
 }
 
+// WorkerCapacityBatchResponse is returned after one Raft entry has updated
+// the capacity of the Leader's complete snapshot of live Worker instances.
+type WorkerCapacityBatchResponse struct {
+	TotalWorkers int                      `json:"total_workers"`
+	Updated      int                      `json:"updated"`
+	Nodes        []WorkerCapacityResponse `json:"nodes"`
+}
+
+// AdminCapabilities advertises protocol features understood by one control
+// process so a new Leader cannot commit an operation to old rolling peers.
+type AdminCapabilities struct {
+	RaftOperations []string `json:"raft_operations"`
+}
+
 // WorkerLoadSnapshot is ephemeral execution-plane feedback attached to an
 // idle-slot request. It is never written to Raft or an FSM snapshot.
 type WorkerLoadSnapshot struct {
