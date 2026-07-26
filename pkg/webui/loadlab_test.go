@@ -360,8 +360,7 @@ func TestDashboardUsesShadcnStyleSidebarShell(t *testing.T) {
 		`--sidebar:#f8fafc`,
 		`--sidebar-border:#e2e8f0`,
 		`.dashboard-sidebar .sidebar-panel{overflow:hidden;border-color:var(--sidebar-border);border-radius:12px;background:var(--sidebar);box-shadow:none}`,
-		`.app-shell.config-collapsed{--config-width:48px}`,
-		`.app-shell.workload-collapsed{--workload-width:48px}`,
+		`.sidebar-reopen{position:fixed`,
 		`class="sidebar-brand-icon"`,
 		`class="sidebar-config-section sidebar-group"`,
 		`class="sidebar-group sidebar-recipe-group"`,
@@ -370,6 +369,43 @@ func TestDashboardUsesShadcnStyleSidebarShell(t *testing.T) {
 	} {
 		if !strings.Contains(page, fragment) {
 			t.Errorf("shadcn-style sidebar shell is missing %q", fragment)
+		}
+	}
+}
+
+func TestDashboardFullyHidesCollapsedSidebars(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	Handler(http.NotFoundHandler()).ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d", recorder.Code)
+	}
+
+	page := recorder.Body.String()
+	for _, fragment := range []string{
+		`.dashboard-sidebar.is-collapsed{display:none}`,
+		`.app-shell.config-collapsed{grid-template-columns:minmax(0,1fr) var(--workload-width);grid-template-areas:"main workload"}`,
+		`.app-shell.workload-collapsed{grid-template-columns:var(--config-width) minmax(0,1fr);grid-template-areas:"config main"}`,
+		`.app-shell.config-collapsed.workload-collapsed{grid-template-columns:minmax(0,1fr);grid-template-areas:"main"}`,
+		`id="config-sidebar-reopen"`,
+		`id="workload-sidebar-reopen"`,
+		`reopen.hidden=!collapsed`,
+		`$('config-sidebar-reopen').addEventListener('click'`,
+		`$('workload-sidebar-reopen').addEventListener('click'`,
+	} {
+		if !strings.Contains(page, fragment) {
+			t.Errorf("fully hidden sidebar contract is missing %q", fragment)
+		}
+	}
+	for _, obsolete := range []string{
+		`--config-width:48px`,
+		`--workload-width:48px`,
+		`sidebar-collapsed-label`,
+	} {
+		if strings.Contains(page, obsolete) {
+			t.Errorf("collapsed sidebar still retains obsolete rail %q", obsolete)
 		}
 	}
 }

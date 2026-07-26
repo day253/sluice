@@ -311,21 +311,35 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	}
 
 	var collapsed struct {
-		ConfigCollapsed   bool    `json:"configCollapsed"`
-		WorkloadCollapsed bool    `json:"workloadCollapsed"`
-		ConfigExpanded    string  `json:"configExpanded"`
-		WorkloadExpanded  string  `json:"workloadExpanded"`
-		MonitoringWidth   float64 `json:"monitoringWidth"`
-		StateConfig       bool    `json:"stateConfig"`
-		StateWorkload     bool    `json:"stateWorkload"`
+		ConfigCollapsed     bool    `json:"configCollapsed"`
+		WorkloadCollapsed   bool    `json:"workloadCollapsed"`
+		ConfigExpanded      string  `json:"configExpanded"`
+		WorkloadExpanded    string  `json:"workloadExpanded"`
+		ConfigWidth         float64 `json:"configWidth"`
+		WorkloadWidth       float64 `json:"workloadWidth"`
+		ConfigDisplay       string  `json:"configDisplay"`
+		WorkloadDisplay     string  `json:"workloadDisplay"`
+		ConfigReopenDisplay string  `json:"configReopenDisplay"`
+		LoadReopenDisplay   string  `json:"loadReopenDisplay"`
+		MonitoringWidth     float64 `json:"monitoringWidth"`
+		StateConfig         bool    `json:"stateConfig"`
+		StateWorkload       bool    `json:"stateWorkload"`
 	}
 	readCollapsedState := chromedp.Evaluate(`(() => {
 		const state = JSON.parse(localStorage.getItem("sluice.dashboard.sidebars.v1") || "{}");
+		const config = document.querySelector("#config-sidebar");
+		const workload = document.querySelector("#workload-sidebar");
 		return {
-			configCollapsed: document.querySelector("#config-sidebar").classList.contains("is-collapsed"),
-			workloadCollapsed: document.querySelector("#workload-sidebar").classList.contains("is-collapsed"),
+			configCollapsed: config.classList.contains("is-collapsed"),
+			workloadCollapsed: workload.classList.contains("is-collapsed"),
 			configExpanded: document.querySelector("#config-sidebar-toggle").getAttribute("aria-expanded"),
 			workloadExpanded: document.querySelector("#workload-sidebar-toggle").getAttribute("aria-expanded"),
+			configWidth: config.getBoundingClientRect().width,
+			workloadWidth: workload.getBoundingClientRect().width,
+			configDisplay: getComputedStyle(config).display,
+			workloadDisplay: getComputedStyle(workload).display,
+			configReopenDisplay: getComputedStyle(document.querySelector("#config-sidebar-reopen")).display,
+			loadReopenDisplay: getComputedStyle(document.querySelector("#workload-sidebar-reopen")).display,
 			monitoringWidth: document.querySelector("#monitoring-main").getBoundingClientRect().width,
 			stateConfig: Boolean(state.config),
 			stateWorkload: Boolean(state.workload),
@@ -341,9 +355,12 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	initialMonitoringWidth := layout.MonitoringRight - layout.MonitoringLeft
 	if !collapsed.ConfigCollapsed || !collapsed.WorkloadCollapsed ||
 		collapsed.ConfigExpanded != "false" || collapsed.WorkloadExpanded != "false" ||
+		collapsed.ConfigWidth != 0 || collapsed.WorkloadWidth != 0 ||
+		collapsed.ConfigDisplay != "none" || collapsed.WorkloadDisplay != "none" ||
+		collapsed.ConfigReopenDisplay != "grid" || collapsed.LoadReopenDisplay != "grid" ||
 		!collapsed.StateConfig || !collapsed.StateWorkload ||
 		collapsed.MonitoringWidth <= initialMonitoringWidth {
-		t.Fatalf("collapsed sidebars did not expand monitoring area: initial=%f collapsed=%+v", initialMonitoringWidth, collapsed)
+		t.Fatalf("collapsed sidebars were not fully removed: initial=%f collapsed=%+v", initialMonitoringWidth, collapsed)
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.Reload(),
@@ -353,12 +370,14 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 		t.Fatal(err)
 	}
 	if !collapsed.ConfigCollapsed || !collapsed.WorkloadCollapsed ||
-		collapsed.ConfigExpanded != "false" || collapsed.WorkloadExpanded != "false" {
+		collapsed.ConfigExpanded != "false" || collapsed.WorkloadExpanded != "false" ||
+		collapsed.ConfigDisplay != "none" || collapsed.WorkloadDisplay != "none" ||
+		collapsed.ConfigReopenDisplay != "grid" || collapsed.LoadReopenDisplay != "grid" {
 		t.Fatalf("sidebar collapse state was not restored after reload: %+v", collapsed)
 	}
 	if err := chromedp.Run(ctx,
-		chromedp.Click("#config-sidebar-toggle", chromedp.ByQuery),
-		chromedp.Click("#workload-sidebar-toggle", chromedp.ByQuery),
+		chromedp.Click("#config-sidebar-reopen", chromedp.ByQuery),
+		chromedp.Click("#workload-sidebar-reopen", chromedp.ByQuery),
 		chromedp.SetValue("#load-tenant-count", "3", chromedp.ByQuery),
 		chromedp.SetValue("#load-tasks-per-tenant", "2", chromedp.ByQuery),
 		chromedp.SetValue("#load-quota", "4", chromedp.ByQuery),
