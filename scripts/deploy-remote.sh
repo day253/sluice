@@ -56,6 +56,11 @@ WORKER_SCALE_DOWN_STABILIZATION_SECONDS="${10}"
 IMAGE="${REGISTRY}/sluice:${TAG}"
 STATEFULSET="${RELEASE}-sluice"
 WORKER_STATEFULSET="${RELEASE}-sluice-worker"
+# Server-side apply must validate newly rendered objects without merging them
+# into the live release. The live control StatefulSet may still use the
+# immutable OrderedReady policy and an HTTP liveness handler until the
+# preservation migration below runs.
+VALIDATION_RELEASE="${RELEASE}-validation"
 
 cd "${DEPLOY_DIR}"
 
@@ -91,11 +96,11 @@ go test ./...
 
 printf '\n==> Validating Helm role split\n'
 microk8s helm3 lint ./charts/sluice
-microk8s helm3 template "${RELEASE}" ./charts/sluice \
+microk8s helm3 template "${VALIDATION_RELEASE}" ./charts/sluice \
   --namespace "${NAMESPACE}" \
   --set control.replicas=5 \
   --set worker.replicas="${WORKER_STATIC_REPLICAS}" >/tmp/sluice-rendered.yaml
-microk8s helm3 template "${RELEASE}" ./charts/sluice \
+microk8s helm3 template "${VALIDATION_RELEASE}" ./charts/sluice \
   --namespace "${NAMESPACE}" \
   --set control.replicas=5 \
   --set worker.autoscaling.enabled=true \
@@ -106,7 +111,7 @@ microk8s helm3 template "${RELEASE}" ./charts/sluice \
   >/tmp/sluice-workload-autoscaling-rendered.yaml
 microk8s kubectl apply --dry-run=server --namespace "${NAMESPACE}" \
   -f /tmp/sluice-workload-autoscaling-rendered.yaml >/dev/null
-microk8s helm3 template "${RELEASE}" ./charts/sluice \
+microk8s helm3 template "${VALIDATION_RELEASE}" ./charts/sluice \
   --namespace "${NAMESPACE}" \
   --set control.replicas=5 \
   --set worker.autoscaling.enabled=true \

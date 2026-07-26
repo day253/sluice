@@ -125,6 +125,24 @@
   retry window 再启动其余 voter，要求重新选主，并经真实 Follower HTTP、Leader Raft、
   allocation、Worker 和 final-state 路径 exactly-once 排空。
 
+### DEPLOY-001：不可变 StatefulSet 迁移前的 server dry-run 必须隔离
+
+- **已复现故障**：CTRL-005 首次远程恢复时，完整远端集成已经通过，但部署脚本在 orphan
+  迁移之前把新 Chart 以 live release 名做 `kubectl apply --dry-run=server`。Kubernetes
+  把新 TCP liveness 与旧 HTTP liveness 合并成两个 handler，同时检测到
+  `OrderedReady→Parallel` 是不可变修改，因此预检失败；迁移和 Helm upgrade 均未执行。
+- **预检边界**：静态、workload autoscaler 和原生 HPA 三种 Chart render 都使用独立的
+  `${RELEASE}-validation` 名称做 server-side dry-run。这样仍由真实 API server 验证完整
+  对象，却只模拟创建一套新对象，不和 live immutable StatefulSet 做 patch merge。
+  正式 release 名只用于后面的实际 upgrade；旧 controller 必须等测试、server dry-run、
+  镜像构建和 registry push 都成功后，才允许 orphan-preserving migration。
+- **非目标**：不跳过 server-side validation，不用 `--force` 删除 Pod，不提前 orphan
+  健康 controller，也不把 validation release 真正写进集群。
+- **回归覆盖**：部署单测要求三种 render 全部使用隔离 release、禁止任何 preflight
+  `helm template "${RELEASE}"`，并固定 validation 在 migration 之前。真实远程
+  MicroK8s 从旧 OrderedReady/HTTP probe release 执行同一脚本，要求 dry-run 通过、
+  迁移前后 Pod/PVC 保持、随后升级和拓扑门禁完成。
+
 ## 任务生命周期
 
 ```

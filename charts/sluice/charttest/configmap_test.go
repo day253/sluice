@@ -264,6 +264,37 @@ func TestRemoteDeployMigratesControlPolicyWithoutDeletingPodsOrPVCs(t *testing.T
 	}
 }
 
+func TestRemoteDeployServerDryRunIsolatedFromLiveImmutableControl(t *testing.T) {
+	data, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := string(data)
+	for _, required := range []string{
+		`VALIDATION_RELEASE="${RELEASE}-validation"`,
+		`microk8s helm3 template "${VALIDATION_RELEASE}"`,
+		`microk8s kubectl apply --dry-run=server`,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("remote server-side validation is missing %q", required)
+		}
+	}
+	if got := strings.Count(
+		source,
+		`microk8s helm3 template "${VALIDATION_RELEASE}"`,
+	); got != 3 {
+		t.Fatalf("isolated validation renders = %d, want all 3 chart variants", got)
+	}
+	if strings.Contains(source, `microk8s helm3 template "${RELEASE}"`) {
+		t.Fatal("server-side preflight can still merge into the live immutable release")
+	}
+	validation := strings.Index(source, "Validating Helm role split")
+	migration := strings.Index(source, "Migrating control StatefulSet to parallel Raft recovery")
+	if validation < 0 || migration < 0 || validation >= migration {
+		t.Fatal("isolated preflight must finish before mutating the live controller")
+	}
+}
+
 func TestRemoteTopologyValidationAcceptsAutoscaledWorkerRange(t *testing.T) {
 	data, err := os.ReadFile("../../../scripts/verify-deployed-topology.sh")
 	if err != nil {
