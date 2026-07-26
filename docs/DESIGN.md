@@ -594,9 +594,12 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **非目标**：本次不提高单日志 128 上限、不把 Claim/Complete 合成新协议、不改变
   Processor 并发或任务超时、不实现 Multi-Raft，也不承诺增加 Worker 能突破单 shard
   共识上限。
-- **验证**：同一真实 8 节点/4900 槽/4096 任务 Case 要求 Claim/Complete 各提交全部
-  4096 条、每批不超过 128、平均至少 64 条、零 stream timeout/lease recovery 且每任务
-  只处理一次；远程固定 5 control/50 Worker/4 tenant/20000 条基线单独记录在 PERF。
+- **验证**：确定性 gRPC 单测让四条 stream 各同时暴露 32 个 Assignment/Completion，
+  要求两种转换分别只提交一条 128-item Raft Apply。真实 8 节点/4900 槽/4096 任务
+  Case 要求 Claim/Complete 各提交全部 4096 条、每批不超过 128、零 stream
+  timeout/lease recovery 且每任务只处理一次；批次均值受 5ms 内 goroutine 到达时序和
+  race instrumentation 影响，只记录诊断，远程固定
+  5 control/50 Worker/4 tenant/20000 条基线单独记录在 PERF。
 
 ### PERF-001：2 万任务被共识规模、重复存储和重复扫描共同拖慢
 

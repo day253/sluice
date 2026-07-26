@@ -470,6 +470,15 @@ fatal、error、timeout、interrupted 或 lease recovery。
 128。远程 50 条活跃 stream 本来就足以用 8-credit 填批，因此 revision 42 单轮相对
 revision 41 没有收益：1338.9 对 1370.9 task/s，属于 -2.3% 单轮波动，不能宣称回退。
 
+CI-002 复核发现 GitHub `ubuntu-latest` 在同一个 4900 槽、4096 任务、`-race` Case 中
+连续观察到 81～112 个 Claim/Complete 批次，而固定 Mac 同形状为 42～45；两种环境均
+完整提交 4096 个 item、每批不超过 128、无 stream timeout/lease recovery 且每任务只
+执行一次。共享 Runner 的 CPU 配额和 goroutine 调度不是固定 failure domain，因此该
+批次均值不能与上表固定硬件结果做百分比比较，也不能作为 CI 正确性门禁。四条 stream
+各 32 credits 能形成一个 128-item Assignment 和 Completion Apply 的能力，改由带
+1 秒受控聚合窗口的真实 gRPC 单测确定性验证；生产窗口仍为 5ms，本次不修改任何运行时
+参数或性能结论。
+
 revision 42 暴露了另一瓶颈：四个 idle tenant 在新任务 durable Create 后仍等待最长
 3 秒 allocator tick。revision 44 在提交成功后只对 allocation≤1、Limit>1 的租户发送
 合并、非阻塞的本地唤醒；周期 tick 仍是丢通知/切 Leader 的 fallback。滚动中同时确认并

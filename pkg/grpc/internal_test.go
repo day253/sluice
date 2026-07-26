@@ -350,11 +350,133 @@ func TestInternalServiceBoundsGlobalRaftBatchSize(t *testing.T) {
 	}
 }
 
-func TestFourWorkerStreamsCanFillOneGlobalRaftBatch(t *testing.T) {
+func TestFourWorkerStreamsFillOneGlobalRaftBatch(t *testing.T) {
 	const activeWorkerStreams = 4
-	if capacity := activeWorkerStreams * workerRequestCredits; capacity < claimBatchMaxSize {
-		t.Fatalf("four Worker streams expose %d credits, need at least one %d-item Raft batch",
-			capacity, claimBatchMaxSize)
+	const requestsPerStream = workerRequestCredits
+	const requestCount = activeWorkerStreams * requestsPerStream
+	if requestCount != claimBatchMaxSize {
+		t.Fatalf("fixture exposes %d credits, want exactly one %d-item batch",
+			requestCount, claimBatchMaxSize)
+	}
+
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raftpkg.OpUpsertTenant, types.TenantConfig{
+		ID: "tenant-a", MaxWorkers: requestCount,
+	})
+	allocations := make(map[string]*types.NodeAllocation, activeWorkerStreams)
+	tasks := make([]raftpkg.CreateTaskData, requestCount)
+	for streamIndex := 0; streamIndex < activeWorkerStreams; streamIndex++ {
+		nodeID := fmt.Sprintf("worker-%d", streamIndex)
+		applyInternalTestCommand(fsm, raftpkg.OpNodeUp, types.NodeInfo{
+			ID: nodeID, Role: types.NodeRoleWorker, Status: types.NodeStatusUp,
+			TotalWorkers: requestsPerStream,
+		})
+		allocations[nodeID] = &types.NodeAllocation{
+			NodeID: nodeID, Tenants: map[string]int{"tenant-a": requestsPerStream},
+		}
+	}
+	for index := range tasks {
+		tasks[index] = raftpkg.CreateTaskData{
+			TaskID:   fmt.Sprintf("full-batch-%03d", index),
+			TenantID: "tenant-a", Payload: `{}`,
+		}
+	}
+	applyInternalTestCommand(fsm, raftpkg.OpUpdateAllocation, allocations)
+	applyInternalTestCommand(fsm, raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: tasks})
+
+	testRaft := &internalTestRaft{fsm: fsm}
+	testRaft.leader.Store(true)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := googlegrpc.NewServer()
+	service := NewInternalService("leader", fsm, testRaft, zap.NewNop())
+	// This test controls the complete input window. A long fallback timer keeps
+	// host scheduling speed out of the assertion; reaching 128 flushes at once.
+	service.assignmentWindow = time.Second
+	service.completionWindow = time.Second
+	grpcv1.RegisterSluiceInternalServer(server, service)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+	})
+
+	clients := make([]*ClaimClient, activeWorkerStreams)
+	for index := range clients {
+		clients[index] = NewClaimClient(fmt.Sprintf("worker-%d", index), zap.NewNop())
+		clients[index].SetLeader(listener.Addr().String())
+		t.Cleanup(clients[index].Close)
+	}
+
+	type assignmentResult struct {
+		client *ClaimClient
+		task   *types.TaskRecord
+		err    error
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	startAssignments := make(chan struct{})
+	assigned := make(chan assignmentResult, requestCount)
+	for _, client := range clients {
+		for requestIndex := 0; requestIndex < requestsPerStream; requestIndex++ {
+			go func(client *ClaimClient) {
+				<-startAssignments
+				task, supported, err := client.Assign(ctx, "tenant-a")
+				if err == nil && (!supported || task == nil) {
+					err = fmt.Errorf("assignment supported=%v task=%+v", supported, task)
+				}
+				assigned <- assignmentResult{client: client, task: task, err: err}
+			}(client)
+		}
+	}
+	close(startAssignments)
+
+	results := make([]assignmentResult, 0, requestCount)
+	for len(results) < requestCount {
+		select {
+		case result := <-assigned:
+			if result.err != nil {
+				t.Fatalf("assignment %d failed: %v", len(results), result.err)
+			}
+			results = append(results, result)
+		case <-ctx.Done():
+			t.Fatalf("received %d/%d assignments: %v", len(results), requestCount, ctx.Err())
+		}
+	}
+	if got := testRaft.applyCount.Load(); got != 1 {
+		t.Fatalf("four streams wrote %d assignment Raft entries, want one full batch", got)
+	}
+
+	testRaft.applyCount.Store(0)
+	startCompletions := make(chan struct{})
+	completed := make(chan error, requestCount)
+	for _, result := range results {
+		go func(client *ClaimClient, taskID string) {
+			<-startCompletions
+			completed <- client.Complete(taskID, "tenant-a", "ok", "", false)
+		}(result.client, result.task.TaskID)
+	}
+	close(startCompletions)
+	for count := 0; count < requestCount; count++ {
+		select {
+		case err := <-completed:
+			if err != nil {
+				t.Fatalf("completion %d failed: %v", count, err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("received %d/%d completions: %v", count, requestCount, ctx.Err())
+		}
+	}
+	if got := testRaft.applyCount.Load(); got != 1 {
+		t.Fatalf("four streams wrote %d completion Raft entries, want one full batch", got)
+	}
+	for _, task := range tasks {
+		result := fsm.GetResult(task.TaskID)
+		if result == nil || result.Status != types.TaskStatusDone {
+			t.Fatalf("final result %s = %+v, want done", task.TaskID, result)
+		}
 	}
 }
 
