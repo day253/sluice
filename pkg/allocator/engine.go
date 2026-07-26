@@ -59,6 +59,7 @@ type Engine struct {
 	fsm    *raftpkg.FSM
 	raft   raftpkg.RaftApplier
 	logger *zap.Logger
+	perf   PerformanceObserver
 
 	// leader tracking
 	mu       sync.Mutex
@@ -87,6 +88,12 @@ type Engine struct {
 	workAvailable chan struct{}
 }
 
+// PerformanceObserver receives process-local allocation-plan outcomes. It is
+// diagnostic only and must not feed measurements back into scheduling.
+type PerformanceObserver interface {
+	ObserveAllocationPlan(applied, unchanged bool)
+}
+
 // NewEngine creates an allocator engine.
 func NewEngine(
 	nodeID string,
@@ -104,6 +111,10 @@ func NewEngine(
 		minWorkersPerTenant: 1,
 		workAvailable:       make(chan struct{}, 1),
 	}
+}
+
+func (e *Engine) SetPerformanceObserver(observer PerformanceObserver) {
+	e.perf = observer
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +233,7 @@ func (e *Engine) reconcile() error {
 	if err := e.requeueStaleTasks(); err != nil {
 		return err
 	}
-	state := e.fsm.GetState()
+	state := e.fsm.GetAllocationInputSnapshot()
 
 	// 1. Determine execution nodes and total cluster capacity. The Raft leader
 	// is a control-plane scheduler only: it never receives worker allocation.
@@ -248,7 +259,7 @@ func (e *Engine) reconcile() error {
 	}
 
 	// 3. Build load snapshot: inflight tasks per tenant (FSM-level).
-	inflightCount := e.fsm.CountUnfinishedPerTenant()
+	inflightCount := state.Unfinished
 
 	// 4. Update idle-cycle counters and classify tenants.
 	idleSet := e.updateIdleState(tenantList, inflightCount)
@@ -262,14 +273,14 @@ func (e *Engine) reconcile() error {
 	// 7. Let every tenant with an aged pending backlog probe otherwise spare
 	// capacity above its configured limit. Probes are shared fairly and shrink
 	// as soon as a tenant's backlog disappears.
-	pendingCount := e.fsm.CountPendingPerTenant()
+	pendingCount := state.Pending
 	finalAlloc, borrowed := e.applyBorrowing(
 		tenantList,
 		finalAlloc,
 		totalClusterWorkers,
 		inflightCount,
 		pendingCount,
-		e.fsm.OldestPendingCreatedAtByTenant(),
+		state.OldestPending,
 		idleSet,
 	)
 
@@ -315,15 +326,31 @@ func (e *Engine) reconcile() error {
 }
 
 func (e *Engine) commitAllocations(allocations map[string]*types.NodeAllocation) error {
+	if e.fsm.AllocationsEqual(allocations) {
+		if e.perf != nil {
+			e.perf.ObserveAllocationPlan(false, true)
+		}
+		e.logger.Debug("allocator: allocation unchanged; skipping Raft Apply",
+			zap.Int("nodes", len(allocations)),
+		)
+		return nil
+	}
 	data, err := json.Marshal(allocations)
 	if err != nil {
+		if e.perf != nil {
+			e.perf.ObserveAllocationPlan(false, false)
+		}
 		return err
 	}
 	result := e.raft.Apply(
 		raftpkg.MustMarshalCommand(raftpkg.OpUpdateAllocation, json.RawMessage(data)),
 		5000,
 	)
-	return result.Error()
+	err = result.Error()
+	if e.perf != nil {
+		e.perf.ObserveAllocationPlan(err == nil, false)
+	}
+	return err
 }
 
 func (e *Engine) requeueStaleTasks() error {

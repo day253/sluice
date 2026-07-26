@@ -366,8 +366,8 @@ func TestInternalServiceBoundsGlobalRaftBatchSize(t *testing.T) {
 	}
 }
 
-func TestFourWorkerStreamsFillOneGlobalRaftBatch(t *testing.T) {
-	const activeWorkerStreams = 4
+func TestSixteenWorkerStreamsFillOneGlobalRaftBatch(t *testing.T) {
+	const activeWorkerStreams = 16
 	const requestsPerStream = workerRequestCredits
 	const requestCount = activeWorkerStreams * requestsPerStream
 	if requestCount != claimBatchMaxSize {
@@ -409,7 +409,7 @@ func TestFourWorkerStreamsFillOneGlobalRaftBatch(t *testing.T) {
 	server := googlegrpc.NewServer()
 	service := NewInternalService("leader", fsm, testRaft, zap.NewNop())
 	// This test controls the complete input window. A long fallback timer keeps
-	// host scheduling speed out of the assertion; reaching 128 flushes at once.
+	// host scheduling speed out of the assertion; reaching 512 flushes at once.
 	service.assignmentWindow = time.Second
 	service.completionWindow = time.Second
 	grpcv1.RegisterSluiceInternalServer(server, service)

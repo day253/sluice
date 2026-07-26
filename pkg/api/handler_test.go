@@ -75,6 +75,7 @@ type recordingMetricsCollector struct {
 	name          string
 	includePrefix string
 	excludePrefix string
+	current       bool
 }
 
 func (c *recordingMetricsCollector) Query(name, includePrefix, excludePrefix string) ([]MetricsData, int) {
@@ -82,6 +83,18 @@ func (c *recordingMetricsCollector) Query(name, includePrefix, excludePrefix str
 	c.includePrefix = includePrefix
 	c.excludePrefix = excludePrefix
 	return []MetricsData{{Name: "unfinished:company-a"}}, 1
+}
+
+func (c *recordingMetricsCollector) QueryCurrent(
+	name, includePrefix, excludePrefix string,
+) ([]MetricsData, int) {
+	c.name = name
+	c.includePrefix = includePrefix
+	c.excludePrefix = excludePrefix
+	c.current = true
+	return []MetricsData{{
+		Name: "allocated-workers:tenant:company-a", Secs: []int64{7},
+	}}, 1
 }
 
 func mustMarshal(v interface{}) []byte {
@@ -389,6 +402,38 @@ func TestMetricsEndpointCanFilterHistoriesByPrefix(t *testing.T) {
 	}
 	if collector.name != "" || collector.includePrefix != "unfinished:" || collector.excludePrefix != "performance:" {
 		t.Fatalf("metrics query name=%q include=%q exclude=%q", collector.name, collector.includePrefix, collector.excludePrefix)
+	}
+}
+
+func TestMetricsEndpointCanReturnCurrentValuesWithoutCopyingHistory(t *testing.T) {
+	h, _, _ := setupHandler(t)
+	collector := &recordingMetricsCollector{}
+	h.SetCollector(collector)
+	recorder := httptest.NewRecorder()
+	newRouter(h).ServeHTTP(recorder, httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/metrics?prefix=allocated-workers%3Atenant%3A&performance=0&current=1",
+		nil,
+	))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !collector.current || collector.name != "" ||
+		collector.includePrefix != "allocated-workers:tenant:" ||
+		collector.excludePrefix != "performance:" {
+		t.Fatalf(
+			"current metrics query current=%t name=%q include=%q exclude=%q",
+			collector.current, collector.name,
+			collector.includePrefix, collector.excludePrefix,
+		)
+	}
+	var data []MetricsData
+	if err := json.Unmarshal(recorder.Body.Bytes(), &data); err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != 1 || len(data[0].Secs) != 1 || data[0].Secs[0] != 7 ||
+		len(data[0].Mins)+len(data[0].Hours)+len(data[0].Days) != 0 {
+		t.Fatalf("current metrics response = %+v", data)
 	}
 }
 

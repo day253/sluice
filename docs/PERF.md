@@ -146,13 +146,13 @@ consensus_capacity ≈ B / (claim_commit_latency + complete_commit_latency)
 processor_capacity ≈ active_workers / average_process_time
 task/s ≈ min(consensus_capacity, processor_capacity)
 
-B ≤ 128，并且还受所有执行节点未决 credit 总数限制。
+B ≤ 512，并且还受所有执行节点未决 credit 总数限制。
 commit_latency = voter 多数派持久化 entry 的尾延迟。
 ```
 
 Process 与下一批控制面提交可并发，不能把每条任务错误建模为串行执行两次 commit。
-相反，批次填充率决定了共识成本如何摊薄：例如 128 条 Claim 和 128 条 Complete 各用
-一次 20ms commit，控制面理论上约为 `128 / 40ms = 3200 task/s`；如果只有 8 个 slot
+相反，批次填充率决定了共识成本如何摊薄：例如 512 条 Claim 和 512 条 Complete 各用
+一次 20ms commit，控制面理论上约为 `512 / 40ms = 12800 task/s`；如果只有 8 个 slot
 进入批次，同样延迟下只有约 200 task/s。
 
 PERF-001 的故障环境是 50 voter/多数派 26 且共用一台物理机磁盘，单个 128 条完成台阶
@@ -185,7 +185,7 @@ Follower HTTP 提交为 1.338 秒、消费为 43.800 秒。环境、磁盘与 Pr
 | 瓶颈 | 方案 | 预期提升 |
 |------|------|---------|
 | 执行规模扩大 Raft | 5 control + 独立 stateless Worker | 日志副本恒定为 control 数 |
-| Raft 磁盘 sync | Create/Claim/Complete batch Apply | 按实际批次摊薄至多 128 条 |
+| Raft 磁盘 sync | Create/Claim/Complete batch Apply | 按实际批次摊薄至多 512 条 |
 | 网络 RTT | gRPC streaming + pipelining | 1.5× |
 | pending 跨批扫描 | FSM 维护可重建的派生 FIFO 索引，每批只取候选 | `O(batches×pending)` → 近似 `O(tasks)` |
 | 重复本地 Queue | 只存 Raft pending | 去掉每任务本地写和扫描删除 |
@@ -195,7 +195,7 @@ Follower HTTP 提交为 1.338 秒、消费为 43.800 秒。环境、磁盘与 Pr
 
 ### 5.1 任务批量调度与 work-steal
 
-Assignment dispatcher 保持 worker 到达顺序并以最多 128 条为一批提交 `OpClaimBatch`；
+Assignment dispatcher 保持 worker 到达顺序并以最多 512 条为一批提交 `OpClaimBatch`；
 节点上的多个 worker 并发执行，Result dispatcher 以同样的全局窗口提交
 `OpCompleteBatch`。空闲 worker
 优先偷取本机其他租户队列，跨节点 work-steal 只放行等待超过 5 秒的 pending 任务；
@@ -1122,3 +1122,66 @@ concurrency=1。
 Raft Apply/batch fill、pending selection、dispatcher queue、backlog、error/lease 指标
 保持不变，新增 `worker_telemetry` 原始 JSON 可直接判断上报覆盖率与样本新鲜度。完整
 integration 阶段为 406.637s。
+
+### 7.18 大积压派生索引、allocation no-op 与 512 条批次（2026-07-26）
+
+本轮先在修改前的远程运行实例固定瓶颈证据。环境为单台 16 logical CPU、约 60GiB
+宿主机上的 MicroK8s，5 control/5 voter、90 stateless Worker、单 Raft shard、约 284
+个当前 tenant；每 Pod 配置 1000 个 Processor 槽，逻辑容量 90000。这个数字是 goroutine/
+并发领取上限，不是 90000 个 CPU worker。采样时统一 autoscaling snapshot 为
+unfinished=401374、pending=400977、running=397，oldest pending 约 4687 秒。
+
+修改前 Leader 进程 epoch 从 2026-07-26 14:31:36 UTC 开始；15:50 UTC 的 current-only
+performance JSON 为：
+
+| 阶段 | Apply / items / 平均批次 | 平均 / 最大 Apply |
+|---|---:|---:|
+| Create batch | 208 / 104000 / 500 | 1698.590ms / 4650.611ms |
+| Claim batch | 2139 / 257192 / 120 | 1196.489ms / 5883.049ms |
+| Complete batch | 2568 / 256613 / 99 | 1139.157ms / 5558.688ms |
+| Allocation | 507 / 45630 / 90 nodes | 1266.879ms / 5679.087ms |
+
+同一时刻 scheduler 平均 pending selection 为 277.382ms，assignment/completion queue
+为 2752/451。`GET /admin/tenants` 响应 29378 bytes/0.308s；
+`GET /admin/allocations` 为 1086803 bytes/0.125s。它们是单次本地隧道样本，不能当稳定
+SLA，但与代码路径相互印证：allocator 每 3 秒通过 `GetState` 深拷贝全部 unfinished
+task/payload，另有 allocator/metrics/tenant API 多次全表扫描；计划未改变时仍把完整
+90×tenant allocation 镜像写入 Raft，页面还每秒读取并渲染该矩阵。
+
+旧版本继续运行且没有新增提交时，unfinished 从 15:50:09 UTC 的 401374 降到
+15:57:50 的 0，最多 461 秒，区间平均约 870.7 task/s；completed process counter 同期
+从 259201 增到 660703。该区间包含此前已 requeue 的任务、批次填充变化和尾部，因此只作
+部署前同一远程环境的运行中参考，不与固定 PERF-001 的 submit/drain 定义混用。
+
+本轮实现把 unfinished/pending/oldest per-tenant 与 inflight claim-expiry 改为 FSM Apply
+内增量维护、Snapshot Restore 时从 durable tasks 重建的当前索引；lease 检查只遍历已
+到期 inflight，allocator coherent snapshot 不再复制 task 或 payload。相同 allocation
+plan 记 no-op 并跳过 Raft Apply，新增
+`allocation_plan_checks/applies/noops` 当前累计及 174 点每秒观测。WebUI 不再请求
+allocation placement，tenant 表改读 `allocated-workers:tenant:*&current=1` 的单点聚合；
+nodes/tenants 拓扑降为每 5 秒读取，负载历史仍每秒。Claim/Complete 全局批次从 128
+提高到 512，但每节点 Assignment/Result 仍各受 32 credits 约束，Leader 唯一选择、
+ACK-after-commit、lease 与 final-state 语义不变。
+
+正确性证据先由 `-race` 下真实三 voter Case 固定：2000 条任务、40 个 gated Processor
+保持大积压，同时反复读取 tenants/174 点/current-only metrics；稳定后 allocation no-op
+多于 Apply，观测 Apply 数与真实 `OpUpdateAllocation` 一致，释放后 2000 条各执行一次、
+unfinished=0。固定 PERF-001 的本地完整基线和部署后远程同形状复测追加在本节后续记录，
+不把上述运行中 epoch 的累计 counters 与新版本端到端吞吐直接作百分比比较。
+
+最终完整 `make test`（Apple M4 Pro、14 logical CPU、48GiB、darwin/arm64、Go 1.26.5，
+全程 `-race -count=1`）通过，真实多节点 integration 阶段为 402.907s。固定 PERF-001
+仍是 7 replica/3 voter/4 non-voter、每进程 80 槽、4 tenant×Limit 120、20000 个约
+10ms 小 JSON 任务、Follower HTTP、batch=1000/concurrency=1：
+
+| 阶段 | OBS-002 上一轮 | PERF-005 最终完整测试 |
+|---|---:|---:|
+| durable submit | 2.710s | 2.543s |
+| accepted 后排空 | 11.201s | 11.201s |
+| 端到端 | 13.911s（1437.8 task/s） | 13.743s（1455.3 task/s） |
+| 错误 / unfinished / 重复执行 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+端到端单轮约快 1.2%，但 submit 与 drain 方向并不一致且 race/选举/本机调度会抖动，
+不能据此宣称吞吐提升。可以确认同形状正确性和性能没有回退；PERF-005 的主要收益应在
+数十万 backlog、数百 tenant、周期 allocator/UI 读取和高 Raft latency 的远程形状验证，
+而不是这个 20k/4 tenant 的小矩阵。

@@ -34,6 +34,8 @@ func TestCollectorStoresBoundedPerformanceHistory(t *testing.T) {
 	performance.SetDispatcherQueueDepths(11, 13)
 	performance.ObserveWorkerLoad("worker-0", 760, 7, 10, time.Now())
 	performance.ObserveLoadAdmission(20, 4, 2, 1)
+	performance.ObserveAllocationPlan(true, false)
+	performance.ObserveAllocationPlan(false, true)
 
 	collector := NewCollector(fsm, zap.NewNop())
 	collector.SetPerformance(performance)
@@ -63,6 +65,9 @@ func TestCollectorStoresBoundedPerformanceHistory(t *testing.T) {
 	assertLatest("performance:scheduler:load-throttled-requests", 4)
 	assertLatest("performance:scheduler:load-unavailable-requests", 2)
 	assertLatest("performance:scheduler:stale-load-requests", 1)
+	assertLatest("performance:scheduler:allocation-plan-checks", 2)
+	assertLatest("performance:scheduler:allocation-plan-applies", 1)
+	assertLatest("performance:scheduler:allocation-plan-noops", 1)
 	assertLatest("performance:scheduler:worker-cpu-max-millis", 760)
 	assertLatest("performance:scheduler:reporting-workers", 1)
 
@@ -143,5 +148,13 @@ func TestCollectorFiltersMetricHistoriesByPrefix(t *testing.T) {
 		if got := len(history.Secs) + len(history.Mins) + len(history.Hours) + len(history.Days); got != 174 {
 			t.Fatalf("history %q points = %d, want 174", history.Name, got)
 		}
+	}
+	current := collector.QueryNamedCurrentFiltered(
+		"", "allocated-workers:tenant:", "performance:",
+	)
+	if len(current) != 1 || current[0].Name != "allocated-workers:tenant:globex" ||
+		len(current[0].Secs) != 1 || current[0].Secs[0] != 7 ||
+		len(current[0].Mins)+len(current[0].Hours)+len(current[0].Days) != 0 {
+		t.Fatalf("current-only allocation query = %+v", current)
 	}
 }

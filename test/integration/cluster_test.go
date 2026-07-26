@@ -2559,6 +2559,37 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		return foundObserved
 	}, 15*time.Second, "follower prefix-filtered unfinished histories")
 
+	tc.waitFor(func() bool {
+		response, err := client.Get(
+			"http://" + tc.httpAddrs[follower] +
+				"/api/v1/metrics?prefix=allocated-workers%3Atenant%3A&performance=0&current=1",
+		)
+		if err != nil {
+			return false
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return false
+		}
+		var current []struct {
+			Name  string  `json:"name"`
+			Secs  []int64 `json:"secs"`
+			Mins  []int64 `json:"mins"`
+			Hours []int64 `json:"hours"`
+			Days  []int64 `json:"days"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&current); err != nil {
+			return false
+		}
+		for _, metric := range current {
+			if metric.Name == "allocated-workers:tenant:observed" {
+				return len(metric.Secs) == 1 && metric.Secs[0] > 0 &&
+					len(metric.Mins) == 0 && len(metric.Hours) == 0 && len(metric.Days) == 0
+			}
+		}
+		return false
+	}, 15*time.Second, "current-only aggregate tenant slots through follower")
+
 	dashboardResponse, err := client.Get("http://" + tc.httpAddrs[follower] + "/")
 	if err != nil {
 		t.Fatalf("GET dashboard through follower: %v", err)
@@ -2576,7 +2607,7 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		`id="performance-raft-chart"`,
 		`id="performance-scheduler-chart"`,
 		`href="/api/v1/admin/performance"`,
-		`getJSON('/api/v1/metrics?performance=0')`,
+		`getJSON('/api/v1/metrics?prefix=allocated-workers%3Atenant%3A&performance=0&current=1')`,
 		`getJSON('/api/v1/admin/performance')`,
 		`.chart-tooltip{`,
 		`canvas.addEventListener('pointermove',event=>moveChartHover(canvas,event))`,
@@ -2584,11 +2615,162 @@ func TestPerformanceDiagnosticsProxyFromFollower(t *testing.T) {
 		`Number.isFinite(selected.item.limit)`,
 		`href="/api/v1/metrics?prefix=allocated-workers%3Anode%3A&amp;performance=0"`,
 		`href="/api/v1/metrics?prefix=unfinished%3A&amp;performance=0"`,
+		`aria-label="View current tenant allocation totals as JSON"`,
 		`aria-label="View Raft Apply history as JSON"`,
 		`aria-label="View scheduler history as JSON"`,
 	} {
 		if !strings.Contains(string(dashboardBody), fragment) {
 			t.Errorf("production dashboard is missing performance fragment %q", fragment)
+		}
+	}
+}
+
+// TestLargeBacklogPollingSkipsUnchangedAllocationRaftWrites preserves
+// PERF-004 through the complete production boundary. A real three-voter
+// cluster holds a backlog while follower HTTP reads poll current mirrors.
+// Periodic leader planning must continue for liveness, but an unchanged plan
+// must not append the complete node×tenant allocation mirror to Raft.
+func TestLargeBacklogPollingSkipsUnchangedAllocationRaftWrites(t *testing.T) {
+	tc := newTestClusterWithAllocatorInterval(t, 3, 20, 100*time.Millisecond)
+	defer tc.shutdown()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	client := &http.Client{Timeout: 10 * time.Second}
+	request, err := http.NewRequest(
+		http.MethodPut,
+		"http://"+tc.httpAddrs[follower]+"/api/v1/admin/tenants/perf-indexed",
+		strings.NewReader(`{"name":"Indexed backlog","max_workers":40}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("create tenant through follower: %v", err)
+	}
+	responseBody, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("create tenant status=%d body=%s", response.StatusCode, responseBody)
+	}
+	tc.waitAllocation(10 * time.Second)
+
+	started, release := tc.proc.gate("perf-indexed")
+	defer release()
+
+	const taskCount = 2000
+	taskIDs := make([]string, 0, taskCount)
+	for batchStart := 0; batchStart < taskCount; batchStart += 1000 {
+		batch := types.BatchTaskSubmitRequest{Tasks: make([]types.TaskSubmitRequest, 1000)}
+		for index := range batch.Tasks {
+			taskIndex := batchStart + index
+			batch.Tasks[index] = types.TaskSubmitRequest{
+				TenantID:       "perf-indexed",
+				Payload:        json.RawMessage(fmt.Sprintf(`{"index":%d}`, taskIndex)),
+				IdempotencyKey: fmt.Sprintf("perf-indexed-%d", taskIndex),
+			}
+		}
+		body, marshalErr := json.Marshal(batch)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		response, postErr := client.Post(
+			"http://"+tc.httpAddrs[follower]+"/api/v1/tasks/batch",
+			"application/json",
+			bytes.NewReader(body),
+		)
+		if postErr != nil {
+			t.Fatalf("submit backlog batch %d: %v", batchStart/1000, postErr)
+		}
+		var submitted types.BatchTaskResponse
+		decodeErr := json.NewDecoder(response.Body).Decode(&submitted)
+		response.Body.Close()
+		if response.StatusCode != http.StatusAccepted || decodeErr != nil ||
+			len(submitted.Tasks) != len(batch.Tasks) {
+			t.Fatalf(
+				"submit backlog batch %d status=%d decode=%v tasks=%d",
+				batchStart/1000,
+				response.StatusCode,
+				decodeErr,
+				len(submitted.Tasks),
+			)
+		}
+		for _, task := range submitted.Tasks {
+			taskIDs = append(taskIDs, task.TaskID)
+		}
+	}
+
+	for index := 0; index < 40; index++ {
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d gated workers started", index)
+		}
+	}
+
+	var diagnostics metricspkg.PerformanceDiagnostics
+	tc.waitFor(func() bool {
+		for _, path := range []string{
+			"/api/v1/admin/tenants",
+			"/api/v1/metrics?prefix=unfinished%3A&performance=0",
+			"/api/v1/metrics?prefix=allocated-workers%3Atenant%3A&performance=0&current=1",
+		} {
+			response, getErr := client.Get("http://" + tc.httpAddrs[follower] + path)
+			if getErr != nil {
+				return false
+			}
+			_, _ = io.Copy(io.Discard, response.Body)
+			response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				return false
+			}
+		}
+		response, getErr := client.Get(
+			"http://" + tc.httpAddrs[follower] + "/api/v1/admin/performance?history=0",
+		)
+		if getErr != nil {
+			return false
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK ||
+			json.NewDecoder(response.Body).Decode(&diagnostics) != nil {
+			return false
+		}
+		scheduler := diagnostics.Current.Scheduler
+		return scheduler.AllocationPlanChecks >= 5 &&
+			scheduler.AllocationPlanApplies >= 1 &&
+			scheduler.AllocationPlanNoops >= 3 &&
+			scheduler.AllocationPlanChecks ==
+				scheduler.AllocationPlanApplies+scheduler.AllocationPlanNoops
+	}, 15*time.Second, "stable allocation checks become no-op without Raft writes")
+
+	updateAllocation := diagnostics.Current.Raft[raftpkg.OpUpdateAllocation]
+	if updateAllocation.Applies != diagnostics.Current.Scheduler.AllocationPlanApplies {
+		t.Fatalf(
+			"allocation Raft applies=%d, observed plan applies=%d, scheduler=%+v",
+			updateAllocation.Applies,
+			diagnostics.Current.Scheduler.AllocationPlanApplies,
+			diagnostics.Current.Scheduler,
+		)
+	}
+	if diagnostics.Current.Scheduler.AllocationPlanNoops <=
+		diagnostics.Current.Scheduler.AllocationPlanApplies {
+		t.Fatalf("unchanged plans did not dominate stable polling: %+v", diagnostics.Current.Scheduler)
+	}
+
+	release()
+	tc.waitFor(func() bool {
+		return tc.fsms().CountUnfinishedPerTenant()["perf-indexed"] == 0
+	}, 45*time.Second, "indexed backlog drains after releasing workers")
+	processed := tc.proc.processedTaskCounts()
+	for _, taskID := range taskIDs {
+		if processed[taskID] != 1 {
+			t.Fatalf("task %s processed %d times, want exactly once", taskID, processed[taskID])
 		}
 	}
 }
@@ -2905,16 +3087,16 @@ func TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery(t *testing.T
 		}
 		if entry.Message == "assignment raft batch committed" {
 			assignmentBatches++
-			if size, ok := fields["tasks"].(int64); !ok || size < 1 || size > 128 {
-				t.Fatalf("assignment Raft batch size = %v, want 1..128", fields["tasks"])
+			if size, ok := fields["tasks"].(int64); !ok || size < 1 || size > 512 {
+				t.Fatalf("assignment Raft batch size = %v, want 1..512", fields["tasks"])
 			} else {
 				assignmentItems += size
 			}
 		}
 		if entry.Message == "completion raft batch committed" {
 			completionBatches++
-			if size, ok := fields["tasks"].(int64); !ok || size < 1 || size > 128 {
-				t.Fatalf("completion Raft batch size = %v, want 1..128", fields["tasks"])
+			if size, ok := fields["tasks"].(int64); !ok || size < 1 || size > 512 {
+				t.Fatalf("completion Raft batch size = %v, want 1..512", fields["tasks"])
 			} else {
 				completionItems += size
 			}
@@ -2929,8 +3111,8 @@ func TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery(t *testing.T
 	}
 	// Batch fill depends on the host scheduler delivering thousands of
 	// race-instrumented Worker goroutines within the 5ms production window.
-	// Keep it visible here, but enforce the 4 streams × 32 credits → one
-	// 128-item Apply contract in the deterministic gRPC component test.
+	// Keep it visible here, but enforce the 16 streams × 32 credits → one
+	// 512-item Apply contract in the deterministic gRPC component test.
 	t.Logf("credit fanout batches: assignment=%d/%d completion=%d/%d",
 		assignmentBatches, assignmentItems, completionBatches, completionItems)
 }

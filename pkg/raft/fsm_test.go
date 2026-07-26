@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"testing"
 	"time"
 
@@ -103,6 +104,123 @@ func TestTaskPressureSnapshotSeparatesPendingAndRunningUnderOneRead(t *testing.T
 	if snapshot.UnfinishedTasks != 2 || snapshot.PendingTasks != 0 ||
 		snapshot.RunningTasks != 2 || !snapshot.OldestPendingAt.IsZero() {
 		t.Fatalf("claimed task pressure snapshot = %+v", snapshot)
+	}
+}
+
+func TestDerivedTenantTaskIndexesTrackLifecycleAndRebuildOnRestore(t *testing.T) {
+	fsm := newTestFSM(t)
+	for _, tenantID := range []string{"tenant-a", "tenant-b"} {
+		applyCmd(t, fsm, OpUpsertTenant, types.TenantConfig{
+			ID: tenantID, MaxWorkers: 10,
+		})
+	}
+	applyCmd(t, fsm, OpCreateTask, CreateTaskData{
+		TaskID: "pending-a", TenantID: "tenant-a", Payload: `{}`,
+	})
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "running-b", TenantID: "tenant-b",
+		NodeID: "worker-0", Payload: `{}`,
+	})
+
+	inputs := fsm.GetAllocationInputSnapshot()
+	if inputs.Unfinished["tenant-a"] != 1 ||
+		inputs.Unfinished["tenant-b"] != 1 ||
+		inputs.Pending["tenant-a"] != 1 ||
+		inputs.Pending["tenant-b"] != 0 ||
+		inputs.OldestPending["tenant-a"].IsZero() {
+		t.Fatalf("initial derived allocation inputs = %+v", inputs)
+	}
+
+	applyCmd(t, fsm, OpRequeueTasks, RequeueTasksData{
+		TaskIDs: []string{"running-b"},
+	})
+	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
+		TaskID: "pending-a", TenantID: "tenant-a",
+		NodeID: "worker-0", Payload: `{}`,
+	})
+	applyCmd(t, fsm, OpCompleteTask, CompleteTaskData{
+		TaskID: "running-b", TenantID: "tenant-b", Result: `{}`,
+	})
+	if unfinished := fsm.CountUnfinishedPerTenant(); len(unfinished) != 1 ||
+		unfinished["tenant-a"] != 1 {
+		t.Fatalf("unfinished derived index after lifecycle = %+v", unfinished)
+	}
+	if pending := fsm.CountPendingPerTenant(); len(pending) != 0 {
+		t.Fatalf("pending derived index after lifecycle = %+v", pending)
+	}
+
+	snapshot, err := fsm.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &testSnapshotSink{}
+	if err := snapshot.Persist(sink); err != nil {
+		t.Fatal(err)
+	}
+	restored := newTestFSM(t)
+	if err := restored.Restore(io.NopCloser(bytes.NewReader(sink.buf.Bytes()))); err != nil {
+		t.Fatal(err)
+	}
+	restoredInputs := restored.GetAllocationInputSnapshot()
+	if restoredInputs.Unfinished["tenant-a"] != 1 ||
+		len(restoredInputs.Pending) != 0 ||
+		len(restoredInputs.OldestPending) != 0 {
+		t.Fatalf("rebuilt allocation inputs = %+v", restoredInputs)
+	}
+	if stale := restored.FindStaleInflightTaskIDs(time.Now().UTC().Add(time.Hour)); !slices.Equal(
+		stale,
+		[]string{"pending-a"},
+	) {
+		t.Fatalf("rebuilt inflight lease index = %v, want [pending-a]", stale)
+	}
+	metrics := restored.GetMetricsSnapshot()
+	if metrics.Unfinished["tenant-a"] != 1 ||
+		metrics.Unfinished["tenant-b"] != 0 {
+		t.Fatalf("metrics did not reuse rebuilt derived counts: %+v", metrics.Unfinished)
+	}
+}
+
+func TestAllocationsEqualComparesCompleteCurrentMirror(t *testing.T) {
+	fsm := newTestFSM(t)
+	allocation := map[string]*types.NodeAllocation{
+		"worker-0": {
+			NodeID:   "worker-0",
+			Tenants:  map[string]int{"tenant-a": 4},
+			Borrowed: map[string]int{"tenant-a": 2},
+		},
+	}
+	applyCmd(t, fsm, OpUpdateAllocation, allocation)
+	if !fsm.AllocationsEqual(allocation) {
+		t.Fatal("identical allocation did not compare equal")
+	}
+	for name, candidate := range map[string]map[string]*types.NodeAllocation{
+		"different workers": {
+			"worker-0": {
+				NodeID:   "worker-0",
+				Tenants:  map[string]int{"tenant-a": 3},
+				Borrowed: map[string]int{"tenant-a": 2},
+			},
+		},
+		"different borrowed": {
+			"worker-0": {
+				NodeID:   "worker-0",
+				Tenants:  map[string]int{"tenant-a": 4},
+				Borrowed: map[string]int{"tenant-a": 1},
+			},
+		},
+		"different tenant key with zero": {
+			"worker-0": {
+				NodeID:   "worker-0",
+				Tenants:  map[string]int{"tenant-b": 0},
+				Borrowed: map[string]int{"tenant-a": 2},
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if fsm.AllocationsEqual(candidate) {
+				t.Fatalf("different allocation compared equal: %+v", candidate)
+			}
+		})
 	}
 }
 
@@ -849,7 +967,10 @@ func TestExpiredClaimCanBeRequeued(t *testing.T) {
 	applyCmd(t, fsm, OpClaimTask, ClaimTaskData{
 		TaskID: "stale-task", TenantID: "t1", NodeID: "n1", Payload: `{}`,
 	})
-	fsm.state.Tasks["stale-task"].ClaimedAt = time.Now().UTC().Add(-10 * time.Minute)
+	task := fsm.state.Tasks["stale-task"]
+	fsm.inflight.remove(task)
+	task.ClaimedAt = time.Now().UTC().Add(-10 * time.Minute)
+	fsm.inflight.add(task)
 
 	taskIDs := fsm.FindStaleInflightTaskIDs(time.Now().UTC().Add(-5 * time.Minute))
 	if len(taskIDs) != 1 || taskIDs[0] != "stale-task" {
@@ -857,9 +978,13 @@ func TestExpiredClaimCanBeRequeued(t *testing.T) {
 	}
 	applyCmd(t, fsm, OpRequeueTasks, RequeueTasksData{TaskIDs: taskIDs})
 
-	task := fsm.GetTask("stale-task")
-	if task == nil || task.Status != types.TaskStatusPending || task.NodeID != "" || !task.ClaimedAt.IsZero() {
-		t.Fatalf("requeued task = %+v, want clean pending task", task)
+	requeued := fsm.GetTask("stale-task")
+	if requeued == nil || requeued.Status != types.TaskStatusPending ||
+		requeued.NodeID != "" || !requeued.ClaimedAt.IsZero() {
+		t.Fatalf("requeued task = %+v, want clean pending task", requeued)
+	}
+	if stale := fsm.FindStaleInflightTaskIDs(time.Now().UTC().Add(time.Hour)); len(stale) != 0 {
+		t.Fatalf("requeued task remained in inflight lease index: %v", stale)
 	}
 }
 

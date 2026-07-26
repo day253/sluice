@@ -101,6 +101,9 @@ func (c *Collector) collect() {
 	c.ensure("performance:scheduler:load-throttled-requests", nil).Record(int64(scheduler.LoadThrottledRequests))
 	c.ensure("performance:scheduler:load-unavailable-requests", nil).Record(int64(scheduler.LoadUnavailableRequests))
 	c.ensure("performance:scheduler:stale-load-requests", nil).Record(int64(scheduler.StaleLoadRequests))
+	c.ensure("performance:scheduler:allocation-plan-checks", nil).Record(int64(scheduler.AllocationPlanChecks))
+	c.ensure("performance:scheduler:allocation-plan-applies", nil).Record(int64(scheduler.AllocationPlanApplies))
+	c.ensure("performance:scheduler:allocation-plan-noops", nil).Record(int64(scheduler.AllocationPlanNoops))
 	c.ensure("performance:scheduler:worker-cpu-max-millis", nil).Record(scheduler.MaxWorkerCPUMillis)
 	c.ensure("performance:scheduler:reporting-workers", nil).Record(scheduler.ReportingWorkers)
 	c.ensure("performance:scheduler:select-us", nil).Record(divideInt64(scheduler.TotalSelectMicros, scheduler.Selections))
@@ -232,6 +235,42 @@ func (c *Collector) QueryNamedFiltered(name, includePrefix, excludePrefix string
 		}
 		d := v.Query()
 		out = append(out, NamedVarData{Name: n, Secs: d.Secs, Mins: d.Mins, Hours: d.Hours, Days: d.Days})
+	}
+	return out
+}
+
+// QueryNamedCurrentFiltered returns only the latest committed one-second value
+// for each selected series. It avoids copying 174 samples when a dashboard
+// needs a current allocation mirror but no history.
+func (c *Collector) QueryNamedCurrentFiltered(
+	name, includePrefix, excludePrefix string,
+) []NamedVarData {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	excluded := func(metricName string) bool {
+		return excludePrefix != "" && strings.HasPrefix(metricName, excludePrefix)
+	}
+	included := func(metricName string) bool {
+		return includePrefix == "" || strings.HasPrefix(metricName, includePrefix)
+	}
+	current := func(metricName string, history *VarHistory) NamedVarData {
+		return NamedVarData{Name: metricName, Secs: []int64{history.Current()}}
+	}
+	if name != "" {
+		if excluded(name) || !included(name) {
+			return nil
+		}
+		if history, ok := c.vars[name]; ok {
+			return []NamedVarData{current(name, history)}
+		}
+		return nil
+	}
+	out := make([]NamedVarData, 0, len(c.vars))
+	for metricName, history := range c.vars {
+		if excluded(metricName) || !included(metricName) {
+			continue
+		}
+		out = append(out, current(metricName, history))
 	}
 	return out
 }

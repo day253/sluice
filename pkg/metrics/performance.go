@@ -46,6 +46,9 @@ type schedulerAggregate struct {
 	LastSelectMicros        int64
 	AssignmentQueueDepth    int64
 	CompletionQueueDepth    int64
+	AllocationPlanChecks    uint64
+	AllocationPlanApplies   uint64
+	AllocationPlanNoops     uint64
 	WorkerLoads             map[string]WorkerLoadSnapshot
 	WorkerTelemetry         map[string]WorkerLoadSnapshot
 
@@ -56,6 +59,9 @@ type schedulerAggregate struct {
 	windowLoadThrottledRequests   uint64
 	windowLoadUnavailableRequests uint64
 	windowStaleLoadRequests       uint64
+	windowAllocationPlanChecks    uint64
+	windowAllocationPlanApplies   uint64
+	windowAllocationPlanNoops     uint64
 	windowTotalSelectMicros       int64
 	windowMaxSelectMicros         int64
 }
@@ -83,6 +89,9 @@ type SchedulerSnapshot struct {
 	LastSelectMicros        int64                         `json:"last_select_us"`
 	AssignmentQueueDepth    int64                         `json:"assignment_queue_depth"`
 	CompletionQueueDepth    int64                         `json:"completion_queue_depth"`
+	AllocationPlanChecks    uint64                        `json:"allocation_plan_checks"`
+	AllocationPlanApplies   uint64                        `json:"allocation_plan_applies"`
+	AllocationPlanNoops     uint64                        `json:"allocation_plan_noops"`
 	MaxWorkerCPUMillis      int64                         `json:"max_worker_cpu_millis"`
 	WorkerLoads             map[string]WorkerLoadSnapshot `json:"worker_loads"`
 	WorkerTelemetry         map[string]WorkerLoadSnapshot `json:"worker_telemetry"`
@@ -129,6 +138,9 @@ type schedulerWindow struct {
 	LoadThrottledRequests   uint64
 	LoadUnavailableRequests uint64
 	StaleLoadRequests       uint64
+	AllocationPlanChecks    uint64
+	AllocationPlanApplies   uint64
+	AllocationPlanNoops     uint64
 	TotalSelectMicros       int64
 	MaxSelectMicros         int64
 	AssignmentQueueDepth    int64
@@ -227,6 +239,22 @@ func (p *Performance) SetDispatcherQueueDepths(assignment, completion int) {
 	p.mu.Unlock()
 }
 
+func (p *Performance) ObserveAllocationPlan(applied, unchanged bool) {
+	p.mu.Lock()
+	s := &p.scheduler
+	s.AllocationPlanChecks++
+	s.windowAllocationPlanChecks++
+	if applied {
+		s.AllocationPlanApplies++
+		s.windowAllocationPlanApplies++
+	}
+	if unchanged {
+		s.AllocationPlanNoops++
+		s.windowAllocationPlanNoops++
+	}
+	p.mu.Unlock()
+}
+
 func (p *Performance) ObserveWorkerLoad(
 	nodeID string,
 	cpuMillis, runningTasks, capacity int,
@@ -311,6 +339,9 @@ func (p *Performance) sample() performanceWindow {
 		LoadThrottledRequests:   s.windowLoadThrottledRequests,
 		LoadUnavailableRequests: s.windowLoadUnavailableRequests,
 		StaleLoadRequests:       s.windowStaleLoadRequests,
+		AllocationPlanChecks:    s.windowAllocationPlanChecks,
+		AllocationPlanApplies:   s.windowAllocationPlanApplies,
+		AllocationPlanNoops:     s.windowAllocationPlanNoops,
 		MaxSelectMicros:         s.windowMaxSelectMicros,
 		AssignmentQueueDepth:    s.AssignmentQueueDepth,
 		CompletionQueueDepth:    s.CompletionQueueDepth,
@@ -324,6 +355,9 @@ func (p *Performance) sample() performanceWindow {
 	s.windowLoadThrottledRequests = 0
 	s.windowLoadUnavailableRequests = 0
 	s.windowStaleLoadRequests = 0
+	s.windowAllocationPlanChecks = 0
+	s.windowAllocationPlanApplies = 0
+	s.windowAllocationPlanNoops = 0
 	s.windowTotalSelectMicros = 0
 	s.windowMaxSelectMicros = 0
 	return window
@@ -354,11 +388,14 @@ func (p *Performance) snapshotLocked() PerformanceSnapshot {
 		StaleLoadRequests:       s.StaleLoadRequests,
 		AverageSelectMicros:     divideInt64(s.TotalSelectMicros, s.SelectionCount),
 		MaxSelectMicros:         s.MaxSelectMicros, LastSelectMicros: s.LastSelectMicros,
-		AssignmentQueueDepth: s.AssignmentQueueDepth,
-		CompletionQueueDepth: s.CompletionQueueDepth,
-		MaxWorkerCPUMillis:   int64(maxCPU),
-		WorkerLoads:          workerLoads,
-		WorkerTelemetry:      workerTelemetry,
+		AssignmentQueueDepth:  s.AssignmentQueueDepth,
+		CompletionQueueDepth:  s.CompletionQueueDepth,
+		AllocationPlanChecks:  s.AllocationPlanChecks,
+		AllocationPlanApplies: s.AllocationPlanApplies,
+		AllocationPlanNoops:   s.AllocationPlanNoops,
+		MaxWorkerCPUMillis:    int64(maxCPU),
+		WorkerLoads:           workerLoads,
+		WorkerTelemetry:       workerTelemetry,
 	}
 	return snapshot
 }

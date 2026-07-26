@@ -247,8 +247,12 @@ func (s *InternalService) armWorkerOfflineLocked(nodeID, sessionID string, incre
 // ---------------------------------------------------------------------------
 
 const (
-	claimBatchWindow  = 5 * time.Millisecond // accumulate window
-	claimBatchMaxSize = 128                  // max claims per Raft entry
+	claimBatchWindow = 5 * time.Millisecond // accumulate window
+	// The remote 90-Pod shape keeps thousands of idle-slot requests queued.
+	// A 128-item ceiling multiplied Raft fsync latency into the limiting stage;
+	// 512 remains a bounded entry while amortizing one consensus round across
+	// enough assignments and completions to keep the execution plane fed.
+	claimBatchMaxSize = 512
 )
 
 func newStoppedTimer() *time.Timer {

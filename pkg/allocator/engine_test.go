@@ -481,7 +481,6 @@ func TestConcurrentReconcileRequestsAreSerialized(t *testing.T) {
 	select {
 	case <-raft.entered:
 		raft.release <- struct{}{}
-		raft.release <- struct{}{}
 		<-done
 		<-done
 		t.Fatal("second reconciliation entered Raft Apply before the first completed")
@@ -490,33 +489,42 @@ func TestConcurrentReconcileRequestsAreSerialized(t *testing.T) {
 	}
 
 	raft.release <- struct{}{}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("first reconciliation: %v", err)
+	for completed := 0; completed < 2; completed++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("reconciliation %d: %v", completed+1, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("serialized reconciliations did not finish")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("first reconciliation did not finish")
 	}
 	select {
 	case <-raft.entered:
-	case <-time.After(time.Second):
-		t.Fatal("second reconciliation did not start after the first completed")
-	}
-	raft.release <- struct{}{}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("second reconciliation: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("second reconciliation did not finish")
+		t.Fatal("second serialized reconciliation wrote an unchanged allocation")
+	default:
 	}
 }
 
 type countingRaftApplier struct {
 	fsm     *raftpkg.FSM
 	applies atomic.Int64
+}
+
+type countingAllocationObserver struct {
+	checks  atomic.Int64
+	applies atomic.Int64
+	noops   atomic.Int64
+}
+
+func (o *countingAllocationObserver) ObserveAllocationPlan(applied, unchanged bool) {
+	o.checks.Add(1)
+	if applied {
+		o.applies.Add(1)
+	}
+	if unchanged {
+		o.noops.Add(1)
+	}
 }
 
 func (c *countingRaftApplier) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {
@@ -527,6 +535,44 @@ func (c *countingRaftApplier) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResu
 
 func (c *countingRaftApplier) IsLeader() bool     { return true }
 func (c *countingRaftApplier) LeaderAddr() string { return "test:7000" }
+
+func TestPeriodicReconcileSkipsUnchangedAllocationRaftApply(t *testing.T) {
+	fsm := newTestFSM()
+	raft := &countingRaftApplier{fsm: fsm}
+	engine := NewEngine("test-node", fsm, raft, zap.NewNop())
+	observer := &countingAllocationObserver{}
+	engine.SetPerformanceObserver(observer)
+	engine.SetLeader(true)
+
+	if err := engine.ReconcileNow(); err != nil {
+		t.Fatal(err)
+	}
+	if got := raft.applies.Load(); got != 1 {
+		t.Fatalf("first allocation wrote %d Raft entries, want one", got)
+	}
+	if err := engine.ReconcileNow(); err != nil {
+		t.Fatal(err)
+	}
+	if got := raft.applies.Load(); got != 1 {
+		t.Fatalf("unchanged periodic allocation wrote %d Raft entries, want one total", got)
+	}
+
+	// The third idle cycle changes the effective plan. Skipping a no-op must
+	// not suppress a real scheduling transition.
+	if err := engine.ReconcileNow(); err != nil {
+		t.Fatal(err)
+	}
+	if got := raft.applies.Load(); got != 2 {
+		t.Fatalf("idle allocation transition wrote %d Raft entries, want two total", got)
+	}
+	if observer.checks.Load() != 3 || observer.applies.Load() != 2 ||
+		observer.noops.Load() != 1 {
+		t.Fatalf(
+			"allocation plan observations = checks:%d applies:%d noops:%d",
+			observer.checks.Load(), observer.applies.Load(), observer.noops.Load(),
+		)
+	}
+}
 
 func TestWorkNotificationsCoalesceBeforeAllocatorRunLoop(t *testing.T) {
 	fsm := newTestFSM()

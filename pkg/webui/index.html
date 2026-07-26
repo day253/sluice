@@ -92,7 +92,7 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
   <aside id="workload-sidebar" class="dashboard-sidebar workload-sidebar" aria-label="Workload controls">
     <section id="load-lab" class="panel load-lab-panel sidebar-panel" aria-labelledby="load-lab-title">
       <div class="panel-head sidebar-head">
-        <div class="sidebar-copy"><div class="sidebar-heading-row"><span class="sidebar-brand-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 3v18M5 7h8a4 4 0 0 1 0 8H5M15 11h5M18 8l3 3-3 3"/></svg></span><div><h2 class="panel-title" id="load-lab-title">Workload builder</h2><div class="panel-kicker">Submit real tasks without leaving the monitoring view.</div></div></div><div class="load-lab-actions"><span class="performance-source">Committed tasks are never canceled</span><button id="load-clear-history" class="btn btn-secondary" type="button">Clear history</button></div></div>
+        <div class="sidebar-copy"><div class="sidebar-heading-row"><span class="sidebar-brand-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 3v18M5 7h8a4 4 0 0 1 0 8H5M15 11h5M18 8l3 3-3 3"/></svg></span><div><h2 class="panel-title" id="load-lab-title">Workload builder</h2><div class="panel-kicker">Submit real tasks without leaving the monitoring view.</div></div></div><div class="load-lab-actions"><span class="performance-source">Committed tasks are never canceled</span></div></div>
         <button id="workload-sidebar-toggle" class="sidebar-toggle" type="button" aria-expanded="true" aria-controls="workload-sidebar-body" aria-label="Collapse workload sidebar" title="Collapse workload sidebar"><span aria-hidden="true">›</span></button>
       </div>
       <div id="workload-sidebar-body" class="panel-body sidebar-body">
@@ -122,16 +122,12 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
             <div class="load-builder-buttons"><button id="load-create-tenants" class="btn btn-secondary load-lab-action" type="button">Create tenants only</button><button id="load-run-custom" class="btn btn-primary load-lab-action" type="button">Create + submit load</button></div>
           </div>
         </div>
-        <div class="sidebar-group sidebar-runtime-group"><div class="sidebar-group-label">Execution</div><div class="load-run-area">
+        <div id="load-run-status" class="sidebar-group sidebar-runtime-group hidden">
           <div class="load-run-box">
-            <div class="load-run-head"><span>Current execution</span><button id="load-stop" class="btn btn-danger hidden" type="button">Stop future submits</button></div>
-            <div id="load-run-current" class="load-run-content"><div class="load-empty">Choose a recipe or compose atomic operations above.</div></div>
+            <div class="load-run-head"><span>Active workload operation</span><button id="load-stop" class="btn btn-danger hidden" type="button">Stop future submits</button></div>
+            <div id="load-run-current" class="load-run-content"></div>
           </div>
-          <div class="load-run-box">
-            <div class="load-run-head"><span>Recent browser executions</span><span>latest 10</span></div>
-            <div id="load-run-history" class="load-history"><div class="load-empty">No workload has run in this browser yet.</div></div>
-          </div>
-        </div></div>
+        </div>
       </div>
     </section>
   </aside>
@@ -160,7 +156,6 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
       <div class="diagnostic-grid" aria-label="Current autoscaling pressure">
         <article class="diagnostic-card"><div class="diagnostic-label">Queue P / R</div><div class="diagnostic-value" id="autoscaling-queue">—</div><div class="diagnostic-note" id="autoscaling-queue-note">Pending / running tasks</div></article>
         <article class="diagnostic-card"><div class="diagnostic-label">Oldest pending</div><div class="diagnostic-value" id="autoscaling-oldest">—</div><div class="diagnostic-note" id="autoscaling-oldest-note">Queue wait age</div></article>
-        <article class="diagnostic-card"><div class="diagnostic-label">Execution</div><div class="diagnostic-value" id="autoscaling-execution">—</div><div class="diagnostic-note" id="autoscaling-execution-note">Running tasks / live slots</div></article>
         <article class="diagnostic-card"><div class="diagnostic-label">Worker CPU</div><div class="diagnostic-value" id="autoscaling-cpu">—</div><div class="diagnostic-note" id="autoscaling-cpu-note">Average / maximum</div></article>
         <article class="diagnostic-card"><div class="diagnostic-label">Telemetry</div><div class="diagnostic-value" id="autoscaling-telemetry">—</div><div class="diagnostic-note" id="autoscaling-telemetry-note">Reporting / live Workers</div></article>
         <article class="diagnostic-card"><div class="diagnostic-label">Tasks S / C</div><div class="diagnostic-value" id="autoscaling-counters">—</div><div class="diagnostic-note" id="autoscaling-counters-note">Submitted / completed counters</div></article>
@@ -226,12 +221,13 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
 
   <section class="panel">
     <div class="panel-head">
-      <div><h2 class="panel-title">Tenant allocation</h2><div class="panel-kicker">Configured limits, current quota and placement by node</div></div>
+      <div><h2 class="panel-title">Tenant allocation</h2><div class="panel-kicker">Configured Limit, current total slots and unfinished tasks · no per-Pod placement details</div></div>
+      <a class="json-link" href="/api/v1/metrics?prefix=allocated-workers%3Atenant%3A&amp;performance=0&amp;current=1" target="_blank" rel="noopener" aria-label="View current tenant allocation totals as JSON">JSON ↗</a>
     </div>
     <div class="table-wrap">
       <table class="data-table">
-        <thead><tr><th>Tenant</th><th>State</th><th>Limit</th><th>Allocated quota</th><th>Unfinished</th><th>Placement</th></tr></thead>
-        <tbody id="tenant-list"><tr><td colspan="6" class="empty">Loading tenants…</td></tr></tbody>
+        <thead><tr><th>Tenant</th><th>State</th><th>Limit</th><th>Allocated slots</th><th>Unfinished</th></tr></thead>
+        <tbody id="tenant-list"><tr><td colspan="5" class="empty">Loading tenants…</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -255,14 +251,15 @@ dialog{border:0;padding:0;border-radius:15px;width:min(460px,calc(100% - 28px));
 <script src="/assets/loadlab.js"></script>
 <script>
 const emptyHistory=()=>({days:Array(30).fill(0),hours:Array(24).fill(0),mins:Array(60).fill(0),secs:Array(60).fill(0)});
-const S={health:null,nodes:[],tenants:[],allocations:[],workerHistories:[],tenantHistories:[],autoscaling:null,performance:null,performanceRaftHistories:[],performanceSchedulerHistories:[],events:[],lastUpdate:null,lastLeader:null,lastOnline:null,editing:null,loadRun:null,loadHistory:[]};
-const LOAD=SluiceLoadLab,LOAD_HISTORY_KEY='sluice.load-lab.history.v1',SIDEBAR_STATE_KEY='sluice.dashboard.sidebars.v1';
-let workerCapacityBusy=false,tenantClearBusy=false,sampleTenantGeneration=0;
+const S={health:null,nodes:[],tenants:[],tenantAllocationTotals:{},nodeAllocationTotals:{},workerHistories:[],tenantHistories:[],autoscaling:null,performance:null,performanceRaftHistories:[],performanceSchedulerHistories:[],events:[],lastUpdate:null,lastLeader:null,lastOnline:null,editing:null,loadRun:null};
+const LOAD=SluiceLoadLab,SIDEBAR_STATE_KEY='sluice.dashboard.sidebars.v1',TOPOLOGY_REFRESH_MS=5000;
+let workerCapacityBusy=false,tenantClearBusy=false,sampleTenantGeneration=0,lastTopologyFetch=0;
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
 const fmt=n=>new Intl.NumberFormat().format(Number(n)||0);
 const historyRing=(values,size)=>Array(Math.max(0,size-(values||[]).length)).fill(0).concat(values||[]).slice(-size).map(Number);
 const metricHistory=metric=>metric?{days:historyRing(metric.days,30),hours:historyRing(metric.hours,24),mins:historyRing(metric.mins,60),secs:historyRing(metric.secs,60)}:emptyHistory();
+const metricCurrent=metric=>Number(metric?.secs?.[metric.secs.length-1]||0);
 const scaleHistory=(history,divisor)=>Object.fromEntries(Object.entries(history).map(([period,values])=>[period,values.map(value=>Number(value||0)/divisor)]));
 const latestHistory=history=>Number(history?.secs?.[history.secs.length-1]||0);
 const chartModels=new Map();
@@ -272,18 +269,13 @@ const compareNodes=(a,b)=>String(a.node_id||'').localeCompare(String(b.node_id||
 const nowTime=()=>new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'});
 
 async function getJSON(path,options){const response=await fetch(path,options);if(!response.ok){let message=response.statusText;try{message=(await response.json()).error||message}catch(_){ }throw new Error(message||`Request failed (${response.status})`)}return response.json()}
-function currentAllocations(){const live=new Set(S.nodes.filter(node=>node.role==='worker'&&node.status==='up').map(node=>node.node_id));return S.allocations.filter(node=>live.has(node.node_id))}
-function allocationsByNode(){const out={};currentAllocations().forEach(node=>out[node.node_id]=node.tenants||{});return out}
-function allocationTotals(){const totals={};currentAllocations().forEach(node=>Object.entries(node.tenants||{}).forEach(([id,count])=>totals[id]=(totals[id]||0)+Number(count||0)));return totals}
-function borrowedTotals(){const totals={};currentAllocations().forEach(node=>Object.entries(node.borrowed||{}).forEach(([id,count])=>totals[id]=(totals[id]||0)+Number(count||0)));return totals}
+function allocationTotals(){return S.tenantAllocationTotals}
 function leaderNode(){const address=S.health?.leader;return S.nodes.find(node=>node.raft_address===address)}
 function addEvent(message){const event={time:nowTime(),message};if(S.events[0]?.message!==message)S.events.unshift(event);S.events=S.events.slice(0,4)}
 const sleep=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
 const loadTerminal=status=>['completed','failed','stopped'].includes(status);
 function loadElapsed(run){const start=new Date(run.startedAt).getTime(),end=run.endedAt?new Date(run.endedAt).getTime():Date.now();return Math.max(0,end-start)}
 function formatDuration(milliseconds){const seconds=Math.max(0,milliseconds)/1000;return seconds<60?`${seconds.toFixed(seconds<10?1:0)}s`:`${Math.floor(seconds/60)}m ${Math.round(seconds%60)}s`}
-function readLoadHistory(){try{const value=JSON.parse(localStorage.getItem(LOAD_HISTORY_KEY)||'[]');return Array.isArray(value)?value.slice(0,10):[]}catch(_){return[]}}
-function persistLoadHistory(){try{localStorage.setItem(LOAD_HISTORY_KEY,JSON.stringify(S.loadHistory.slice(0,10)))}catch(_){}}
 function readSidebarState(){try{const value=JSON.parse(localStorage.getItem(SIDEBAR_STATE_KEY)||'{}');return{config:Boolean(value.config),workload:Boolean(value.workload)}}catch(_){return{config:false,workload:false}}}
 function setSidebarCollapsed(side,collapsed,persist=true){
   const sidebar=$(side==='config'?'config-sidebar':'workload-sidebar'),button=$(side==='config'?'config-sidebar-toggle':'workload-sidebar-toggle'),reopen=$(`${side}-sidebar-reopen`),shell=document.querySelector('.app-shell'),isConfig=side==='config',name=isConfig?'configuration':'workload';
@@ -326,7 +318,7 @@ async function applyWorkerCapacity(){
     const path=allSelected?'/api/v1/admin/nodes/capacity':`/api/v1/admin/nodes/${encodeURIComponent(nodeID)}/capacity`,result=await getJSON(path,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({total_workers:totalWorkers})});
     if(allSelected){addEvent(`${result.updated} live Worker Pods changed to ${result.total_workers} slots`);toast(`${fmt(result.updated)} Worker Pods now have ${fmt(result.total_workers)} Processor slots`)}
     else{addEvent(`Worker ${shortNode(nodeID)} capacity changed to ${result.total_workers}`);toast(`${shortNode(nodeID)} now has ${fmt(result.total_workers)} Processor slots`)}
-    await refresh()
+    await refresh(true)
   }catch(error){toast(`Could not update Worker capacity: ${error.message}`)}
   finally{workerCapacityBusy=false;renderWorkerCapacity(true)}
 }
@@ -345,14 +337,14 @@ function renderRunCard(run){
 }
 let simpleLoadBusy=false;
 function renderLoadRuns(){
-  $('load-run-current').innerHTML=S.loadRun?renderRunCard(S.loadRun):'<div class="load-empty">Choose a recipe or compose atomic operations above.</div>';
+  $('load-run-status').classList.toggle('hidden',!S.loadRun);
+  $('load-run-current').innerHTML=S.loadRun?renderRunCard(S.loadRun):'';
   $('load-stop').classList.toggle('hidden',!S.loadRun||!['preparing','submitting'].includes(S.loadRun.status));
-  $('load-run-history').innerHTML=S.loadHistory.map(run=>`<div class="load-history-row"><div><div class="load-history-name"><span class="run-badge ${esc(run.status)}">${esc(run.status)}</span> ${esc(run.name)}</div><div class="load-history-note">${fmt(run.tenantCount)} tenants · ${fmt(run.submitted)} submitted · ${formatDuration(loadElapsed(run))}</div></div><div class="load-history-metric"><strong>${run.remaining?fmt(run.remaining):run.submitted?fmt(Math.round(run.submitted/(loadElapsed(run)/1000||1))):'—'}</strong><span>${run.remaining?'remaining':'tasks/s'}</span></div><button class="json-link" type="button" data-load-json="${esc(run.id)}" aria-label="View saved workload run as JSON">JSON ↗</button></div>`).join('')||'<div class="load-empty">No workload has run in this browser yet.</div>';
   const busy=Boolean(S.loadRun&&!loadTerminal(S.loadRun.status));document.querySelectorAll('.load-lab-action').forEach(button=>button.disabled=busy||simpleLoadBusy);document.querySelectorAll('.load-control').forEach(button=>button.disabled=busy||simpleLoadBusy||!S.tenants.length);updateLoadBuilderSummary()
 }
 function updateLoadRun(patch){if(!S.loadRun)return;Object.assign(S.loadRun,patch);renderLoadRuns()}
-function finishLoadRun(status,message){if(!S.loadRun)return;Object.assign(S.loadRun,{status,message,endedAt:new Date().toISOString()});S.loadHistory=[structuredClone(S.loadRun),...S.loadHistory.filter(run=>run.id!==S.loadRun.id)].slice(0,10);persistLoadHistory();renderLoadRuns();addEvent(`${S.loadRun.name}: ${status}`)}
-function loadRunByID(id){return S.loadRun?.id===id?S.loadRun:S.loadHistory.find(run=>run.id===id)}
+function finishLoadRun(status,message){if(!S.loadRun)return;Object.assign(S.loadRun,{status,message,endedAt:new Date().toISOString()});renderLoadRuns();addEvent(`${S.loadRun.name}: ${status}`)}
+function loadRunByID(id){return S.loadRun?.id===id?S.loadRun:null}
 function openLoadJSON(id){const run=loadRunByID(id);if(!run)return;const url=URL.createObjectURL(new Blob([JSON.stringify(run,null,2)],{type:'application/json'}));window.open(url,'_blank','noopener');setTimeout(()=>URL.revokeObjectURL(url),30000)}
 async function mapConcurrent(items,concurrency,fn){for(let offset=0;offset<items.length;offset+=concurrency)await Promise.all(items.slice(offset,offset+concurrency).map(fn))}
 async function loadPoolSnapshot(){const tenants=Object.values(await getJSON('/api/v1/admin/tenants'));return tenants.filter(tenant=>String(tenant.id||'').startsWith(LOAD.LIMITS.tenantPrefix))}
@@ -387,7 +379,7 @@ async function monitorLoadDrain(specs){
 }
 async function executeLoad(name,recipe,options,operation){
   if(S.loadRun&&!loadTerminal(S.loadRun.status)){toast('A Load Lab operation is already running');return}
-  let specs;try{const summary=LOAD.summarize(options,name);specs=summary.specs;S.loadRun={id:`load-${Date.now().toString(36)}`,name,recipe,operation,status:'preparing',startedAt:new Date().toISOString(),endedAt:null,tenantCount:summary.tenantCount,totalTasks:operation==='load'?summary.totalTasks:0,prepared:0,submitted:0,failed:0,remaining:0,peakBacklog:0,options:summary.options,tenantSpecs:specs,stopRequested:false,message:'Checking the shared Load Lab tenant pool…'};renderLoadRuns();await ensureLoadPoolIdle();await prepareLoadTenants(specs);if(operation==='tenants'){finishLoadRun('completed',`Created or updated ${fmt(specs.length)} reusable tenants.`);await refresh();return}updateLoadRun({status:'submitting',message:`Submitting ${fmt(S.loadRun.totalTasks)} tasks in round-robin order…`});await submitLoadJobs(specs,summary.options);const stopped=S.loadRun.stopRequested;updateLoadRun({status:'draining',submittedAt:new Date().toISOString(),message:stopped?'Future submissions stopped; draining committed tasks…':'All accepted batches submitted; monitoring unfinished tasks…'});await monitorLoadDrain(specs);const status=stopped?'stopped':S.loadRun.failed?'failed':'completed';finishLoadRun(status,stopped?`Stopped after ${fmt(S.loadRun.submitted)} accepted tasks; committed work drained.`:S.loadRun.failed?`${fmt(S.loadRun.failed)} task submissions failed; accepted work drained.`:`All ${fmt(S.loadRun.submitted)} tasks drained.`);await refresh()}
+  let specs;try{const summary=LOAD.summarize(options,name);specs=summary.specs;S.loadRun={id:`load-${Date.now().toString(36)}`,name,recipe,operation,status:'preparing',startedAt:new Date().toISOString(),endedAt:null,tenantCount:summary.tenantCount,totalTasks:operation==='load'?summary.totalTasks:0,prepared:0,submitted:0,failed:0,remaining:0,peakBacklog:0,options:summary.options,tenantSpecs:specs,stopRequested:false,message:'Checking the shared Load Lab tenant pool…'};renderLoadRuns();await ensureLoadPoolIdle();await prepareLoadTenants(specs);if(operation==='tenants'){finishLoadRun('completed',`Created or updated ${fmt(specs.length)} reusable tenants.`);await refresh(true);return}updateLoadRun({status:'submitting',message:`Submitting ${fmt(S.loadRun.totalTasks)} tasks in round-robin order…`});await submitLoadJobs(specs,summary.options);const stopped=S.loadRun.stopRequested;updateLoadRun({status:'draining',submittedAt:new Date().toISOString(),message:stopped?'Future submissions stopped; draining committed tasks…':'All accepted batches submitted; monitoring unfinished tasks…'});await monitorLoadDrain(specs);const status=stopped?'stopped':S.loadRun.failed?'failed':'completed';finishLoadRun(status,stopped?`Stopped after ${fmt(S.loadRun.submitted)} accepted tasks; committed work drained.`:S.loadRun.failed?`${fmt(S.loadRun.failed)} task submissions failed; accepted work drained.`:`All ${fmt(S.loadRun.submitted)} tasks drained.`);await refresh(true)}
   catch(error){if(S.loadRun)finishLoadRun(S.loadRun.stopRequested?'stopped':'failed',error.message);toast(`Load operation failed: ${error.message}`)}
 }
 
@@ -411,9 +403,9 @@ function renderHeader(){
 }
 
 function renderTenants(){
-  const totals=allocationTotals(),borrowed=borrowedTotals(),byNode=allocationsByNode();
+  const totals=allocationTotals();
   const tenants=[...S.tenants].sort((a,b)=>(Number(b.max_workers||0)-Number(a.max_workers||0))||String(a.name||a.id).localeCompare(String(b.name||b.id),undefined,{numeric:true,sensitivity:'base'}));
-  $('tenant-list').innerHTML=tenants.map(tenant=>{const allocated=totals[tenant.id]||0,borrowedCount=borrowed[tenant.id]||0,limit=Number(tenant.max_workers||0),rate=limit?Math.min(100,Math.round(allocated/limit*100)):0,inflight=Number(tenant.inflight||0),idle=allocated<=1&&!inflight,state=inflight?'Active':idle?'Idle':'Reserved';const placements=S.nodes.filter(node=>node.role==='worker'&&node.status==='up').map(node=>({node:shortNode(node.node_id),count:Number(byNode[node.node_id]?.[tenant.id]||0)})).filter(x=>x.count>0);return `<tr data-tenant="${esc(tenant.id)}"><td><div class="tenant-name">${esc(tenant.name||tenant.id)}</div>${tenant.name&&tenant.name!==tenant.id?`<div class="tenant-id">${esc(tenant.id)}</div>`:''}</td><td><span class="state-badge ${inflight?'queued':idle?'idle':''}"><span class="status-dot"></span>${state}</span></td><td>${fmt(limit)}</td><td class="quota-cell"><div class="quota-line"><strong>${fmt(allocated)}</strong><span>${rate}% of limit${borrowedCount?` · +${fmt(borrowedCount)} borrowed`:''}</span></div><div class="meter"><i style="width:${rate}%"></i></div></td><td><strong>${fmt(inflight)}</strong></td><td><div class="placement">${placements.map(p=>`<span>${esc(p.node)} · ${p.count}</span>`).join('')||'<span>unassigned</span>'}</div></td></tr>`}).join('')||'<tr><td colspan="6" class="empty">No tenants configured.</td></tr>';
+  $('tenant-list').innerHTML=tenants.map(tenant=>{const allocated=totals[tenant.id]||0,limit=Number(tenant.max_workers||0),rate=limit?Math.min(100,Math.round(allocated/limit*100)):0,inflight=Number(tenant.inflight||0),idle=allocated<=1&&!inflight,state=inflight?'Active':idle?'Idle':'Reserved';return `<tr data-tenant="${esc(tenant.id)}"><td><div class="tenant-name">${esc(tenant.name||tenant.id)}</div>${tenant.name&&tenant.name!==tenant.id?`<div class="tenant-id">${esc(tenant.id)}</div>`:''}</td><td><span class="state-badge ${inflight?'queued':idle?'idle':''}"><span class="status-dot"></span>${state}</span></td><td>${fmt(limit)}</td><td class="quota-cell"><div class="quota-line"><strong>${fmt(allocated)}</strong><span>${rate}% of Limit</span></div><div class="meter"><i style="width:${rate}%"></i></div></td><td><strong>${fmt(inflight)}</strong></td></tr>`}).join('')||'<tr><td colspan="5" class="empty">No tenants configured.</td></tr>';
 }
 function renderQuickTenantSelect(){
   const tenants=[...S.tenants].sort((a,b)=>String(a.name||a.id).localeCompare(String(b.name||b.id),undefined,{numeric:true,sensitivity:'base'}));
@@ -431,12 +423,11 @@ function durationUS(value){const us=Number(value||0);if(!us)return '0 ms';const 
 function performanceOperation(name){return S.performance?.current?.raft?.[name]||{}}
 function performanceHistory(name,divisor=1){return scaleHistory(metricHistory(S.performance?.history?.[name]),divisor)}
 function renderAutoscaling(){
-  const signal=S.autoscaling,ids=['autoscaling-queue','autoscaling-oldest','autoscaling-execution','autoscaling-cpu','autoscaling-telemetry','autoscaling-counters'];
+  const signal=S.autoscaling,ids=['autoscaling-queue','autoscaling-oldest','autoscaling-cpu','autoscaling-telemetry','autoscaling-counters'];
   if(!signal){$('autoscaling-source').textContent='Signals unavailable';ids.forEach(id=>$(id).textContent='—');return}
   const observed=signal.observed_at?new Date(signal.observed_at).toLocaleTimeString():'now',source=signal.telemetry_source?` · ${shortNode(signal.telemetry_source)}`:'';$('autoscaling-source').textContent=`Observed ${observed}${source}`;
   $('autoscaling-queue').textContent=`${fmt(signal.pending_tasks)} / ${fmt(signal.running_tasks)}`;$('autoscaling-queue-note').textContent=signal.task_breakdown_valid?'Pending / running tasks':'Task breakdown unavailable';
   $('autoscaling-oldest').textContent=formatDuration(Number(signal.oldest_pending_age_ms||0));$('autoscaling-oldest-note').textContent=Number(signal.pending_tasks||0)?'Age of oldest pending task':'Queue is empty';
-  $('autoscaling-execution').textContent=`${fmt(signal.executing_tasks)} / ${fmt(signal.worker_capacity)}`;$('autoscaling-execution-note').textContent=signal.execution_signals_valid?'Actual running tasks / live slots':'Execution telemetry incomplete';
   const averageCPU=Number(signal.average_worker_cpu_millis||0)/10,maxCPU=Number(signal.max_worker_cpu_millis||0)/10;$('autoscaling-cpu').textContent=`${averageCPU.toFixed(averageCPU>=10?0:1)}% / ${maxCPU.toFixed(maxCPU>=10?0:1)}%`;$('autoscaling-cpu-note').textContent='Average / maximum reported CPU';
   const reporting=Number(signal.reporting_workers||0),instances=Number(signal.worker_instances||0),coverage=instances?Math.round(reporting/instances*100):0;$('autoscaling-telemetry').textContent=`${fmt(reporting)} / ${fmt(instances)}`;$('autoscaling-telemetry-note').textContent=`${coverage}% reporting coverage`;
   $('autoscaling-counters').textContent=`${fmt(signal.submitted_tasks_total)} / ${fmt(signal.completed_tasks_total)}`;$('autoscaling-counters-note').textContent=signal.rate_counters_valid?'Leader-epoch submitted / completed':'Rate counters unavailable';
@@ -461,7 +452,7 @@ function renderPerformance(){
   const assignment=Number(scheduler.assignment_queue_depth||0),completion=Number(scheduler.completion_queue_depth||0);$('performance-queues').textContent=`${fmt(assignment)} · ${fmt(completion)}`;$('performance-queues-note').textContent=`selector avg ${durationUS(scheduler.average_select_us)} · max ${durationUS(scheduler.max_select_us)}`;
   const aware=Number(scheduler.load_aware_requests||0),throttled=Number(scheduler.load_throttled_requests||0),loads=Object.values(scheduler.worker_loads||{}),maxCPU=Number(scheduler.max_worker_cpu_millis||0)/10;$('performance-cpu-admission').textContent=`${fmt(throttled)} / ${fmt(aware)}`;$('performance-cpu-note').textContent=loads.length?`${loads.length} Workers reporting · max ${maxCPU.toFixed(maxCPU>=10?0:1)}% CPU`:'Waiting for Worker feedback';
   S.performanceRaftHistories=[['create_task_batch','Create','#176bdf'],['claim_batch','Claim','#b66508'],['complete_batch','Complete','#14845d']].map(([op,name,color])=>{const history=performanceHistory(`performance:raft:${op}:apply-us`,1000);return{id:op,name,current:latestHistory(history),history,color}}).filter(item=>performanceOperation(item.id).applies||item.current);
-  S.performanceSchedulerHistories=[['performance:scheduler:pending-scanned','Pending scanned'],['performance:scheduler:tasks-selected','Tasks selected'],['performance:scheduler:selection-rate','Selections'],['performance:scheduler:load-throttled-requests','CPU throttled']].map(([key,name])=>{const history=performanceHistory(key);return{id:key,name,current:latestHistory(history),history}});
+  S.performanceSchedulerHistories=[['performance:scheduler:pending-scanned','Pending scanned'],['performance:scheduler:tasks-selected','Tasks selected'],['performance:scheduler:selection-rate','Selections'],['performance:scheduler:allocation-plan-applies','Allocation writes'],['performance:scheduler:allocation-plan-noops','Allocation no-ops']].map(([key,name])=>{const history=performanceHistory(key);return{id:key,name,current:latestHistory(history),history}});
 }
 
 function hideChartHover(canvas){const wrap=canvas.parentElement;wrap.querySelectorAll('.chart-hover-line,.chart-hover-dot,.chart-tooltip').forEach(element=>element.classList.add('hidden'))}
@@ -488,10 +479,12 @@ function drawCharts(){
 
 function renderAll(){renderHeader();renderSummary();renderTenants();renderQuickTenantSelect();renderAutoscaling();renderWorkerLoads();renderPerformance();renderLoadRuns();renderWorkerCapacity();drawCharts()}
 
-async function refresh(){
+async function refresh(forceTopology=false){
   try{
-    const [health,nodes,tenants,allocations,allMetrics,autoscaling,performance]=await Promise.all([getJSON('/api/v1/health'),getJSON('/api/v1/admin/nodes'),getJSON('/api/v1/admin/tenants'),getJSON('/api/v1/admin/allocations'),getJSON('/api/v1/metrics?performance=0'),getJSON('/api/v1/admin/autoscaling').catch(()=>null),getJSON('/api/v1/admin/performance').catch(()=>null)]);
-    S.health=health;S.nodes=[...(nodes.nodes||[])].sort(compareNodes);S.tenants=Object.values(tenants||{});S.allocations=allocations.nodes||[];S.autoscaling=autoscaling;S.performance=performance;const metrics=Array.isArray(allMetrics)?allMetrics:[],byName=Object.fromEntries(metrics.map(metric=>[metric.name,metric])),allocationByNode=Object.fromEntries(S.allocations.map(allocation=>[allocation.node_id,Object.values(allocation.tenants||{}).reduce((sum,count)=>sum+Number(count||0),0)])),executionNodes=S.nodes.filter(node=>node.role==='worker'&&node.status==='up'&&Number(node.total_workers||0)>0);S.workerHistories=executionNodes.map(node=>({id:node.node_id,name:shortNode(node.node_id),current:allocationByNode[node.node_id]||0,limit:Number(node.total_workers||0),history:metricHistory(byName[`allocated-workers:node:${node.node_id}`])}));S.tenantHistories=S.tenants.map(tenant=>({id:tenant.id,name:tenant.name||tenant.id,current:Number(tenant.inflight||0),history:metricHistory(byName[`unfinished:${tenant.id}`])}));
+    const topologyDue=forceTopology||!S.nodes.length||Date.now()-lastTopologyFetch>=TOPOLOGY_REFRESH_MS,topologyRequest=topologyDue?Promise.all([getJSON('/api/v1/admin/nodes'),getJSON('/api/v1/admin/tenants')]):Promise.resolve(null);
+    const [health,unfinishedMetrics,workerMetrics,tenantAllocationMetrics,autoscaling,performance,topology]=await Promise.all([getJSON('/api/v1/health'),getJSON('/api/v1/metrics?prefix=unfinished%3A&performance=0'),getJSON('/api/v1/metrics?prefix=allocated-workers%3Anode%3A&performance=0'),getJSON('/api/v1/metrics?prefix=allocated-workers%3Atenant%3A&performance=0&current=1'),getJSON('/api/v1/admin/autoscaling').catch(()=>null),getJSON('/api/v1/admin/performance').catch(()=>null),topologyRequest]);
+    if(topology){const [nodes,tenants]=topology;S.nodes=[...(nodes.nodes||[])].sort(compareNodes);S.tenants=Object.values(tenants||{});lastTopologyFetch=Date.now()}
+    S.health=health;S.autoscaling=autoscaling;S.performance=performance;const metrics=[...(Array.isArray(unfinishedMetrics)?unfinishedMetrics:[]),...(Array.isArray(workerMetrics)?workerMetrics:[])],byName=Object.fromEntries(metrics.map(metric=>[metric.name,metric]));S.tenantAllocationTotals=Object.fromEntries((Array.isArray(tenantAllocationMetrics)?tenantAllocationMetrics:[]).map(metric=>[metric.name.replace(/^allocated-workers:tenant:/,''),metricCurrent(metric)]));S.nodeAllocationTotals=Object.fromEntries((Array.isArray(workerMetrics)?workerMetrics:[]).map(metric=>[metric.name.replace(/^allocated-workers:node:/,''),metricCurrent(metric)]));S.tenants=S.tenants.map(tenant=>{const metric=byName[`unfinished:${tenant.id}`];return{...tenant,inflight:metric?metricCurrent(metric):Number(tenant.inflight||0)}});const executionNodes=S.nodes.filter(node=>node.role==='worker'&&node.status==='up'&&Number(node.total_workers||0)>0);S.workerHistories=executionNodes.map(node=>({id:node.node_id,name:shortNode(node.node_id),current:S.nodeAllocationTotals[node.node_id]||0,limit:Number(node.total_workers||0),history:metricHistory(byName[`allocated-workers:node:${node.node_id}`])}));S.tenantHistories=S.tenants.map(tenant=>({id:tenant.id,name:tenant.name||tenant.id,current:Number(tenant.inflight||0),history:metricHistory(byName[`unfinished:${tenant.id}`])})).sort((a,b)=>(b.current-a.current)||String(a.name).localeCompare(String(b.name),undefined,{numeric:true,sensitivity:'base'})).slice(0,12);
     const online=S.nodes.filter(n=>n.status==='up').length;if(S.lastOnline!==null&&S.lastOnline!==online)addEvent(`Online members changed: ${S.lastOnline} → ${online}`);S.lastOnline=online;
     if(S.lastLeader&&S.lastLeader!==health.leader)addEvent(`Leader changed to ${leaderNode()?.node_id||health.leader}`);S.lastLeader=health.leader;if(!S.events.length)addEvent('Connected to the control plane');
     S.lastUpdate=new Date();$('connection-banner').classList.add('hidden');renderAll();
@@ -508,13 +501,13 @@ const SUBMIT_BATCH_SIZE=500,SUBMIT_BATCH_CONCURRENCY=4;
 async function submitJobBatch(batch){const response=await fetch('/api/v1/tasks/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tasks:batch.map(job=>({tenant_id:job.tenant,payload:`ui-${Date.now()}-${job.tenant}-${job.index}`}))})});if(!response.ok)throw new Error(`batch request failed (${response.status})`);const body=await response.json();return Array.isArray(body.tasks)?body.tasks.length:batch.length}
 async function submitTasks(tenantIds){const ids=[...new Set(tenantIds)].filter(Boolean),count=quickCount();$('quick-count').value=count;if(!ids.length){toast('No tenants configured');return}const total=count*ids.length,jobs=interleaveTasks(ids,count),roundRobin=ids.length>1;setLoadBusy(true);toast(`Submitting ${fmt(total)} tasks${roundRobin?' in round-robin order':''}…`);let submitted=0,failed=0;try{for(let offset=0;offset<jobs.length;offset+=SUBMIT_BATCH_SIZE*SUBMIT_BATCH_CONCURRENCY){const batches=[];for(let start=offset;start<Math.min(jobs.length,offset+SUBMIT_BATCH_SIZE*SUBMIT_BATCH_CONCURRENCY);start+=SUBMIT_BATCH_SIZE)batches.push(jobs.slice(start,start+SUBMIT_BATCH_SIZE));const results=await Promise.allSettled(batches.map(batch=>submitJobBatch(batch)));results.forEach((result,index)=>{const size=batches[index].length;if(result.status==='fulfilled'){submitted+=Math.min(size,Number(result.value)||0);failed+=Math.max(0,size-(Number(result.value)||0))}else failed+=size})}addEvent(`Submitted ${submitted} tasks to ${ids.length===1?ids[0]:`${ids.length} tenants`}${roundRobin?' in round-robin order':''}`);toast(failed?`${fmt(submitted)} submitted, ${fmt(failed)} failed`:`${fmt(submitted)} tasks submitted`);setTimeout(refresh,600)}finally{setLoadBusy(false)}}
 function randomTenantSeed(){sampleTenantGeneration++;let entropy=0;if(globalThis.crypto?.getRandomValues){const values=new Uint32Array(1);globalThis.crypto.getRandomValues(values);entropy=values[0]}else entropy=Math.floor(Math.random()*0xffffffff);return (entropy^Date.now()^Math.imul(sampleTenantGeneration,0x9e3779b9))>>>0}
-async function seedSampleTenants(){const button=$('seed-tenants'),samples=LOAD.buildRandomTenantConfigs(S.tenants.map(tenant=>tenant.id),randomTenantSeed());button.disabled=true;toast(`Adding ${samples.length} random tenant configs…`);try{const results=await Promise.allSettled(samples.map(tenant=>getJSON(`/api/v1/admin/tenants/${encodeURIComponent(tenant.id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:tenant.name,max_workers:tenant.maxWorkers})}))),failed=results.filter(result=>result.status==='rejected').length,added=samples.length-failed;if(added)addEvent(`Added ${added} random tenant configs`);toast(failed?`${added} random tenants added, ${failed} failed`:`${added} random tenant configs added`);await refresh()}finally{button.disabled=false}}
+async function seedSampleTenants(){const button=$('seed-tenants'),samples=LOAD.buildRandomTenantConfigs(S.tenants.map(tenant=>tenant.id),randomTenantSeed());button.disabled=true;toast(`Adding ${samples.length} random tenant configs…`);try{const results=await Promise.allSettled(samples.map(tenant=>getJSON(`/api/v1/admin/tenants/${encodeURIComponent(tenant.id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:tenant.name,max_workers:tenant.maxWorkers})}))),failed=results.filter(result=>result.status==='rejected').length,added=samples.length-failed;if(added)addEvent(`Added ${added} random tenant configs`);toast(failed?`${added} random tenants added, ${failed} failed`:`${added} random tenant configs added`);await refresh(true)}finally{button.disabled=false}}
 async function clearAllTenants(){
   const count=S.tenants.length;if(!count){toast('No tenants configured');return}
   const unfinished=S.tenants.reduce((sum,tenant)=>sum+Number(tenant.inflight||0),0),warning=unfinished?`\n\n${fmt(unfinished)} unfinished tasks are still visible. The server will refuse the clear until they drain.`:'\n\nCompleted task history, nodes and Worker capacity are preserved.';
   if(!confirm(`Delete all ${fmt(count)} tenant configurations?${warning}`))return;
   tenantClearBusy=true;renderQuickTenantSelect();toast(`Clearing ${fmt(count)} tenants in one Raft commit…`);
-  try{const result=await getJSON('/api/v1/admin/tenants',{method:'DELETE'});addEvent(`Cleared ${result.deleted} tenant configurations`);toast(`${fmt(result.deleted)} tenants cleared`);await refresh()}
+  try{const result=await getJSON('/api/v1/admin/tenants',{method:'DELETE'});addEvent(`Cleared ${result.deleted} tenant configurations`);toast(`${fmt(result.deleted)} tenants cleared`);await refresh(true)}
   catch(error){toast(`Could not clear tenants: ${error.message}`)}
   finally{tenantClearBusy=false;renderQuickTenantSelect()}
 }
@@ -525,18 +518,17 @@ $('load-recipe-list').addEventListener('click',event=>{const button=event.target
 $('load-create-tenants').addEventListener('click',()=>executeLoad('Custom tenant pool','custom',customLoadOptions(),'tenants'));
 $('load-run-custom').addEventListener('click',()=>executeLoad('Custom workload','custom',customLoadOptions(),'load'));
 $('load-stop').addEventListener('click',()=>{if(S.loadRun&&!loadTerminal(S.loadRun.status)){S.loadRun.stopRequested=true;updateLoadRun({message:'Stopping future batches; already committed tasks will continue.'})}});
-$('load-clear-history').addEventListener('click',()=>{S.loadHistory=[];persistLoadHistory();renderLoadRuns()});
 $('worker-capacity-node').addEventListener('change',()=>renderWorkerCapacity(true));
 $('worker-capacity-apply').addEventListener('click',applyWorkerCapacity);
 document.querySelectorAll('#load-tenant-count,#load-tasks-per-tenant,#load-quota,#load-quota-profile,#load-shape,#load-waves').forEach(input=>input.addEventListener('input',updateLoadBuilderSummary));
 $('load-delivery').addEventListener('change',()=>{$('load-waves').disabled=$('load-delivery').value!=='waves';updateLoadBuilderSummary()});
 document.querySelector('.load-lab-panel').addEventListener('click',event=>{const button=event.target.closest('[data-load-json]');if(button)openLoadJSON(button.dataset.loadJson)});
 document.querySelectorAll('[data-close]').forEach(button=>button.addEventListener('click',()=>closeDialog(button.dataset.close)));
-$('tenant-form').addEventListener('submit',async event=>{event.preventDefault();const id=$('tenant-id').value.trim(),name=$('tenant-name').value.trim()||id,max_workers=Number($('tenant-limit').value)||50;try{await getJSON(`/api/v1/admin/tenants/${encodeURIComponent(id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,max_workers})});addEvent(`${S.editing?'Updated':'Created'} tenant ${id}`);closeDialog('tenant-dialog');toast(`Tenant ${id} saved`);await refresh()}catch(error){toast(`Could not save tenant: ${error.message}`)}});
-$('delete-tenant').addEventListener('click',async()=>{const id=S.editing;if(!id||!confirm(`Delete tenant ${id}?`))return;try{await getJSON(`/api/v1/admin/tenants/${encodeURIComponent(id)}`,{method:'DELETE'});addEvent(`Deleted tenant ${id}`);closeDialog('tenant-dialog');toast(`Tenant ${id} deleted`);await refresh()}catch(error){toast(`Could not delete tenant: ${error.message}`)}});
+$('tenant-form').addEventListener('submit',async event=>{event.preventDefault();const id=$('tenant-id').value.trim(),name=$('tenant-name').value.trim()||id,max_workers=Number($('tenant-limit').value)||50;try{await getJSON(`/api/v1/admin/tenants/${encodeURIComponent(id)}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,max_workers})});addEvent(`${S.editing?'Updated':'Created'} tenant ${id}`);closeDialog('tenant-dialog');toast(`Tenant ${id} saved`);await refresh(true)}catch(error){toast(`Could not save tenant: ${error.message}`)}});
+$('delete-tenant').addEventListener('click',async()=>{const id=S.editing;if(!id||!confirm(`Delete tenant ${id}?`))return;try{await getJSON(`/api/v1/admin/tenants/${encodeURIComponent(id)}`,{method:'DELETE'});addEvent(`Deleted tenant ${id}`);closeDialog('tenant-dialog');toast(`Tenant ${id} deleted`);await refresh(true)}catch(error){toast(`Could not delete tenant: ${error.message}`)}});
 
 const chartObserver=new ResizeObserver(drawCharts);chartObserver.observe($('workers-chart'));chartObserver.observe($('tenant-unfinished-chart'));chartObserver.observe($('performance-raft-chart'));chartObserver.observe($('performance-scheduler-chart'));
-initializeSidebars();S.loadHistory=readLoadHistory();renderLoadRecipes();renderLoadRuns();refresh();setInterval(()=>{if(!document.hidden)refresh()},1000);
+initializeSidebars();renderLoadRecipes();renderLoadRuns();refresh();setInterval(()=>{if(!document.hidden)refresh()},1000);
 </script>
 </body>
 </html>

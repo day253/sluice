@@ -26,6 +26,7 @@ type loadLabBrowserAPI struct {
 	capacityWrites    int
 	allCapacityWrites int
 	clearTenantWrites int
+	allocationReads   int
 }
 
 func newLoadLabBrowserAPI() *loadLabBrowserAPI {
@@ -68,6 +69,9 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			},
 		}})
 	case r.URL.Path == "/api/v1/admin/allocations":
+		a.mu.Lock()
+		a.allocationReads++
+		a.mu.Unlock()
 		writeBrowserJSON(w, map[string]any{"nodes": []map[string]any{
 			{"node_id": "worker-0", "tenants": map[string]int{}},
 			{"node_id": "worker-retained", "tenants": map[string]int{"ghost": 100}},
@@ -560,7 +564,7 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 		t.Fatal(err)
 	}
 	var capacity, allocated, nodeSummary, workerLegend, cpuAdmission, cpuNote string
-	var queuePressure, executionPressure, cpuPressure, telemetryCoverage string
+	var queuePressure, cpuPressure, telemetryCoverage string
 	if err := chromedp.Run(ctx,
 		chromedp.Text("#metric-capacity", &capacity, chromedp.ByQuery),
 		chromedp.Text("#metric-allocated", &allocated, chromedp.ByQuery),
@@ -569,7 +573,6 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 		chromedp.Text("#performance-cpu-admission", &cpuAdmission, chromedp.ByQuery),
 		chromedp.Text("#performance-cpu-note", &cpuNote, chromedp.ByQuery),
 		chromedp.Text("#autoscaling-queue", &queuePressure, chromedp.ByQuery),
-		chromedp.Text("#autoscaling-execution", &executionPressure, chromedp.ByQuery),
 		chromedp.Text("#autoscaling-cpu", &cpuPressure, chromedp.ByQuery),
 		chromedp.Text("#autoscaling-telemetry-note", &telemetryCoverage, chromedp.ByQuery),
 	); err != nil {
@@ -578,12 +581,12 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	if capacity != "100" || allocated != "0" || nodeSummary != "2" ||
 		strings.Contains(workerLegend, "worker-retained") ||
 		cpuAdmission != "3 / 12" || !strings.Contains(cpuNote, "max 72% CPU") ||
-		queuePressure != "7 / 5" || executionPressure != "5 / 100" ||
+		queuePressure != "7 / 5" ||
 		cpuPressure != "42% / 72%" || telemetryCoverage != "100% reporting coverage" {
 		t.Fatalf(
-			"live Worker UI capacity=%q allocated=%q nodes=%q legend=%q CPU=%q note=%q autoscaling=%q %q %q %q",
+			"live Worker UI capacity=%q allocated=%q nodes=%q legend=%q CPU=%q note=%q autoscaling=%q %q %q",
 			capacity, allocated, nodeSummary, workerLegend, cpuAdmission, cpuNote,
-			queuePressure, executionPressure, cpuPressure, telemetryCoverage,
+			queuePressure, cpuPressure, telemetryCoverage,
 		)
 	}
 	if err := chromedp.Run(ctx,
@@ -661,7 +664,7 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	})()`, &jsonControls)); err != nil {
 		t.Fatal(err)
 	}
-	if jsonControls.Count != 10 || !jsonControls.AllCompact ||
+	if jsonControls.Count != 9 || !jsonControls.AllCompact ||
 		!jsonControls.AllLabels || jsonControls.LegacyCount != 0 ||
 		jsonControls.MaxHeight > 14 {
 		t.Fatalf("JSON controls are not uniformly compact: %+v", jsonControls)
@@ -684,11 +687,13 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	defer api.mu.Unlock()
 	if len(api.tenants) != 0 || api.submitted != 7 ||
 		len(api.idempotencyKey) != 6 || api.capacityWrites != 1 ||
-		api.allCapacityWrites != 1 || api.clearTenantWrites != 1 {
+		api.allCapacityWrites != 1 || api.clearTenantWrites != 1 ||
+		api.allocationReads != 0 {
 		t.Fatalf(
-			"browser operations = %d tenants, %d tasks, %d keys, %d single/%d all capacity writes, %d tenant clears",
+			"browser operations = %d tenants, %d tasks, %d keys, %d single/%d all capacity writes, %d tenant clears, %d allocation reads",
 			len(api.tenants), api.submitted, len(api.idempotencyKey),
 			api.capacityWrites, api.allCapacityWrites, api.clearTenantWrites,
+			api.allocationReads,
 		)
 	}
 }

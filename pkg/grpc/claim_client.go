@@ -30,11 +30,12 @@ const (
 	// same time. The credits are released after acknowledgement, not after
 	// business execution, so they bound control-plane pressure without capping
 	// worker throughput.
-	// 32 lets four active Worker streams fill one 128-item Raft batch. The old
-	// value 8 required at least sixteen active nodes even when a smaller number
-	// of nodes owned hundreds of execution slots, fragmenting Claim/Complete
-	// into extra consensus round trips. Assignment and result credits remain
-	// separate, so this bounds each node to 64 pending control-plane requests.
+	// 32 keeps each node bounded while sixteen active Worker streams can fill
+	// the current 512-item Raft batch. The old value 8 required at least
+	// sixteen active nodes even for the historical 128-item ceiling, fragmenting
+	// Claim/Complete when a smaller number of nodes owned hundreds of execution
+	// slots. Assignment and result credits remain separate, so this bounds each
+	// node to 64 pending control-plane requests.
 	workerRequestCredits = 32
 )
 

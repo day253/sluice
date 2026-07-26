@@ -147,6 +147,18 @@ func (v *VarHistory) Query() VarData {
 	}
 }
 
+// Current returns the most recently committed one-second value without
+// copying all 174 historical samples.
+func (v *VarHistory) Current() int64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	index := v.secIdx - 1
+	if index < 0 {
+		index = len(v.secRing) - 1
+	}
+	return v.secRing[index]
+}
+
 // VarData is the JSON response payload.
 type VarData struct {
 	Secs  []int64 `json:"secs"`

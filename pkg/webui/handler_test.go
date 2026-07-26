@@ -23,7 +23,7 @@ func TestDashboardIncludesPerformanceVisualizationAndJSONLink(t *testing.T) {
 		`id="performance-raft-chart"`,
 		`id="performance-scheduler-chart"`,
 		`href="/api/v1/admin/performance"`,
-		`getJSON('/api/v1/metrics?performance=0')`,
+		`getJSON('/api/v1/metrics?prefix=allocated-workers%3Atenant%3A&performance=0&current=1')`,
 		`getJSON('/api/v1/admin/performance')`,
 	} {
 		if !strings.Contains(body, fragment) {
@@ -74,6 +74,8 @@ func TestDashboardChartsExposeRawJSONLinks(t *testing.T) {
 		`aria-label="View worker allocation history as JSON"`,
 		`href="/api/v1/metrics?prefix=unfinished%3A&amp;performance=0"`,
 		`aria-label="View unfinished task history as JSON"`,
+		`href="/api/v1/metrics?prefix=allocated-workers%3Atenant%3A&amp;performance=0&amp;current=1"`,
+		`aria-label="View current tenant allocation totals as JSON"`,
 		`aria-label="View performance diagnostics as JSON"`,
 		`aria-label="View Raft Apply history as JSON"`,
 		`aria-label="View scheduler history as JSON"`,
@@ -101,7 +103,6 @@ func TestDashboardUsesOneCompactJSONLinkStyle(t *testing.T) {
 		`.json-link{display:inline-flex;align-items:center;border:0;background:transparent;`,
 		`padding:0;font-size:10px;`,
 		`aria-label="View current workload run as JSON">JSON ↗</button>`,
-		`aria-label="View saved workload run as JSON">JSON ↗</button>`,
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Errorf("dashboard is missing compact JSON control fragment %q", fragment)
@@ -111,6 +112,7 @@ func TestDashboardUsesOneCompactJSONLinkStyle(t *testing.T) {
 		`btn-link`,
 		`chart-json-link`,
 		`load-run-json`,
+		`View saved workload run as JSON`,
 		`View JSON ↗`,
 		`View raw JSON ↗`,
 	} {
@@ -168,13 +170,45 @@ func TestWorkerChartUsesOnlyCurrentLiveWorkerNodes(t *testing.T) {
 		t.Fatalf("dashboard is missing live execution-role chart filter %q", fragment)
 	}
 	for _, fragment := range []string{
-		`function currentAllocations(){const live=new Set(S.nodes.filter(node=>node.role==='worker'&&node.status==='up')`,
+		`S.nodeAllocationTotals[node.node_id]||0`,
+		`getJSON('/api/v1/metrics?prefix=allocated-workers%3Anode%3A&performance=0')`,
 		`const capacity=liveWorkers.reduce((sum,node)=>sum+Number(node.total_workers||0),0)`,
 		`S.workerHistories.reduce((sum,item)=>sum+item.limit,0)`,
-		`S.nodes.filter(node=>node.role==='worker'&&node.status==='up').map`,
 	} {
 		if !strings.Contains(recorder.Body.String(), fragment) {
 			t.Fatalf("dashboard current Worker mirror is missing %q", fragment)
+		}
+	}
+}
+
+func TestDashboardUsesAggregateTenantSlotsWithoutPlacementMatrix(t *testing.T) {
+	handler := Handler(http.NotFoundHandler())
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	body := recorder.Body.String()
+	for _, fragment := range []string{
+		`<th>Limit</th><th>Allocated slots</th><th>Unfinished</th>`,
+		`current total slots and unfinished tasks · no per-Pod placement details`,
+		`S.tenantAllocationTotals`,
+		`totals[tenant.id]||0`,
+		`sort((a,b)=>(Number(b.max_workers||0)-Number(a.max_workers||0))`,
+		`prefix=allocated-workers%3Atenant%3A&performance=0&current=1`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Errorf("aggregate tenant-slot mirror is missing %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{
+		`/api/v1/admin/allocations`,
+		`S.allocations`,
+		`<th>Placement</th>`,
+		`placement-chip`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("dashboard still exposes per-Pod allocation detail %q", forbidden)
 		}
 	}
 }

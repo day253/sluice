@@ -148,7 +148,7 @@ func TestLoadLabBuildsBoundedUniqueRandomTenantConfigs(t *testing.T) {
 	}
 }
 
-func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
+func TestDashboardExposesAtomicLoadLabAndOnlyTheActiveOperation(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	Handler(http.NotFoundHandler()).ServeHTTP(
 		recorder,
@@ -160,7 +160,7 @@ func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
 	for _, fragment := range []string{
 		`id="load-lab"`, `Atomic workload builder`,
 		`id="load-create-tenants"`, `id="load-run-custom"`,
-		`id="load-run-current"`, `id="load-run-history"`,
+		`id="load-run-status"`, `id="load-run-current"`,
 		`id="load-stop"`, `data-load-json=`,
 		`id="worker-capacity-node"`, `id="worker-capacity-value"`,
 		`id="worker-capacity-apply"`, `Processor slots`,
@@ -170,7 +170,7 @@ func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
 		`id="performance-cpu-admission"`, `CPU admission`,
 		`load_throttled_requests`, `worker_loads`,
 		`id="autoscaling-title"`, `Autoscaling pressure`,
-		`id="autoscaling-queue"`, `id="autoscaling-execution"`,
+		`id="autoscaling-queue"`, `id="autoscaling-cpu"`,
 		`id="autoscaling-telemetry"`, `/api/v1/admin/autoscaling`,
 		`idempotency_key:`, `buildRoundRobinJobs`,
 		`Add random tenants`, `buildRandomTenantConfigs`,
@@ -178,6 +178,17 @@ func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
 	} {
 		if !strings.Contains(recorder.Body.String(), fragment) {
 			t.Errorf("dashboard is missing Load Lab fragment %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{
+		`id="load-run-history"`,
+		`id="load-clear-history"`,
+		`Clear history`,
+		`id="autoscaling-execution"`,
+		`View saved workload run as JSON`,
+	} {
+		if strings.Contains(recorder.Body.String(), forbidden) {
+			t.Errorf("dashboard still exposes removed execution history %q", forbidden)
 		}
 	}
 }
@@ -365,7 +376,7 @@ func TestDashboardUsesShadcnStyleSidebarShell(t *testing.T) {
 		`class="sidebar-config-section sidebar-group"`,
 		`class="sidebar-group sidebar-recipe-group"`,
 		`class="sidebar-group-label">Load presets`,
-		`class="sidebar-group sidebar-runtime-group"`,
+		`class="sidebar-group sidebar-runtime-group hidden"`,
 	} {
 		if !strings.Contains(page, fragment) {
 			t.Errorf("shadcn-style sidebar shell is missing %q", fragment)

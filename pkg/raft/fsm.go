@@ -24,18 +24,22 @@ const maxRetainedTaskResults = 10000
 //
 // Reads from other goroutines must acquire the read lock via exported accessors.
 type FSM struct {
-	mu      sync.RWMutex
-	state   *types.FSMState
-	pending *pendingIndex
-	logger  *zap.Logger
+	mu                 sync.RWMutex
+	state              *types.FSMState
+	pending            *pendingIndex
+	inflight           *inflightIndex
+	unfinishedByTenant map[string]int
+	logger             *zap.Logger
 }
 
 // NewFSM creates a ready-to-use FSM with an empty state.
 func NewFSM(logger *zap.Logger) *FSM {
 	return &FSM{
-		state:   types.NewFSMState(),
-		pending: newPendingIndex(),
-		logger:  logger,
+		state:              types.NewFSMState(),
+		pending:            newPendingIndex(),
+		inflight:           newInflightIndex(),
+		unfinishedByTenant: make(map[string]int),
+		logger:             logger,
 	}
 }
 
@@ -172,10 +176,7 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	}
 
 	f.state = &state
-	f.pending = newPendingIndex()
-	for _, task := range state.Tasks {
-		f.pending.add(task)
-	}
+	f.rebuildTaskIndexes()
 	f.logger.Info("fsm: state restored from snapshot",
 		zap.Uint64("version", state.Version),
 		zap.Int("tenants", len(state.Tenants)),
@@ -183,6 +184,40 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 		zap.Int("repaired_completed_tasks", repairedTasks),
 	)
 	return nil
+}
+
+// rebuildTaskIndexes reconstructs current-only task counters from durable task
+// truth after snapshot restore. These indexes are deliberately absent from the
+// serialized FSM state so an older snapshot cannot make them authoritative.
+// The caller holds f.mu.
+func (f *FSM) rebuildTaskIndexes() {
+	f.pending = newPendingIndex()
+	f.inflight = newInflightIndex()
+	f.unfinishedByTenant = make(map[string]int)
+	for _, task := range f.state.Tasks {
+		f.pending.add(task)
+		f.inflight.add(task)
+		f.addUnfinished(task)
+	}
+}
+
+// addUnfinished and removeUnfinished maintain the rebuildable per-tenant
+// current mirror while the caller holds f.mu.
+func (f *FSM) addUnfinished(task *types.TaskRecord) {
+	if task != nil {
+		f.unfinishedByTenant[task.TenantID]++
+	}
+}
+
+func (f *FSM) removeUnfinished(task *types.TaskRecord) {
+	if task == nil {
+		return
+	}
+	if f.unfinishedByTenant[task.TenantID] <= 1 {
+		delete(f.unfinishedByTenant, task.TenantID)
+		return
+	}
+	f.unfinishedByTenant[task.TenantID]--
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +435,7 @@ func (f *FSM) applyNodeDown(data json.RawMessage) interface{} {
 	reQueued := 0
 	for _, task := range f.state.Tasks {
 		if task.NodeID == req.ID && task.Status == types.TaskStatusInflight {
+			f.inflight.remove(task)
 			task.Status = types.TaskStatusPending
 			task.NodeID = ""
 			task.ClaimedAt = time.Time{}
@@ -514,6 +550,7 @@ func (f *FSM) insertPendingTask(req CreateTaskData) bool {
 	}
 	f.state.Tasks[req.TaskID] = record
 	f.pending.add(record)
+	f.addUnfinished(record)
 	return true
 }
 
@@ -525,8 +562,12 @@ func (f *FSM) applyClaimTask(data json.RawMessage) interface{} {
 
 	now := time.Now().UTC()
 	if _, completed := f.state.Results[req.TaskID]; completed {
-		f.pending.remove(f.state.Tasks[req.TaskID])
-		delete(f.state.Tasks, req.TaskID)
+		if task := f.state.Tasks[req.TaskID]; task != nil {
+			f.pending.remove(task)
+			f.inflight.remove(task)
+			f.removeUnfinished(task)
+			delete(f.state.Tasks, req.TaskID)
+		}
 		return fmt.Errorf("task %s already completed", req.TaskID)
 	}
 
@@ -541,12 +582,13 @@ func (f *FSM) applyClaimTask(data json.RawMessage) interface{} {
 		existing.NodeID = req.NodeID
 		existing.ClaimedAt = now
 		existing.Payload = req.Payload
+		f.inflight.add(existing)
 		return nil
 	}
 
 	// Fresh claim — the payload is being promoted from the local queue into
 	// the Raft log, giving it cluster-wide durability.
-	f.state.Tasks[req.TaskID] = &types.TaskRecord{
+	record := &types.TaskRecord{
 		TaskID:    req.TaskID,
 		TenantID:  req.TenantID,
 		Status:    types.TaskStatusInflight,
@@ -555,6 +597,9 @@ func (f *FSM) applyClaimTask(data json.RawMessage) interface{} {
 		CreatedAt: now,
 		ClaimedAt: now,
 	}
+	f.state.Tasks[req.TaskID] = record
+	f.inflight.add(record)
+	f.addUnfinished(record)
 	return nil
 }
 
@@ -596,8 +641,12 @@ func (f *FSM) applyClaimBatch(data json.RawMessage) interface{} {
 	now := time.Now().UTC()
 	for _, t := range req.Tasks {
 		if _, completed := f.state.Results[t.TaskID]; completed {
-			f.pending.remove(f.state.Tasks[t.TaskID])
-			delete(f.state.Tasks, t.TaskID)
+			if task := f.state.Tasks[t.TaskID]; task != nil {
+				f.pending.remove(task)
+				f.inflight.remove(task)
+				f.removeUnfinished(task)
+				delete(f.state.Tasks, t.TaskID)
+			}
 			result.Failed = append(result.Failed, t.TaskID)
 			continue
 		}
@@ -612,11 +661,12 @@ func (f *FSM) applyClaimBatch(data json.RawMessage) interface{} {
 			existing.NodeID = t.NodeID
 			existing.ClaimedAt = now
 			existing.Payload = t.Payload
+			f.inflight.add(existing)
 			result.Claimed = append(result.Claimed, t.TaskID)
 			continue
 		}
 		// Fresh claim.
-		f.state.Tasks[t.TaskID] = &types.TaskRecord{
+		record := &types.TaskRecord{
 			TaskID:    t.TaskID,
 			TenantID:  t.TenantID,
 			Status:    types.TaskStatusInflight,
@@ -625,6 +675,9 @@ func (f *FSM) applyClaimBatch(data json.RawMessage) interface{} {
 			CreatedAt: now,
 			ClaimedAt: now,
 		}
+		f.state.Tasks[t.TaskID] = record
+		f.inflight.add(record)
+		f.addUnfinished(record)
 		result.Claimed = append(result.Claimed, t.TaskID)
 	}
 	return result
@@ -657,6 +710,7 @@ func (f *FSM) applyRequeueTasks(data json.RawMessage) interface{} {
 		if !ok || task.Status != types.TaskStatusInflight {
 			continue
 		}
+		f.inflight.remove(task)
 		task.Status = types.TaskStatusPending
 		task.NodeID = ""
 		task.ClaimedAt = time.Time{}
@@ -678,6 +732,8 @@ func (f *FSM) finishTask(req CompleteTaskData, status string, completedAt time.T
 		return
 	}
 	f.pending.remove(task)
+	f.inflight.remove(task)
+	f.removeUnfinished(task)
 	delete(f.state.Tasks, req.TaskID)
 
 	tenantID := task.TenantID
@@ -817,6 +873,81 @@ func (f *FSM) GetAllAllocations() map[string]*types.NodeAllocation {
 	return out
 }
 
+// AllocationInputSnapshot is the allocator's coherent current-state input. It
+// intentionally excludes task records and payloads: scheduling needs only
+// node/tenant configuration plus rebuildable task-pressure indexes.
+type AllocationInputSnapshot struct {
+	Nodes         map[string]*types.NodeInfo
+	Tenants       map[string]*types.TenantConfig
+	Unfinished    map[string]int
+	Pending       map[string]int
+	OldestPending map[string]time.Time
+}
+
+func (f *FSM) GetAllocationInputSnapshot() AllocationInputSnapshot {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	snapshot := AllocationInputSnapshot{
+		Nodes:         make(map[string]*types.NodeInfo, len(f.state.Nodes)),
+		Tenants:       make(map[string]*types.TenantConfig, len(f.state.Tenants)),
+		Unfinished:    make(map[string]int, len(f.unfinishedByTenant)),
+		Pending:       f.pending.countsPerTenant(),
+		OldestPending: f.pending.oldestCreatedAtPerTenant(),
+	}
+	for nodeID, node := range f.state.Nodes {
+		copyNode := *node
+		snapshot.Nodes[nodeID] = &copyNode
+	}
+	for tenantID, tenant := range f.state.Tenants {
+		copyTenant := *tenant
+		snapshot.Tenants[tenantID] = &copyTenant
+	}
+	for tenantID, count := range f.unfinishedByTenant {
+		snapshot.Unfinished[tenantID] = count
+	}
+	return snapshot
+}
+
+// AllocationsEqual compares a candidate current allocation with replicated
+// state under one read lock. It lets the allocator skip a large Raft entry
+// when a periodic safety tick recomputes the same plan.
+func (f *FSM) AllocationsEqual(candidate map[string]*types.NodeAllocation) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if len(candidate) != len(f.state.Allocations) {
+		return false
+	}
+	for nodeID, expected := range candidate {
+		actual, ok := f.state.Allocations[nodeID]
+		if !ok || !nodeAllocationEqual(actual, expected) {
+			return false
+		}
+	}
+	return true
+}
+
+func nodeAllocationEqual(left, right *types.NodeAllocation) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if left.NodeID != right.NodeID ||
+		len(left.Tenants) != len(right.Tenants) ||
+		len(left.Borrowed) != len(right.Borrowed) {
+		return false
+	}
+	for tenantID, workers := range left.Tenants {
+		if actual, ok := right.Tenants[tenantID]; !ok || actual != workers {
+			return false
+		}
+	}
+	for tenantID, workers := range left.Borrowed {
+		if actual, ok := right.Borrowed[tenantID]; !ok || actual != workers {
+			return false
+		}
+	}
+	return true
+}
+
 // AllocatedWorkersForTenants returns current allocation totals only for the
 // requested tenants. It avoids cloning the full node×tenant allocation mirror
 // on the submission hot path.
@@ -917,14 +1048,7 @@ func (f *FSM) FindStealablePendingTasks(excludeTenantID string, before time.Time
 func (f *FSM) FindStaleInflightTaskIDs(before time.Time) []string {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	var taskIDs []string
-	for taskID, task := range f.state.Tasks {
-		if task.Status == types.TaskStatusInflight && !task.ClaimedAt.IsZero() && task.ClaimedAt.Before(before) {
-			taskIDs = append(taskIDs, taskID)
-		}
-	}
-	sort.Strings(taskIDs)
-	return taskIDs
+	return f.inflight.staleTaskIDs(before)
 }
 
 // CountUnfinishedPerTenant returns the number of inflight + pending tasks per
@@ -932,9 +1056,9 @@ func (f *FSM) FindStaleInflightTaskIDs(before time.Time) []string {
 func (f *FSM) CountUnfinishedPerTenant() map[string]int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	out := make(map[string]int)
-	for _, t := range f.state.Tasks {
-		out[t.TenantID]++
+	out := make(map[string]int, len(f.unfinishedByTenant))
+	for tenantID, count := range f.unfinishedByTenant {
+		out[tenantID] = count
 	}
 	return out
 }
@@ -943,13 +1067,7 @@ func (f *FSM) CountUnfinishedPerTenant() map[string]int {
 func (f *FSM) CountPendingPerTenant() map[string]int {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	out := make(map[string]int)
-	for _, t := range f.state.Tasks {
-		if t.Status == types.TaskStatusPending {
-			out[t.TenantID]++
-		}
-	}
-	return out
+	return f.pending.countsPerTenant()
 }
 
 // TaskPressureSnapshot reads O(1) current gauges from the rebuildable pending
@@ -980,17 +1098,7 @@ func (f *FSM) TaskPressureSnapshot() types.TaskPressureSnapshot {
 func (f *FSM) OldestPendingCreatedAtByTenant() map[string]time.Time {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	out := make(map[string]time.Time)
-	for _, task := range f.state.Tasks {
-		if task.Status != types.TaskStatusPending {
-			continue
-		}
-		oldest, ok := out[task.TenantID]
-		if !ok || task.CreatedAt.Before(oldest) {
-			out[task.TenantID] = task.CreatedAt
-		}
-	}
-	return out
+	return f.pending.oldestCreatedAtPerTenant()
 }
 
 // MetricsSnapshot is a lightweight view used by the 1-second collector. It
@@ -1021,8 +1129,8 @@ func (f *FSM) GetMetricsSnapshot() MetricsSnapshot {
 			snapshot.AllocatedWorkersByNode[nodeID] = 0
 		}
 	}
-	for _, task := range f.state.Tasks {
-		snapshot.Unfinished[task.TenantID]++
+	for tenantID, count := range f.unfinishedByTenant {
+		snapshot.Unfinished[tenantID] = int64(count)
 	}
 	for nodeID, allocation := range f.state.Allocations {
 		for tenantID, count := range allocation.Tenants {

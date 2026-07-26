@@ -176,6 +176,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 	// ---- Allocator engine ----
 	n.allocEngine = allocator.NewEngine(cfg.NodeID, cluster.FSM(), bridge, logger)
+	n.allocEngine.SetPerformanceObserver(n.performance)
 
 	// ---- Tenant manager ----
 	n.tenantMgr = tenant.NewManager(cluster.FSM(), bridge, logger)
@@ -1058,6 +1059,15 @@ func (a metricsAdapter) Query(name, includePrefix, excludePrefix string) ([]api.
 			Name: d.Name, Labels: d.Labels,
 			Secs: d.Secs, Mins: d.Mins, Hours: d.Hours, Days: d.Days,
 		}
+	}
+	return out, len(out)
+}
+
+func (a metricsAdapter) QueryCurrent(name, includePrefix, excludePrefix string) ([]api.MetricsData, int) {
+	data := a.c.QueryNamedCurrentFiltered(name, includePrefix, excludePrefix)
+	out := make([]api.MetricsData, len(data))
+	for i, d := range data {
+		out[i] = api.MetricsData{Name: d.Name, Labels: d.Labels, Secs: d.Secs}
 	}
 	return out, len(out)
 }

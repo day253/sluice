@@ -113,18 +113,20 @@ type pendingNodeTenantKey struct {
 // pendingIndex is a derived, rebuildable view. It is never serialized in an
 // FSM snapshot and never serves as task state truth.
 type pendingIndex struct {
-	all          *pendingTreeNode
-	byTenant     map[string]*pendingTreeNode
-	byNode       map[string]*pendingTreeNode
-	byNodeTenant map[pendingNodeTenantKey]*pendingTreeNode
-	count        int
+	all           *pendingTreeNode
+	byTenant      map[string]*pendingTreeNode
+	countByTenant map[string]int
+	byNode        map[string]*pendingTreeNode
+	byNodeTenant  map[pendingNodeTenantKey]*pendingTreeNode
+	count         int
 }
 
 func newPendingIndex() *pendingIndex {
 	return &pendingIndex{
-		byTenant:     make(map[string]*pendingTreeNode),
-		byNode:       make(map[string]*pendingTreeNode),
-		byNodeTenant: make(map[pendingNodeTenantKey]*pendingTreeNode),
+		byTenant:      make(map[string]*pendingTreeNode),
+		countByTenant: make(map[string]int),
+		byNode:        make(map[string]*pendingTreeNode),
+		byNodeTenant:  make(map[pendingNodeTenantKey]*pendingTreeNode),
 	}
 }
 
@@ -135,6 +137,7 @@ func (p *pendingIndex) add(task *types.TaskRecord) {
 	key := pendingKeyFor(task)
 	p.all = insertPendingTree(p.all, key)
 	p.byTenant[task.TenantID] = insertPendingTree(p.byTenant[task.TenantID], key)
+	p.countByTenant[task.TenantID]++
 	if task.QueueNodeID != "" {
 		p.byNode[task.QueueNodeID] = insertPendingTree(p.byNode[task.QueueNodeID], key)
 		bucket := pendingNodeTenantKey{nodeID: task.QueueNodeID, tenantID: task.TenantID}
@@ -152,6 +155,11 @@ func (p *pendingIndex) remove(task *types.TaskRecord) {
 	p.byTenant[task.TenantID] = deletePendingTree(p.byTenant[task.TenantID], key)
 	if p.byTenant[task.TenantID] == nil {
 		delete(p.byTenant, task.TenantID)
+	}
+	if p.countByTenant[task.TenantID] <= 1 {
+		delete(p.countByTenant, task.TenantID)
+	} else {
+		p.countByTenant[task.TenantID]--
 	}
 	if task.QueueNodeID != "" {
 		p.byNode[task.QueueNodeID] = deletePendingTree(p.byNode[task.QueueNodeID], key)
@@ -182,6 +190,28 @@ func (p *pendingIndex) oldestCreatedAt(state *types.FSMState) time.Time {
 		return time.Time{}
 	}
 	return task.CreatedAt
+}
+
+func (p *pendingIndex) countsPerTenant() map[string]int {
+	out := make(map[string]int, len(p.countByTenant))
+	for tenantID, count := range p.countByTenant {
+		out[tenantID] = count
+	}
+	return out
+}
+
+func (p *pendingIndex) oldestCreatedAtPerTenant() map[string]time.Time {
+	out := make(map[string]time.Time, len(p.byTenant))
+	for tenantID, root := range p.byTenant {
+		node := root
+		for node != nil && node.left != nil {
+			node = node.left
+		}
+		if node != nil {
+			out[tenantID] = time.Unix(0, node.key.createdAt).UTC()
+		}
+	}
+	return out
 }
 
 type pendingIterator struct {

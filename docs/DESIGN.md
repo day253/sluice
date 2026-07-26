@@ -273,7 +273,7 @@
          b. preferred tenant 的任意节点队列
          c. 本节点其他 tenant
          d. 已等待超过 5s 的任意 tenant（work steal）
-4. 批量: Leader 跨所有节点流全局聚批(5ms/最多128条) → raft.Apply(OpClaimBatch)
+4. 批量: Leader 跨所有节点流全局聚批(5ms/最多512条) → raft.Apply(OpClaimBatch)
          原子提交 task: pending→inflight、NodeID=执行节点
 5. 返回: Leader → AssignmentStream → 已提交的 task_id/tenant/payload
 6. 执行: Stateless Worker 只处理 Leader 返回的已提交任务
@@ -335,7 +335,7 @@ Allocator (Leader, 每 3s):
 Stateless workers                        Control Leader
      │                                     │
      │──Assignment(node, preferred)───────►│  每个请求代表一个空闲槽位
-     │──Assignment(node, preferred)───────►│  跨全部节点流全局聚批 5ms / 128
+     │──Assignment(node, preferred)───────►│  跨全部节点流全局聚批 5ms / 512
      │                                     │  从全局 FIFO pending 中选不同 task
      │                                     │  raft.Apply(OpClaimBatch)
      │                                     │  pending→inflight + execution NodeID
@@ -345,8 +345,8 @@ Stateless workers                        Control Leader
 ```
 
 Leader 只有一个 Assignment dispatcher：来自所有节点流的空闲槽位先进入同一 5ms
-窗口，最多 128 条请求只读一次 pending/allocation 并提交一条 `OpClaimBatch`。提交结果
-再路由回原节点流，每条流按 5ms/128 条合并响应。这样 Raft 往返次数随总吞吐增长，而不
+窗口，最多 512 条请求只读一次 pending/allocation 并提交一条 `OpClaimBatch`。提交结果
+再路由回原节点流，每条流按 5ms/512 条合并响应。这样 Raft 往返次数随总吞吐增长，而不
 随节点流数量线性增长；也保证“读 pending、选不同 task、提交 ClaimBatch”不会被另一个
 节点流交叉重复选择。ResultStream 同样使用跨所有节点流的全局 dispatcher，把完成状态
 合并为 `OpCompleteBatch`，避免大量节点分别提交完成日志。
@@ -355,8 +355,8 @@ Leader 只有一个 Assignment dispatcher：来自所有节点流的空闲槽位
 Worker 可以按 allocation 全量并发执行，但一个节点同时等待 Raft 确认的拉取和完成请求
 分别最多 32 个；确认后立即释放 credit 给下一个空闲 Worker，因此这个窗口只限制控制面
 排队，不限制 Processor 并发。N 个执行节点的 Leader 未决请求上界分别为 `32N`，
-Assignment 与 Result 合计最多 `64N`。四条活跃 Worker 流即可填满一个 128 条 Raft
-批次，同时仍按全局 128 条切分日志，避免 4900 Worker 同时启动形成无界请求尖峰。
+Assignment 与 Result 合计最多 `64N`。十六条活跃 Worker 流即可填满一个 512 条 Raft
+批次，同时仍按全局 512 条切分日志，避免数万逻辑槽同时启动形成无界请求尖峰。
 
 Raft FSM 仍保留最终防线：若状态已变化，未成功 claim 的任务不会返回给 Worker。响应
 丢失时任务保持 inflight，30 秒 lease 到期后由 Leader 重新放回 pending。Assignment 和
@@ -468,8 +468,8 @@ Worker 只通过内部流接收任务与报告结果。
    在 30 秒 Claim lease 到期后回到 pending，最终状态只提交一次。
 7. **有界活性**：Leader 优先同 tenant/同节点队列，再使用本节点其他 tenant 的任务；
    跨节点 steal 只兜底等待超过 5 秒的任务，且选择过程不产生 Worker Claim 风暴。
-8. **控制面背压**：单节点 Assignment/Result 未决请求各不超过 8；每条 Claim/Complete
-   Raft 日志不超过 128 个任务。单请求等待不能关闭同节点其他健康请求共用的流。
+8. **控制面背压**：单节点 Assignment/Result 未决请求各不超过 32；每条 Claim/Complete
+   Raft 日志不超过 512 个任务。单请求等待不能关闭同节点其他健康请求共用的流。
 9. **共识规模有界**：单 shard voter/总成员数不超过 control 配置；Worker 扩容不改变
    membership。迁移旧超大集合必须先转移 leadership，再 demote/remove 多余 replica；
    删除旧 Node 镜像不提前重派 inflight。
@@ -545,15 +545,15 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   该节点共享的 Claim/Assignment/Result 三条流。Leader 已提交但响应接收者消失的任务只
   能等待 lease，重连后的 4900 个请求又形成下一轮尖峰。
 - **修复**：初版每节点 Assignment/Result 各使用 8-credit 未决窗口，PERF-003 在保持
-  有界的前提下扩为当前 32；已发送请求不再用固定客户端 deadline 破坏共享流；Leader
-  将 Claim/Complete Raft 日志统一限制为 128 条。
+  有界的前提下扩为当前 32；已发送请求不再用固定客户端 deadline 破坏共享流。初版
+  Claim/Complete 上限为 128，PERF-005 在相同有界/ACK-after-commit 语义下提高为 512。
 - **不变量**：Leader 仍唯一选择并提交 task→node，credit 只限制等待共识的控制请求，
   不降低 allocation 或 Processor 并发；连接/Leader 失败仍取消整条流，未知提交仍走
   30 秒 lease。没有新增任务转移、取消执行或 Processor exactly-once 语义。
 - **回归覆盖**：`TestClaimClientBoundsPerNodeRaftRequests` 在服务端故意不确认时验证每类
-  只有当前 credit 上限的请求且流不重建；`TestInternalServiceBoundsGlobalRaftBatchSize` 固定 128 上限；
+  只有当前 credit 上限的请求且流不重建；`TestInternalServiceBoundsGlobalRaftBatchSize` 固定 512 上限；
   真实 8 节点 `TestNodeCreditsDrainProductionWorkerFanoutWithoutLeaseRecovery` 启动 4900 个
-  执行 Worker、处理 4096 个任务，断言所有 Raft 批次不超过 128、lease 前排空、每任务
+  执行 Worker、处理 4096 个任务，断言所有 Raft 批次不超过 512、lease 前排空、每任务
   只执行一次且没有超时重连或 lease 回收。
 
 ### SCHED-005：大量一槽 idle tenant 挤满第一个 Worker 实例
@@ -600,6 +600,9 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   timeout/lease recovery 且每任务只处理一次；批次均值受 5ms 内 goroutine 到达时序和
   race instrumentation 影响，只记录诊断，远程固定
   5 control/50 Worker/4 tenant/20000 条基线单独记录在 PERF。
+- **后续变更**：以上 128 是 PERF-003 当时的发布边界；PERF-005 后当前上限为 512，
+  确定性填批 Case 相应改为十六条 stream×32 credits。保留本段是为了记录从
+  8→32 credit 的历史原因，不再把 128 描述为当前协议上限。
 
 ### PERF-001：2 万任务被共识规模、重复存储和重复扫描共同拖慢
 
@@ -736,9 +739,10 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 ### UI-006：原始 JSON 入口统一为紧凑链接
 
 - **需求**：Autoscaling、Worker allocation、Unfinished tasks、Performance 顶层诊断、两张
-  Performance 子图以及 Load Lab 当前/历史 run 的 JSON 入口统一显示为 `JSON ↗` 小号文本
-  链接。标题栏不再使用带边框、内边距和按钮高度的 `View JSON` 大按钮；负载记录也不再维护
-  独立的 9px 样式。
+  Performance 子图以及当时的 Load Lab current/history run JSON 入口统一显示为
+  `JSON ↗` 小号文本链接。标题栏不再使用带边框、内边距和按钮高度的 `View JSON` 大按钮；
+  负载记录也不再维护独立的 9px 样式。UI-008 后只保留当前 operation JSON，saved history
+  已按新需求删除。
 - **交互与可访问性**：HTTP JSON 使用同一 `json-link` anchor 样式并继续
   `target="_blank" rel="noopener"`；浏览器本地 run JSON 使用同一视觉样式的 button，
   继续通过 Blob 新页打开。视觉文案统一，但每个入口保留描述具体数据源的 `aria-label`，
@@ -749,7 +753,7 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **回归覆盖**：`pkg/webui.TestDashboardUsesOneCompactJSONLinkStyle` 固定唯一 class、10px、
   零 border/padding、统一文案并禁止三套旧样式；真实 Chrome
   `TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON` 在静态诊断链接和动态
-  current/history run 都出现后检查全部入口的 computed size、class、文案和旧控件数量。
+  当时 current/history run 都出现后检查全部入口；UI-008 的回归改为只要求 current。
 
 ### UI-007：按 Worker Pod 展示当前执行负载
 
@@ -777,6 +781,30 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   验证自然名称排序、72%/12% CPU、running/capacity、Raft limit、fresh 状态、down 排除和
   可滚动表格。同已有 `test/integration.TestLeaderAssignmentUsesWorkerCPULoadFeedback`
   继续保证真实 3-voter/Follower/Worker 路径产生的负载反馈与 Leader-only 调度正确性。
+
+### UI-008：租户槽位聚合替代 node×tenant 分配详情
+
+- **问题与需求**：90 Worker、数百 tenant 时，`Tenant allocation` 每秒读取约 1.18MiB
+  的 `/admin/allocations`，在浏览器构造完整 placement chip 矩阵；这既不是主监控所需，
+  也放大 Leader/网络/DOM 开销。主表现在只按 Limit 降序展示 tenant、状态、Limit、
+  当前聚合 `Allocated slots` 和 unfinished，不再展示每 Pod 分配详情。
+- **数据语义**：每租户槽位来自既有 `allocated-workers:tenant:<id>` collector 指标的
+  最新一秒。`current=1` 在复制 ring 前只返回一个 `secs` 值，其他历史数组为空；这是
+  allocation 当前镜像的轻量读法，不新增长期存储。Worker allocation 和 unfinished 两张
+  主图仍分别保留 174 点。nodes/tenants 拓扑每 5 秒刷新，负载、历史和性能继续每秒刷新。
+- **负载操作状态**：空的 `Execution`/saved run history 和含义含混的 `Clear history`
+  被删除；只在当前 Load Lab operation 存在时显示状态、Stop 与 current JSON。浏览器不再
+  把最近 run 写入 `localStorage`。这不清理 server task/history，也不影响 durable accepted
+  task 的继续处理。
+- **正确性与非目标**：生产 `/admin/allocations` 保留给部署校验和显式诊断，WebUI 不再
+  轮询它。聚合值只读，不能用于 task→node ownership、capacity 校验或调度反馈；Leader
+  仍提交完整 allocation 镜像。页面变化不改变租户 Limit、借用、unfinished 历史、Raft
+  或任务生命周期。
+- **回归覆盖**：组件测试固定聚合列/current-only URL/Limit 排序并禁止 placement、
+  `S.allocations`、allocation endpoint、saved history 和 Clear history；真实 Chrome
+  完整创建/提交/排空 Case 要求 allocation endpoint 读取次数为 0、只出现当前 operation
+  JSON 且所有 JSON 控件保持紧凑。真实三 voter诊断 Case 验证 Follower 上 current-only
+  tenant allocation 恰好一个点，同时保留完整 174 点 unfinished。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 
@@ -860,6 +888,40 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   tenant 零额外日志；真实 `TestDurableSubmissionWakesIdleAllocator` 把 periodic tick 延长
   为一小时，经 Follower HTTP、Leader Raft、Allocator、allocation push 和 Worker 验证
   2 秒内唤醒、20 条任务最终各处理一次。
+
+### PERF-005：大积压下重复全量复制、扫描并提交 allocation 镜像
+
+- **现象证据**：远程单机 MicroK8s 为 5 control、90 stateless Worker、约 284 tenant、
+  200000 个任务。逻辑容量是 90000 槽，但宿主机只有 16 个 CPU；Leader 的
+  `GetState` 每 3 秒深拷贝所有 unfinished task/payload，随后 allocator、metrics collector
+  和 tenant API 又分别遍历任务。即使计划不变，allocator 仍每轮提交约 1.18MiB 的
+  90×284 allocation 镜像；页面还每秒读取同一完整矩阵。同期
+  Create/Claim/Complete Apply 平均约 1.36～1.70 秒，控制面无法及时喂满逻辑 Worker。
+- **当前状态与历史边界**：durable task map 仍是 unfinished 生命周期真相。FSM 新增
+  `unfinishedByTenant`，pending 索引同时维护 per-tenant count/oldest，另以 Claim 时间树
+  索引 inflight lease；它们都是可重建的当前镜像，不写 Raft、不进 Snapshot、不形成
+  174 点历史，Restore 必须从 durable tasks 完整重建。lease 检查只遍历已经到期的少量
+  inflight，不再为了找超时 claim 扫过全部 pending。`GetAllocationInputSnapshot` 只复制
+  node、tenant 和聚合计数，不复制 task ID、payload 或 result。Collector 仍把 unfinished
+  与 allocation 聚合值采样为 174 点有界历史。
+- **allocation 写入规则**：Leader 仍周期性和事件驱动地计算完整计划；候选与已提交
+  `FSMState.Allocations` 完全相等时只记一次 process-local no-op，跳过
+  `OpUpdateAllocation`。任意 node、tenant、effective 或 borrowed 值变化仍由唯一 Leader
+  用一条完整 Raft command 原子替换；Apply 失败保留旧镜像，不能把本地候选当成已提交。
+- **批处理边界**：Claim/Complete 的全局 entry 上限由 128 提到 512，仍受 5ms 窗口、
+  每节点每类 32 credits 和所有 stream 合计未决数约束。Worker 只执行 Leader 已选择且
+  Raft Apply 成功的 task，Result 只在 final-state Apply 后 ACK；未知结果继续由 30 秒
+  lease 恢复。十六条 stream×32 credits 的确定性单测锁定一次 512-item Apply。
+- **观测与非目标**：`allocation_plan_checks/applies/noops` 的累计当前值和每秒 174 点
+  历史只存在 Leader 进程与 metrics collector，不写 FSM，也不反馈调度。这个 Case 不改变
+  tenant Limit、work-steal、借用、Processor、任务 lease、最终状态语义或单 shard 架构，
+  也没有把 90000 逻辑槽冒充 90000 CPU 核；更高持续吞吐仍需按最新基线评估 Multi-Raft。
+- **回归覆盖**：FSM 单测覆盖 Create/Claim/Requeue/Complete/重复完成及 Snapshot Restore
+  后统计与 claim lease 索引一致；allocator 单测要求相同计划不调用 Raft、变化计划仍提交；gRPC 单测
+  固定 512-item 全局批次；metrics/API 单测固定 current-only 一点响应与 allocation
+  观测。真实三 voter Case 经 Follower HTTP 提交 2000 条、阻塞 40 个 Processor 保持积压，
+  每轮读取 tenants/174 点/current-only metrics，要求 plan no-op 多于 Apply、Raft
+  allocation Apply 与观测一致，释放后每任务恰好执行一次且 unfinished=0。
 
 ### CAPACITY-001：单个 Worker 实例的可配置 Processor 并发
 
@@ -1308,27 +1370,28 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   仍有 unfinished，拒绝覆盖；Stop 只停止未来批次，已经 durable accepted 的任务继续
   排空。
 - **状态与持久化**：当前 run 显示 preparing/submitting/draining/completed/failed/
-  stopped、提交/失败/剩余/峰值/耗时；浏览器只在 `localStorage` 保留最近 10 条 run JSON。
-  这不是集群事实、Raft 数据或服务端测试记录；刷新或换浏览器不能把它当审计日志。集群的
-  tenant/task 最终状态仍由生产 API/Raft 决定。
+  stopped、提交/失败/剩余/峰值/耗时。初版曾在 `localStorage` 保留最近 10 条 run JSON；
+  UI-008 已删除这份易误解的浏览器历史，现在只保留当前页面内的 operation。两种状态都
+  不是集群事实、Raft 数据或服务端测试记录；集群 tenant/task 最终状态仍由生产 API/Raft
+  决定。
 - **非目标**：不是批量导入文件、不是服务端场景 runner、不能取消 committed task，也不
   承诺浏览器保持打开之外的 wave 定时精度。大于安全上限的压测继续使用版本化 benchmark。
 - **回归覆盖**：纯 JS 组件测试固定稳定 tenant ID、100×200、hotspot、wave、安全上限和
   首轮每 tenant 一条；真实 Chrome E2E 从页面点击创建 3 tenant、轮转提交 6 条并检查
-  status/JSON/idempotency。`TestAtomicHundredTenantLoadThroughFollowerHTTP` 用 100 个
+  当前 status/JSON/idempotency，且不读取 allocation 详情。`TestAtomicHundredTenantLoadThroughFollowerHTTP` 用 100 个
   tenant 经真实 Follower HTTP、三 voter Raft、Allocator/Worker/final state 验证每 tenant
   两条、每 task 一次且最终 unfinished=0。
 
 ### UI-LOAD-002：写操作侧栏与只读监控主区
 
 - **初始界面边界**：桌面布局先把单 tenant/all tenant 快速加任务、样例 tenant、tenant
-  新建/修改、负载 recipe、自定义 workload、执行历史以及实例并发配置从主区移入 sticky
+  新建/修改、负载 recipe、自定义 workload、当时的执行状态以及实例并发配置从主区移入 sticky
   sidebar。主区只显示集群摘要、Worker 分配、tenant unfinished、autoscaling/performance
   信号和 tenant allocation 表，不在表格行内混入加任务或编辑入口。UI-LOAD-003 在保留
   该只读主区边界的前提下继续把这一个混合侧栏拆成左右两类。
 - **响应式行为**：宽屏侧栏固定在 topbar 下并独立滚动，监控主区持续可见；窄于 900px
   时不再强行挤压图表，监控主区排在 workload builder 前面。布局变化不改变每秒轮询、
-  174 点历史、JSON 链接、任务提交顺序、浏览器执行历史或任何 Raft/FSM 数据。
+  174 点历史、JSON 链接、任务提交顺序、当前负载 operation 或任何 Raft/FSM 数据。
 - **回归覆盖**：组件测试固定 sidebar→monitoring 的 DOM 边界，要求所有写入口都属于
   sidebar 且主区表格只读；真实 Chrome 使用 1440px viewport 验证两栏几何关系、核心
   图表归属和主表无写按钮，并继续完成 tenant 创建、Worker capacity 修改与 round-robin

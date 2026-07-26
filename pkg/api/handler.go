@@ -586,6 +586,15 @@ func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("performance") == "0" {
 		excludePrefix = "performance:"
 	}
+	if r.URL.Query().Get("current") == "1" {
+		if current, ok := h.collector.(interface {
+			QueryCurrent(name, includePrefix, excludePrefix string) ([]MetricsData, int)
+		}); ok {
+			data, _ := current.QueryCurrent(name, includePrefix, excludePrefix)
+			h.writeJSON(w, http.StatusOK, data)
+			return
+		}
+	}
 	data, _ := h.collector.Query(name, includePrefix, excludePrefix)
 	h.writeJSON(w, http.StatusOK, data)
 }
