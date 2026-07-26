@@ -164,12 +164,14 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tasks := make([]map[string]any, 0, len(request.Tasks))
 		a.mu.Lock()
 		for index, task := range request.Tasks {
-			if task.IdempotencyKey == "" || a.idempotencyKey[task.IdempotencyKey] {
+			if task.IdempotencyKey != "" && a.idempotencyKey[task.IdempotencyKey] {
 				a.mu.Unlock()
-				http.Error(w, `{"error":"missing or duplicate idempotency key"}`, http.StatusConflict)
+				http.Error(w, `{"error":"duplicate idempotency key"}`, http.StatusConflict)
 				return
 			}
-			a.idempotencyKey[task.IdempotencyKey] = true
+			if task.IdempotencyKey != "" {
+				a.idempotencyKey[task.IdempotencyKey] = true
+			}
 			a.submitted++
 			tasks = append(tasks, map[string]any{
 				"task_id":   fmt.Sprintf("task-%d-%d", a.submitted, index),
@@ -204,6 +206,7 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 			chromedp.Flag("headless", true),
 			chromedp.Flag("disable-gpu", true),
 			chromedp.Flag("no-sandbox", true),
+			chromedp.WindowSize(1440, 1000),
 		)...,
 	)
 	defer cancelAllocator()
@@ -212,15 +215,48 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	ctx, cancel := context.WithTimeout(browserContext, 25*time.Second)
 	defer cancel()
 
+	var layout struct {
+		LoadInSidebar      bool    `json:"loadInSidebar"`
+		ChartsInMonitoring bool    `json:"chartsInMonitoring"`
+		LoadInMonitoring   bool    `json:"loadInMonitoring"`
+		WriteInTable       bool    `json:"writeInTable"`
+		SidebarLeft        float64 `json:"sidebarLeft"`
+		SidebarRight       float64 `json:"sidebarRight"`
+		MonitoringLeft     float64 `json:"monitoringLeft"`
+	}
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
 		chromedp.WaitVisible("#load-lab", chromedp.ByQuery),
+		chromedp.Evaluate(`(() => {
+			const sidebar = document.querySelector("#workload-sidebar");
+			const monitoring = document.querySelector("#monitoring-main");
+			const sideRect = sidebar.getBoundingClientRect();
+			const monitoringRect = monitoring.getBoundingClientRect();
+			return {
+				loadInSidebar: sidebar.contains(document.querySelector("#load-lab")) &&
+					sidebar.contains(document.querySelector("#add-one")) &&
+					sidebar.contains(document.querySelector("#add-all")),
+				chartsInMonitoring: monitoring.contains(document.querySelector("#workers-chart")) &&
+					monitoring.contains(document.querySelector("#tenant-unfinished-chart")),
+				loadInMonitoring: monitoring.contains(document.querySelector("#load-lab")),
+				writeInTable: Boolean(document.querySelector("#tenant-list [data-action=load]")),
+				sidebarLeft: sideRect.left,
+				sidebarRight: sideRect.right,
+				monitoringLeft: monitoringRect.left,
+			};
+		})()`, &layout),
 		chromedp.SetValue("#load-tenant-count", "3", chromedp.ByQuery),
 		chromedp.SetValue("#load-tasks-per-tenant", "2", chromedp.ByQuery),
 		chromedp.SetValue("#load-quota", "4", chromedp.ByQuery),
 		chromedp.Click("#load-create-tenants", chromedp.ByQuery),
 	); err != nil {
 		t.Fatal(err)
+	}
+	if !layout.LoadInSidebar || !layout.ChartsInMonitoring ||
+		layout.LoadInMonitoring || layout.WriteInTable ||
+		layout.SidebarLeft >= layout.MonitoringLeft ||
+		layout.SidebarRight > layout.MonitoringLeft {
+		t.Fatalf("dashboard workload/monitor layout = %+v", layout)
 	}
 	var capacity, allocated, nodeSummary, workerLegend, cpuAdmission, cpuNote string
 	var queuePressure, executionPressure, cpuPressure, telemetryCoverage string
@@ -258,7 +294,19 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	waitForWorkerCapacity(t, ctx, api, 7, 8*time.Second)
 	waitForLoadLabStatus(t, ctx, "completed", 8*time.Second)
 
-	if err := chromedp.Run(ctx, chromedp.Click("#load-run-custom", chromedp.ByQuery)); err != nil {
+	if err := chromedp.Run(ctx,
+		chromedp.SetValue("#quick-tenant", "load-lab-001", chromedp.ByQuery),
+		chromedp.SetValue("#quick-count", "1", chromedp.ByQuery),
+		chromedp.Click("#add-one", chromedp.ByQuery),
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitForSubmitted(t, api, 1, 5*time.Second)
+
+	if err := chromedp.Run(ctx,
+		chromedp.WaitEnabled("#load-run-custom", chromedp.ByQuery),
+		chromedp.Click("#load-run-custom", chromedp.ByQuery),
+	); err != nil {
 		t.Fatal(err)
 	}
 	waitForLoadLabStatus(t, ctx, "completed", 10*time.Second)
@@ -272,13 +320,31 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	}
 	api.mu.Lock()
 	defer api.mu.Unlock()
-	if len(api.tenants) != 3 || api.submitted != 6 ||
+	if len(api.tenants) != 3 || api.submitted != 7 ||
 		len(api.idempotencyKey) != 6 || api.capacityWrites != 1 {
 		t.Fatalf(
 			"browser operations = %d tenants, %d tasks, %d keys, %d capacity writes",
 			len(api.tenants), api.submitted, len(api.idempotencyKey), api.capacityWrites,
 		)
 	}
+}
+
+func waitForSubmitted(t *testing.T, api *loadLabBrowserAPI, want int, deadline time.Duration) {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		api.mu.Lock()
+		got := api.submitted
+		api.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	api.mu.Lock()
+	got := api.submitted
+	api.mu.Unlock()
+	t.Fatalf("submitted tasks = %d, want %d", got, want)
 }
 
 func waitForWorkerCapacity(

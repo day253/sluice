@@ -129,6 +129,67 @@ func TestDashboardExposesAtomicLoadLabAndExecutionHistory(t *testing.T) {
 	}
 }
 
+func TestDashboardKeepsWorkloadWritesInSidebarAndMonitoringMainReadOnly(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	Handler(http.NotFoundHandler()).ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/", nil),
+	)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d", recorder.Code)
+	}
+
+	page := recorder.Body.String()
+	sidebarStart := strings.Index(page, `<aside id="workload-sidebar"`)
+	sidebarEnd := strings.Index(page, `</aside>`)
+	monitoringStart := strings.Index(page, `<div id="monitoring-main"`)
+	if sidebarStart < 0 || sidebarEnd <= sidebarStart || monitoringStart <= sidebarEnd {
+		t.Fatalf(
+			"dashboard regions are not ordered sidebar then monitoring: sidebar=%d..%d monitoring=%d",
+			sidebarStart,
+			sidebarEnd,
+			monitoringStart,
+		)
+	}
+
+	sidebar := page[sidebarStart:sidebarEnd]
+	for _, fragment := range []string{
+		`id="load-lab"`,
+		`id="quick-tenant"`,
+		`id="quick-count"`,
+		`id="add-one"`,
+		`id="add-all"`,
+		`id="seed-tenants"`,
+		`id="open-tenant"`,
+		`id="edit-tenant"`,
+		`id="load-run-custom"`,
+	} {
+		if !strings.Contains(sidebar, fragment) {
+			t.Errorf("workload sidebar is missing write control %q", fragment)
+		}
+	}
+
+	monitoring := page[monitoringStart:strings.Index(page, `</main>`)]
+	for _, fragment := range []string{
+		`Worker allocation by instance`,
+		`Unfinished tasks by tenant`,
+		`Tenant allocation`,
+	} {
+		if !strings.Contains(monitoring, fragment) {
+			t.Errorf("monitoring main is missing %q", fragment)
+		}
+	}
+	for _, fragment := range []string{
+		`id="load-lab"`,
+		`data-action="load"`,
+		`id="add-all"`,
+	} {
+		if strings.Contains(monitoring, fragment) {
+			t.Errorf("monitoring main still contains workload write control %q", fragment)
+		}
+	}
+}
+
 func TestLoadLabAssetIsServedAsJavaScript(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	Handler(http.NotFoundHandler()).ServeHTTP(

@@ -1071,3 +1071,18 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   status/JSON/idempotency。`TestAtomicHundredTenantLoadThroughFollowerHTTP` 用 100 个
   tenant 经真实 Follower HTTP、三 voter Raft、Allocator/Worker/final state 验证每 tenant
   两条、每 task 一次且最终 unfinished=0。
+
+### UI-LOAD-002：写操作侧栏与只读监控主区
+
+- **界面边界**：桌面布局把单 tenant/all tenant 快速加任务、样例 tenant、tenant
+  新建/修改、负载 recipe、自定义 workload、执行历史以及实例并发配置统一放进左侧
+  `Workload builder`。右侧主区只显示集群摘要、Worker 分配、tenant unfinished、
+  autoscaling/performance 信号和 tenant allocation 表，不在表格行内混入加任务或编辑
+  入口。
+- **响应式行为**：宽屏侧栏固定在 topbar 下并独立滚动，监控主区持续可见；窄于 900px
+  时不再强行挤压图表，监控主区排在 workload builder 前面。布局变化不改变每秒轮询、
+  174 点历史、JSON 链接、任务提交顺序、浏览器执行历史或任何 Raft/FSM 数据。
+- **回归覆盖**：组件测试固定 sidebar→monitoring 的 DOM 边界，要求所有写入口都属于
+  sidebar 且主区表格只读；真实 Chrome 使用 1440px viewport 验证两栏几何关系、核心
+  图表归属和主表无写按钮，并继续完成 tenant 创建、Worker capacity 修改与 round-robin
+  任务提交，防止只改外观却破坏真实入口。
