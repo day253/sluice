@@ -78,6 +78,7 @@ type PerformanceObserver interface {
 	ObservePendingSelection(scanned, selected int, duration time.Duration)
 	SetDispatcherQueueDepths(assignment, completion int)
 	ObserveWorkerLoad(nodeID string, cpuMillis, runningTasks, capacity int, observedAt time.Time)
+	ObserveWorkerTelemetry(nodeID string, cpuMillis, runningTasks, capacity int, observedAt time.Time)
 	ObserveLoadAdmission(loadAware, throttled, unavailable, stale int)
 }
 
@@ -472,6 +473,7 @@ func (s *InternalService) AssignmentStream(stream grpcv1.SluiceInternal_Assignme
 
 	pendingResponses := 0
 	receiving := true
+	var lastLoadObservedAt time.Time
 
 	for {
 		select {
@@ -488,9 +490,13 @@ func (s *InternalService) AssignmentStream(stream grpcv1.SluiceInternal_Assignme
 				}
 				continue
 			}
+			receivedAt := time.Now().UTC()
+			lastLoadObservedAt = s.observeAssignmentLoad(
+				request, receivedAt, lastLoadObservedAt,
+			)
 			job := assignmentJob{
 				ctx: stream.Context(), request: request,
-				receivedAt: time.Now().UTC(), outcome: outcomes,
+				receivedAt: receivedAt, outcome: outcomes,
 			}
 			select {
 			case s.assignmentJobs <- job:
@@ -787,9 +793,36 @@ func (s *InternalService) dispatchAssignments(batch []assignmentJob) {
 
 const (
 	assignmentLoadFreshness       = 2 * time.Second
+	workerLoadObservationInterval = 250 * time.Millisecond
 	assignmentCPUTargetMillis     = 850
 	assignmentOverloadProbePeriod = time.Second
 )
+
+// observeAssignmentLoad records the Worker current-state mirror when its
+// request reaches the Leader, before dispatcher queueing can make the sample
+// ineligible for scheduling. Observation is bounded to the CPU sampler cadence
+// per node stream and never feeds back into Raft or assignment decisions.
+func (s *InternalService) observeAssignmentLoad(
+	request *grpcv1.AssignmentRequest,
+	observedAt, lastObservedAt time.Time,
+) time.Time {
+	if s.performance == nil || request == nil || request.NodeId == "" ||
+		!request.CpuLoadValid || request.CpuUtilizationMillis < 0 ||
+		request.CpuUtilizationMillis > 1000 {
+		return lastObservedAt
+	}
+	if !lastObservedAt.IsZero() &&
+		observedAt.Sub(lastObservedAt) < workerLoadObservationInterval {
+		return lastObservedAt
+	}
+	s.performance.ObserveWorkerTelemetry(
+		request.NodeId, int(request.CpuUtilizationMillis),
+		max(int(request.RunningTasks), 0),
+		max(int(request.WorkerCapacity), 0),
+		observedAt,
+	)
+	return observedAt
+}
 
 // cpuAssignmentBudget maps the currently observed CPU headroom to the maximum
 // number of idle slots from one node admitted in this dispatcher batch. The

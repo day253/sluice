@@ -94,8 +94,8 @@ func TestDashboardUsesOneCompactJSONLinkStyle(t *testing.T) {
 		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
 	}
 	body := recorder.Body.String()
-	if count := strings.Count(body, `class="json-link"`); count != 8 {
-		t.Fatalf("compact JSON control count = %d, want 8", count)
+	if count := strings.Count(body, `class="json-link"`); count != 9 {
+		t.Fatalf("compact JSON control count = %d, want 9", count)
 	}
 	for _, fragment := range []string{
 		`.json-link{display:inline-flex;align-items:center;border:0;background:transparent;`,
@@ -116,6 +116,43 @@ func TestDashboardUsesOneCompactJSONLinkStyle(t *testing.T) {
 	} {
 		if strings.Contains(body, legacy) {
 			t.Errorf("dashboard still contains legacy large/mixed JSON control %q", legacy)
+		}
+	}
+}
+
+func TestDashboardShowsCurrentWorkerPodLoadMirror(t *testing.T) {
+	handler := Handler(http.NotFoundHandler())
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	body := recorder.Body.String()
+	for _, fragment := range []string{
+		`id="worker-load-title"`,
+		`id="worker-load-summary"`,
+		`id="worker-load-list"`,
+		`aria-label="Current load for every live Worker Pod"`,
+		`aria-label="View current Worker Pod load as JSON"`,
+		`loads=scheduler.worker_telemetry||scheduler.worker_loads||{}`,
+		`cpu_utilization_millis`,
+		`running_tasks`,
+		`reportedCapacity`,
+		`age>5000`,
+		`No fresh sample`,
+		`sorted by Pod name · no history`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Errorf("dashboard is missing Worker Pod load fragment %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{
+		`worker-load-history`,
+		`/api/v1/admin/worker-load`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("current Worker Pod load mirror unexpectedly adds %q", forbidden)
 		}
 	}
 }

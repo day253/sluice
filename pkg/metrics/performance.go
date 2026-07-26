@@ -47,6 +47,7 @@ type schedulerAggregate struct {
 	AssignmentQueueDepth    int64
 	CompletionQueueDepth    int64
 	WorkerLoads             map[string]WorkerLoadSnapshot
+	WorkerTelemetry         map[string]WorkerLoadSnapshot
 
 	windowSelectionCount          uint64
 	windowPendingScanned          uint64
@@ -84,6 +85,7 @@ type SchedulerSnapshot struct {
 	CompletionQueueDepth    int64                         `json:"completion_queue_depth"`
 	MaxWorkerCPUMillis      int64                         `json:"max_worker_cpu_millis"`
 	WorkerLoads             map[string]WorkerLoadSnapshot `json:"worker_loads"`
+	WorkerTelemetry         map[string]WorkerLoadSnapshot `json:"worker_telemetry"`
 }
 
 // WorkerLoadSnapshot is a recent Leader-local observation. It is intentionally
@@ -144,7 +146,10 @@ func NewPerformance() *Performance {
 	return &Performance{
 		startedAt: time.Now().UTC(),
 		raft:      make(map[string]*operationAggregate),
-		scheduler: schedulerAggregate{WorkerLoads: make(map[string]WorkerLoadSnapshot)},
+		scheduler: schedulerAggregate{
+			WorkerLoads:     make(map[string]WorkerLoadSnapshot),
+			WorkerTelemetry: make(map[string]WorkerLoadSnapshot),
+		},
 	}
 }
 
@@ -240,6 +245,27 @@ func (p *Performance) ObserveWorkerLoad(
 	p.mu.Unlock()
 }
 
+// ObserveWorkerTelemetry stores ingress-time Worker feedback for read-only
+// diagnostics. Unlike WorkerLoads, this mirror is not conditioned on the
+// dispatcher freshness window and is never consumed by autoscaling.
+func (p *Performance) ObserveWorkerTelemetry(
+	nodeID string,
+	cpuMillis, runningTasks, capacity int,
+	observedAt time.Time,
+) {
+	if nodeID == "" {
+		return
+	}
+	p.mu.Lock()
+	p.scheduler.WorkerTelemetry[nodeID] = WorkerLoadSnapshot{
+		CPUUtilizationMillis: max(cpuMillis, 0),
+		RunningTasks:         max(runningTasks, 0),
+		Capacity:             max(capacity, 0),
+		ObservedAt:           observedAt.UTC(),
+	}
+	p.mu.Unlock()
+}
+
 func (p *Performance) ObserveLoadAdmission(loadAware, throttled, unavailable, stale int) {
 	p.mu.Lock()
 	s := &p.scheduler
@@ -318,6 +344,7 @@ func (p *Performance) snapshotLocked() PerformanceSnapshot {
 	}
 	s := p.scheduler
 	workerLoads, maxCPU := p.freshWorkerLoadsLocked(time.Now().UTC())
+	workerTelemetry := p.freshWorkerTelemetryLocked(time.Now().UTC())
 	snapshot.Scheduler = SchedulerSnapshot{
 		Selections: s.SelectionCount, PendingScanned: s.PendingScanned,
 		TasksSelected:           s.TasksSelected,
@@ -331,6 +358,7 @@ func (p *Performance) snapshotLocked() PerformanceSnapshot {
 		CompletionQueueDepth: s.CompletionQueueDepth,
 		MaxWorkerCPUMillis:   int64(maxCPU),
 		WorkerLoads:          workerLoads,
+		WorkerTelemetry:      workerTelemetry,
 	}
 	return snapshot
 }
@@ -351,6 +379,18 @@ func (p *Performance) freshWorkerLoadsLocked(now time.Time) (map[string]WorkerLo
 		}
 	}
 	return out, maxCPU
+}
+
+func (p *Performance) freshWorkerTelemetryLocked(now time.Time) map[string]WorkerLoadSnapshot {
+	out := make(map[string]WorkerLoadSnapshot, len(p.scheduler.WorkerTelemetry))
+	for nodeID, load := range p.scheduler.WorkerTelemetry {
+		if load.ObservedAt.IsZero() || now.Sub(load.ObservedAt) > workerLoadRetention {
+			delete(p.scheduler.WorkerTelemetry, nodeID)
+			continue
+		}
+		out[nodeID] = load
+	}
+	return out
 }
 
 func divideInt64(total int64, count uint64) int64 {

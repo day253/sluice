@@ -4666,7 +4666,13 @@ func TestLeaderAssignmentUsesWorkerCPULoadFeedback(t *testing.T) {
 		scheduler := diagnostics.Current.Scheduler
 		return scheduler.LoadThrottledRequests > 0 &&
 			scheduler.WorkerLoads["cpu-worker-high"].CPUUtilizationMillis == 950 &&
-			scheduler.WorkerLoads["cpu-worker-low"].CPUUtilizationMillis == 100
+			scheduler.WorkerLoads["cpu-worker-high"].Capacity == 2 &&
+			scheduler.WorkerLoads["cpu-worker-low"].CPUUtilizationMillis == 100 &&
+			scheduler.WorkerLoads["cpu-worker-low"].Capacity == 2 &&
+			scheduler.WorkerTelemetry["cpu-worker-high"].CPUUtilizationMillis == 950 &&
+			scheduler.WorkerTelemetry["cpu-worker-high"].Capacity == 2 &&
+			scheduler.WorkerTelemetry["cpu-worker-low"].CPUUtilizationMillis == 100 &&
+			scheduler.WorkerTelemetry["cpu-worker-low"].Capacity == 2
 	}, 5*time.Second, "Leader exposes CPU admission diagnostics")
 
 	highSampler.cpu.Store(100)

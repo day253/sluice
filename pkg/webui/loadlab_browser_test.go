@@ -222,6 +222,171 @@ func writeBrowserJSON(w http.ResponseWriter, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+type workerLoadBrowserAPI struct{}
+
+func (workerLoadBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch r.URL.Path {
+	case "/api/v1/health":
+		writeBrowserJSON(w, map[string]any{
+			"status": "ok", "node_id": "control-0", "leader": "127.0.0.1:7000",
+		})
+	case "/api/v1/admin/nodes":
+		nodes := []map[string]any{{
+			"node_id": "worker-1", "role": "worker", "status": "down",
+			"total_workers": 100,
+		}}
+		for index := 13; index >= 2; index-- {
+			capacity := 50
+			if index == 2 {
+				capacity = 100
+			} else if index == 10 {
+				capacity = 20
+			}
+			nodes = append(nodes, map[string]any{
+				"node_id": fmt.Sprintf("worker-%d", index),
+				"role":    "worker", "status": "up",
+				"total_workers": capacity,
+			})
+		}
+		nodes = append(nodes, map[string]any{
+			"node_id": "control-0", "role": "control", "status": "up",
+			"total_workers": 0,
+		})
+		writeBrowserJSON(w, map[string]any{"nodes": nodes})
+	case "/api/v1/admin/allocations":
+		writeBrowserJSON(w, map[string]any{"nodes": []any{}})
+	case "/api/v1/admin/tenants":
+		writeBrowserJSON(w, map[string]any{})
+	case "/api/v1/metrics":
+		writeBrowserJSON(w, []any{})
+	case "/api/v1/admin/performance":
+		loads := make(map[string]any)
+		for index := 2; index <= 12; index++ {
+			cpu, running, capacity := index*10, 1, 50
+			if index == 2 {
+				cpu, running, capacity = 720, 5, 100
+			} else if index == 10 {
+				cpu, running, capacity = 120, 1, 20
+			}
+			loads[fmt.Sprintf("worker-%d", index)] = map[string]any{
+				"cpu_utilization_millis": cpu,
+				"running_tasks":          running,
+				"capacity":               capacity,
+				"observed_at":            time.Now().UTC(),
+			}
+		}
+		loads["worker-1"] = map[string]any{
+			"cpu_utilization_millis": 990,
+			"running_tasks":          100,
+			"capacity":               100,
+			"observed_at":            time.Now().UTC(),
+		}
+		writeBrowserJSON(w, map[string]any{
+			"node_id": "control-0", "collected_at": time.Now().UTC(),
+			"current": map[string]any{
+				"raft": map[string]any{},
+				"scheduler": map[string]any{
+					"max_worker_cpu_millis": 720,
+					"worker_telemetry":      loads,
+				},
+			},
+			"history": map[string]any{},
+		})
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func TestWorkerPodLoadBrowserShowsStableLiveRows(t *testing.T) {
+	chromePath := findChrome()
+	if chromePath == "" {
+		t.Skip("Chrome/Chromium is not installed")
+	}
+	server := httptest.NewServer(Handler(workerLoadBrowserAPI{}))
+	defer server.Close()
+
+	allocator, cancelAllocator := chromedp.NewExecAllocator(
+		context.Background(),
+		append(chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.ExecPath(chromePath),
+			chromedp.Flag("headless", true),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("no-sandbox", true),
+			chromedp.WindowSize(1440, 1000),
+		)...,
+	)
+	defer cancelAllocator()
+	browserContext, cancelBrowser := chromedp.NewContext(allocator)
+	defer cancelBrowser()
+	ctx, cancel := context.WithTimeout(browserContext, 15*time.Second)
+	defer cancel()
+
+	var state struct {
+		Rows             []string `json:"rows"`
+		Summary          string   `json:"summary"`
+		Worker2          string   `json:"worker2"`
+		Worker10         string   `json:"worker10"`
+		Worker13         string   `json:"worker13"`
+		DownVisible      bool     `json:"downVisible"`
+		PanelInMonitor   bool     `json:"panelInMonitor"`
+		Scrollable       bool     `json:"scrollable"`
+		StickyHeader     string   `json:"stickyHeader"`
+		JSONLabel        string   `json:"jsonLabel"`
+		JSONTarget       string   `json:"jsonTarget"`
+		JSONRelationship string   `json:"jsonRelationship"`
+	}
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(server.URL),
+		chromedp.WaitVisible("#worker-load-list [data-worker-load=worker-2]", chromedp.ByQuery),
+		chromedp.Evaluate(`(() => {
+			const panel = document.querySelector(".worker-load-panel");
+			const wrap = panel.querySelector(".worker-load-table-wrap");
+			const link = panel.querySelector(".json-link");
+			const rowText = id => panel.querySelector(
+				'[data-worker-load="' + id + '"]'
+			)?.textContent.replace(/\s+/g, " ").trim() || "";
+			return {
+				rows: [...panel.querySelectorAll("[data-worker-load]")]
+					.map(row => row.dataset.workerLoad),
+				summary: panel.querySelector("#worker-load-summary").textContent.trim(),
+				worker2: rowText("worker-2"),
+				worker10: rowText("worker-10"),
+				worker13: rowText("worker-13"),
+				downVisible: Boolean(panel.querySelector("[data-worker-load=worker-1]")),
+				panelInMonitor: document.querySelector("#monitoring-main").contains(panel),
+				scrollable: wrap.scrollHeight > wrap.clientHeight,
+				stickyHeader: getComputedStyle(panel.querySelector("th")).position,
+				jsonLabel: link.textContent.trim(),
+				jsonTarget: link.target,
+				jsonRelationship: link.rel,
+			};
+		})()`, &state),
+	); err != nil {
+		t.Fatal(err)
+	}
+	wantRows := []string{
+		"worker-2", "worker-3", "worker-4", "worker-5", "worker-6", "worker-7",
+		"worker-8", "worker-9", "worker-10", "worker-11", "worker-12", "worker-13",
+	}
+	if fmt.Sprint(state.Rows) != fmt.Sprint(wantRows) ||
+		state.Summary != "11 / 12 reporting" ||
+		!strings.Contains(state.Worker2, "72.0%") ||
+		!strings.Contains(state.Worker2, "5 / 100") ||
+		!strings.Contains(state.Worker2, "100 slots") ||
+		!strings.Contains(state.Worker2, "Fresh") ||
+		!strings.Contains(state.Worker10, "12.0%") ||
+		!strings.Contains(state.Worker10, "1 / 20") ||
+		!strings.Contains(state.Worker10, "20 slots") ||
+		!strings.Contains(state.Worker13, "No fresh sample") ||
+		state.DownVisible || !state.PanelInMonitor || !state.Scrollable ||
+		state.StickyHeader != "sticky" || state.JSONLabel != "JSON ↗" ||
+		state.JSONTarget != "_blank" ||
+		!strings.Contains(state.JSONRelationship, "noopener") {
+		t.Fatalf("Worker Pod load browser state = %+v", state)
+	}
+}
+
 func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) {
 	chromePath := findChrome()
 	if chromePath == "" {
@@ -496,7 +661,7 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	})()`, &jsonControls)); err != nil {
 		t.Fatal(err)
 	}
-	if jsonControls.Count < 8 || !jsonControls.AllCompact ||
+	if jsonControls.Count != 10 || !jsonControls.AllCompact ||
 		!jsonControls.AllLabels || jsonControls.LegacyCount != 0 ||
 		jsonControls.MaxHeight > 14 {
 		t.Fatalf("JSON controls are not uniformly compact: %+v", jsonControls)

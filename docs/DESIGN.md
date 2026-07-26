@@ -751,6 +751,33 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   `TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON` 在静态诊断链接和动态
   current/history run 都出现后检查全部入口的 computed size、class、文案和旧控件数量。
 
+### UI-007：按 Worker Pod 展示当前执行负载
+
+- **需求与数据语义**：主监控区增加 `Worker Pod load`，按 Pod 名称稳定排序，逐个展示
+  Worker 进程 CPU、正在执行任务数/自报槽数、槽占用率、Raft 当前容量上限和采样新鲜度。
+  CPU 是 SCHED-006 已有的 `0..1000` 进程利用率：优先按 cgroup CPU quota 归一化，无
+  quota 时按 Go 可用并行度归一化；页面显示为百分比，但不把它冒充 metrics-server 的
+  Kubernetes container CPU request/limit 指标。
+- **当前镜像边界**：页面复用 Leader `/api/v1/admin/performance` 的
+  `worker_telemetry`（兼容旧 Leader 时回退 `worker_loads`）。
+  服务端只保留每 Pod 最近 5 秒的 Leader 进程内镜像；WebUI 每秒刷新，不新增 174 点
+  序列、Raft 字段、FSM/Snapshot 数据或额外轮询。所有 live Worker 都必须出现；没有新鲜
+  feedback 时显示 `No fresh sample`，不能把缺失值画成 0%。feedback 在 AssignmentStream
+  入口按每 Pod 最多 250ms 一次采样，因此 dispatcher 深队列只让该请求对 admission
+  fail-open，不能抹掉刚到达 Leader 的监控值。
+- **一致性与非目标**：live Pod 集合和 Raft limit 来自当前 nodes 镜像，软负载来自同次
+  Leader performance 响应；retained down/未知 Worker feedback 不进入表。该面板只读，
+  不改变 Leader admission、allocator、HPA、capacity override 或任务迁移，也不新增
+  Kubernetes Metrics API 依赖；历史 CPU、内存、GPU、网络/磁盘属于后续观测范围。
+- **回归覆盖**：`pkg/grpc.TestAssignmentIngressPreservesWorkerLoadWhenDispatcherSampleIsStale`
+  固定入口采样、250ms 限频和 dispatcher 超过 2 秒后的展示/调度语义分离；
+  `pkg/webui.TestDashboardShowsCurrentWorkerPodLoadMirror` 固定当前镜像、5 秒新鲜度、
+  缺失态、稳定 live Worker 集合和无新历史/API；真实 Chrome
+  `TestWorkerPodLoadBrowserShowsStableLiveRows` 用乱序 live/down 节点与 CPU feedback
+  验证自然名称排序、72%/12% CPU、running/capacity、Raft limit、fresh 状态、down 排除和
+  可滚动表格。同已有 `test/integration.TestLeaderAssignmentUsesWorkerCPULoadFeedback`
+  继续保证真实 3-voter/Follower/Worker 路径产生的负载反馈与 Leader-only 调度正确性。
+
 ### RESULT-001：每节点完成流放大 Raft 日志
 
 - **风险**：Assignment 修复后，大量节点可能同时完成任务；若 ResultStream 各自提交
@@ -922,9 +949,14 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   backlog。Leader 切换丢弃 probe 时间和最近负载，Worker 的后续 idle 请求自动重建。
   过载探测防止长期错误但持续刷新的高值让一个节点永久饥饿。
 - **存储与观测**：每节点最近 CPU/running/capacity 是 Leader 进程内最多保留 5 秒的当前
-  镜像；load-aware、throttled、unavailable、stale 计数和最大 CPU 进入既有 174 点性能
-  ring。两类数据都不写 Raft/FSM/Snapshot，也不反馈给 allocator/HPA。WebUI Performance
-  面板显示 `CPU admission`，原始 JSON 保留每节点最近值。
+  镜像；在 AssignmentStream 收到 feedback 时即按每节点流最多每 250ms 一次记录，不能
+  等 dispatcher 出队后才记录，否则深队列让已等待超过 2 秒的调度样本同时从监控消失。
+  入口镜像单独暴露为 `worker_telemetry`，只供诊断；既有 `worker_loads` 仍只接受
+  2 秒内出队的样本并按 HPA-007 提供 autoscaling 软信号，因而本次不能悄悄改变 HPA。
+  load-aware、throttled、unavailable、stale 计数和调度有效的最大 CPU 进入既有 174 点
+  performance ring；入口镜像不进入历史。两类当前值都不写 Raft/FSM/Snapshot，也不
+  反馈给 allocator 或 Raft assignment。WebUI Performance 面板显示 `CPU admission`，
+  原始 JSON 同时保留 admission 与入口镜像。
 - **明确非目标**：当前任务 payload 没有稳定、可信的 task-type/cost 字段，本轮不能在
   第一次执行前预测单条任务 CPU，也不把某个进程的 CPU 时间归因到并发 goroutine。它是
   基于节点实际消耗的闭环 admission，不处理内存/GPU/磁盘/下游限流，不抢占已执行任务，

@@ -55,6 +55,7 @@ type recordingPerformanceObserver struct {
 	unavailable int
 	stale       int
 	workerLoads map[string]metricsWorkerLoad
+	telemetry   map[string]metricsWorkerLoad
 }
 
 type metricsWorkerLoad struct {
@@ -88,6 +89,21 @@ func (o *recordingPerformanceObserver) ObserveWorkerLoad(
 		o.workerLoads = make(map[string]metricsWorkerLoad)
 	}
 	o.workerLoads[nodeID] = metricsWorkerLoad{
+		cpu: cpuMillis, running: runningTasks, capacity: capacity,
+	}
+	o.mu.Unlock()
+}
+
+func (o *recordingPerformanceObserver) ObserveWorkerTelemetry(
+	nodeID string,
+	cpuMillis, runningTasks, capacity int,
+	_ time.Time,
+) {
+	o.mu.Lock()
+	if o.telemetry == nil {
+		o.telemetry = make(map[string]metricsWorkerLoad)
+	}
+	o.telemetry[nodeID] = metricsWorkerLoad{
 		cpu: cpuMillis, running: runningTasks, capacity: capacity,
 	}
 	o.mu.Unlock()
@@ -835,7 +851,74 @@ func TestDispatchAssignmentsPrioritizesLowCPUAndThrottlesOverloadedNode(t *testi
 	}
 	if observer.workerLoads["worker-low"].cpu != 100 ||
 		observer.workerLoads["worker-high"].cpu != 950 {
-		t.Fatalf("worker load observations = %+v", observer.workerLoads)
+		t.Fatalf("worker admission load observations = %+v", observer.workerLoads)
+	}
+}
+
+func TestAssignmentIngressPreservesWorkerLoadWhenDispatcherSampleIsStale(t *testing.T) {
+	fsm := raftpkg.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raftpkg.OpNodeUp, types.NodeInfo{
+		ID: "worker-delayed", Role: types.NodeRoleWorker,
+		Status: types.NodeStatusUp, TotalWorkers: 8,
+	})
+	applyInternalTestCommand(fsm, raftpkg.OpUpsertTenant,
+		types.TenantConfig{ID: "tenant-delayed", MaxWorkers: 8})
+	applyInternalTestCommand(fsm, raftpkg.OpUpdateAllocation, map[string]*types.NodeAllocation{
+		"worker-delayed": {
+			NodeID:  "worker-delayed",
+			Tenants: map[string]int{"tenant-delayed": 8},
+		},
+	})
+	applyInternalTestCommand(fsm, raftpkg.OpCreateTask, raftpkg.CreateTaskData{
+		TaskID: "task-delayed", TenantID: "tenant-delayed",
+	})
+
+	raft := &internalTestRaft{fsm: fsm}
+	raft.leader.Store(true)
+	service := NewInternalService("leader", fsm, raft, zap.NewNop())
+	observer := &recordingPerformanceObserver{}
+	service.SetPerformanceObserver(observer)
+
+	request := &grpcv1.AssignmentRequest{
+		RequestId: "request-delayed", NodeId: "worker-delayed",
+		PreferredTenantId: "tenant-delayed",
+		CpuLoadValid:      true, CpuUtilizationMillis: 730,
+		RunningTasks: 6, WorkerCapacity: 7,
+	}
+	ingressAt := time.Now().UTC().Add(-assignmentLoadFreshness - time.Second)
+	lastObservedAt := service.observeAssignmentLoad(request, ingressAt, time.Time{})
+
+	// Repeated idle-slot requests from the same node stream are bounded to the
+	// shared 250ms sampler cadence instead of locking the metrics mirror once
+	// per execution slot.
+	request.CpuUtilizationMillis = 100
+	if got := service.observeAssignmentLoad(
+		request, ingressAt.Add(workerLoadObservationInterval/2), lastObservedAt,
+	); !got.Equal(lastObservedAt) {
+		t.Fatalf("rate-limited observation advanced to %v, want %v", got, lastObservedAt)
+	}
+
+	outcomes := make(chan assignmentOutcome, 1)
+	service.dispatchAssignments([]assignmentJob{{
+		ctx: context.Background(), request: request,
+		receivedAt: ingressAt, outcome: outcomes,
+	}})
+	outcome := <-outcomes
+	if outcome.err != nil || outcome.task == nil {
+		t.Fatalf("stale dispatcher assignment outcome = %+v", outcome)
+	}
+
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	load, ok := observer.telemetry["worker-delayed"]
+	if !ok || load.cpu != 730 || load.running != 6 || load.capacity != 7 {
+		t.Fatalf("ingress Worker load = %+v, exists=%t, want 730/6/7", load, ok)
+	}
+	if observer.loadAware != 0 || observer.stale != 1 {
+		t.Fatalf(
+			"dispatcher admission observations = aware:%d stale:%d, want 0/1",
+			observer.loadAware, observer.stale,
+		)
 	}
 }
 

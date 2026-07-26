@@ -1095,3 +1095,30 @@ post-clear submit 返回 404 且原任务 exactly once。
 完整 `make test`（unit/browser/Chart/真实多节点均带 `-race`）随后通过，integration
 阶段为 407.615s；其中新增 TENANT-001 三 voter Case 定向运行 6.02s。整包耗时包含选举、
 故障恢复和新增 Case，不能与单独 20k 吞吐相互替代。
+
+### 7.17 Worker Pod 当前负载观测（2026-07-26）
+
+OBS-002 在 AssignmentStream 入口增加独立的 `worker_telemetry` 当前镜像，用于页面和
+performance JSON 展示每个 live Worker 的进程 CPU、running tasks、上报 slots 与样本时间。
+每条 node stream 最多每 250ms 更新一次，样本超过 5 秒即从输出移除；该镜像只在 Leader
+进程内存中存在，不写 Raft、FSM snapshot 或 174 点历史。既有 `worker_loads` 仍使用
+dispatcher 的 2 秒新鲜度边界，继续单独服务 admission/HPA，展示镜像不会反馈到调度。
+
+按仓库 PERF-001 固定形状重跑：Apple M4 Pro（14 logical CPU、48GiB、
+darwin/arm64、Go 1.26.5），`-race -count=1`，单故障域真实 7 replica/3 voter/4
+non-voter、单 Raft shard；每进程 80 槽，Leader 不执行，4 tenant×Limit 120，共 20000
+个约 10ms 小 JSON 任务。请求经真实 Follower HTTP 顺序提交，batch=1000、
+concurrency=1。
+
+| 阶段 | 完整 `make test` 内复跑 |
+|---|---:|
+| 20k Follower HTTP durable submit | 2.710s |
+| accepted 后排空 | 11.201s |
+| submit 开始至排空 | 13.911s（1437.8 task/s） |
+| 请求错误 / 最终 unfinished / 单任务重复执行 | 0 / 0 / 0 |
+
+结果处在 7.15/7.16 相同形状的本地 race 单轮范围内，不能从一次采样宣称吞吐改善或回退。
+新增更新频率由 node stream 数而非 task 数决定；本轮固定 20k 正常路径正确排空，既有
+Raft Apply/batch fill、pending selection、dispatcher queue、backlog、error/lease 指标
+保持不变，新增 `worker_telemetry` 原始 JSON 可直接判断上报覆盖率与样本新鲜度。完整
+integration 阶段为 406.637s。

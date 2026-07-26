@@ -56,6 +56,32 @@ func TestPerformanceRecordsRaftBatchAndSchedulerWindows(t *testing.T) {
 	}
 }
 
+func TestPerformanceSeparatesIngressTelemetryFromAdmissionLoads(t *testing.T) {
+	performance := NewPerformance()
+	now := time.Now().UTC()
+	performance.ObserveWorkerTelemetry("worker-delayed", 730, 6, 7, now)
+	performance.ObserveWorkerLoad(
+		"worker-delayed", 100, 1, 8,
+		now.Add(-workerLoadRetention-time.Second),
+	)
+
+	scheduler := performance.Snapshot().Scheduler
+	if len(scheduler.WorkerLoads) != 0 {
+		t.Fatalf("stale admission loads = %+v, want none", scheduler.WorkerLoads)
+	}
+	load, ok := scheduler.WorkerTelemetry["worker-delayed"]
+	if !ok || load.CPUUtilizationMillis != 730 ||
+		load.RunningTasks != 6 || load.Capacity != 7 {
+		t.Fatalf("ingress Worker telemetry = %+v, exists=%t", load, ok)
+	}
+	if scheduler.MaxWorkerCPUMillis != 0 {
+		t.Fatalf(
+			"ingress-only CPU changed admission/HPA maximum to %d",
+			scheduler.MaxWorkerCPUMillis,
+		)
+	}
+}
+
 func TestCommandShapeCountsReplicatedItems(t *testing.T) {
 	tests := []struct {
 		name    string
