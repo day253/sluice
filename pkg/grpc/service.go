@@ -45,6 +45,11 @@ type Service struct {
 
 	submitForwardTimeout time.Duration
 	tenantMutationMu     sync.RWMutex
+	submissionOnce       sync.Once
+	submissionJobs       chan submissionJob
+	submissionWindow     time.Duration
+	submissionMax        int
+	submissionObserver   SubmissionPerformanceObserver
 
 	forwardMu     sync.Mutex
 	forwardAddr   string
@@ -52,11 +57,35 @@ type Service struct {
 	forwardClient grpcv1.SluiceClient
 }
 
+// SubmissionPerformanceObserver receives process-local ingress batching
+// observations. They are diagnostics only and must never feed scheduling or
+// replicated state.
+type SubmissionPerformanceObserver interface {
+	ObserveSubmissionBatch(requests, tasks int, queueWait time.Duration)
+	SetSubmissionQueueDepth(depth int)
+}
+
+type submissionJob struct {
+	create     []raftpkg.CreateTaskData
+	response   *grpcv1.SubmitBatchResponse
+	receivedAt time.Time
+	outcome    chan<- submissionOutcome
+}
+
+type submissionOutcome struct {
+	response *grpcv1.SubmitBatchResponse
+	err      error
+}
+
 // SetWorkAvailableFunc installs the control-plane notification invoked only
 // after submitted tasks are durably committed by Raft. The callback is wired
 // during node construction, before the service starts handling requests.
 func (s *Service) SetWorkAvailableFunc(fn func([]string)) {
 	s.workAvailable = fn
+}
+
+func (s *Service) SetSubmissionPerformanceObserver(observer SubmissionPerformanceObserver) {
+	s.submissionObserver = observer
 }
 
 func NewService(
@@ -71,6 +100,9 @@ func NewService(
 		nodeID: nodeID, queue: q, fsm: fsm,
 		raft: raft, pool: pool, logger: logger,
 		submitForwardTimeout: 60 * time.Second,
+		submissionJobs:       make(chan submissionJob, 1024),
+		submissionWindow:     2 * time.Millisecond,
+		submissionMax:        maxSubmitBatchTasks,
 	}
 }
 
@@ -91,9 +123,11 @@ func (s *Service) Submit(ctx context.Context, req *grpcv1.SubmitRequest) (*grpcv
 
 const maxSubmitBatchTasks = 1000
 
-// SubmitBatch persists multiple pending tasks in one Raft log entry. Tenant
-// validation happens only on the leader: a follower may have a briefly stale
-// FSM snapshot and must forward the complete request before validating it.
+// SubmitBatch persists pending tasks through the Leader-wide submission
+// dispatcher. Concurrent requests from every HTTP/gRPC client and every
+// forwarding follower can share one bounded Raft log entry. Tenant validation
+// happens only on the leader: a follower may have a briefly stale FSM snapshot
+// and must forward the complete request before validating it.
 func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchRequest) (*grpcv1.SubmitBatchResponse, error) {
 	if req == nil || len(req.Tasks) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "at least one task is required")
@@ -111,22 +145,11 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 		return client.SubmitBatch(forwardCtx, req)
 	}
 
-	// Keep tenant validation and the durable Create in one Leader-local read
-	// section. DeleteAllTenants takes the write side so a validated request
-	// cannot commit after the atomic clear and create orphaned work.
-	s.tenantMutationMu.RLock()
-	defer s.tenantMutationMu.RUnlock()
-
 	create := make([]raftpkg.CreateTaskData, len(req.Tasks))
 	resp := &grpcv1.SubmitBatchResponse{Tasks: make([]*grpcv1.SubmitResponse, len(req.Tasks))}
 	for i, item := range req.Tasks {
 		if item == nil || item.TenantId == "" {
 			return nil, status.Errorf(codes.InvalidArgument, "tasks[%d].tenant_id is required", i)
-		}
-		// Validate tenant state on the leader only. Followers can lag the
-		// replicated tenant snapshot and must not return a transient 404.
-		if _, ok := s.fsm.GetTenant(item.TenantId); !ok {
-			return nil, status.Error(codes.NotFound, "tenant not found: "+item.TenantId)
 		}
 		taskID := uuid.New().String()
 		if item.IdempotencyKey != "" {
@@ -143,11 +166,128 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 		resp.Tasks[i] = &grpcv1.SubmitResponse{TaskId: taskID, TenantId: item.TenantId, Status: types.TaskStatusPending}
 	}
 
+	s.submissionOnce.Do(func() { go s.runSubmissionDispatcher() })
+	outcome := make(chan submissionOutcome, 1)
+	job := submissionJob{
+		create: create, response: resp,
+		receivedAt: time.Now(), outcome: outcome,
+	}
+	select {
+	case s.submissionJobs <- job:
+		s.setSubmissionQueueDepth(0)
+	case <-ctx.Done():
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+	select {
+	case result := <-outcome:
+		return result.response, result.err
+	case <-ctx.Done():
+		// The queued job may still commit after the caller disappears. A retry
+		// with idempotency keys resolves that intentionally unknown outcome.
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+}
+
+func (s *Service) runSubmissionDispatcher() {
+	pending := make([]submissionJob, 0, 1)
+	for {
+		var first submissionJob
+		if len(pending) > 0 {
+			first = pending[0]
+			pending = pending[:0]
+		} else {
+			first = <-s.submissionJobs
+		}
+		jobs := []submissionJob{first}
+		tasks := len(first.create)
+		if tasks < s.submissionMax {
+			timer := time.NewTimer(s.submissionWindow)
+		collect:
+			for tasks < s.submissionMax {
+				select {
+				case next := <-s.submissionJobs:
+					if tasks+len(next.create) > s.submissionMax {
+						pending = append(pending, next)
+						break collect
+					}
+					jobs = append(jobs, next)
+					tasks += len(next.create)
+				case <-timer.C:
+					break collect
+				}
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}
+		s.setSubmissionQueueDepth(len(pending))
+		s.applySubmissionJobs(jobs)
+	}
+}
+
+func (s *Service) applySubmissionJobs(jobs []submissionJob) {
+	// Keep tenant validation and durable Create in one Leader-local read
+	// section. DeleteAllTenants takes the write side so no validated job can
+	// commit after the atomic clear and create orphaned work.
+	s.tenantMutationMu.RLock()
+	defer s.tenantMutationMu.RUnlock()
+
+	tenantExists := make(map[string]bool)
+	for _, job := range jobs {
+		for _, task := range job.create {
+			if _, checked := tenantExists[task.TenantID]; checked {
+				continue
+			}
+			_, tenantExists[task.TenantID] = s.fsm.GetTenant(task.TenantID)
+		}
+	}
+	valid := make([]submissionJob, 0, len(jobs))
+	create := make([]raftpkg.CreateTaskData, 0, s.submissionMax)
+	oldest := time.Now()
+	for _, job := range jobs {
+		missing := ""
+		for _, task := range job.create {
+			if !tenantExists[task.TenantID] {
+				missing = task.TenantID
+				break
+			}
+		}
+		if missing != "" {
+			job.outcome <- submissionOutcome{
+				err: status.Error(codes.NotFound, "tenant not found: "+missing),
+			}
+			continue
+		}
+		if len(valid) == 0 || job.receivedAt.Before(oldest) {
+			oldest = job.receivedAt
+		}
+		valid = append(valid, job)
+		create = append(create, job.create...)
+	}
+	if len(valid) == 0 {
+		return
+	}
+	if s.submissionObserver != nil {
+		s.submissionObserver.ObserveSubmissionBatch(
+			len(valid), len(create), time.Since(oldest),
+		)
+	}
+
 	cmd := raftpkg.MustMarshalCommand(raftpkg.OpCreateTaskBatch, raftpkg.CreateTaskBatchData{Tasks: create})
 	result := s.raft.Apply(cmd, 5000)
 	if err := result.Error(); err != nil {
-		s.logger.Error("submit batch raft apply failed", zap.Error(err), zap.Int("tasks", len(create)))
-		return nil, status.Error(codes.Internal, "failed to create task batch")
+		s.logger.Error(
+			"submit batch raft apply failed",
+			zap.Error(err), zap.Int("tasks", len(create)), zap.Int("requests", len(valid)),
+		)
+		applyErr := status.Error(codes.Internal, "failed to create task batch")
+		for _, job := range valid {
+			job.outcome <- submissionOutcome{err: applyErr}
+		}
+		return
 	}
 	if s.workAvailable != nil {
 		tenantIDs := make([]string, len(create))
@@ -157,13 +297,25 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 		s.workAvailable(tenantIDs)
 	}
 	if _, ok := result.Response().(*raftpkg.CreateTaskBatchResult); !ok {
-		return nil, status.Error(codes.Internal, "create task batch returned an invalid response")
+		applyErr := status.Error(codes.Internal, "create task batch returned an invalid response")
+		for _, job := range valid {
+			job.outcome <- submissionOutcome{err: applyErr}
+		}
+		return
+	}
+	for _, job := range valid {
+		job.outcome <- submissionOutcome{response: job.response}
 	}
 	// The replicated pending record is the only durable queue. Duplicating this
 	// batch into the Leader's local Bolt queue adds one fsync and later one
 	// delete scan per task, while providing no locality because Leaders execute
 	// no business work. Legacy workers recover pending tasks from the FSM.
-	return resp, nil
+}
+
+func (s *Service) setSubmissionQueueDepth(extra int) {
+	if s.submissionObserver != nil {
+		s.submissionObserver.SetSubmissionQueueDepth(len(s.submissionJobs) + extra)
+	}
 }
 
 // ---------------------------------------------------------------------------

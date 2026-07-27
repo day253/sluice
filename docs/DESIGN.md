@@ -428,7 +428,9 @@ Worker 只通过内部流接收任务与报告结果。
 
 ### 批量提交、转发与幂等边界
 
-- `SubmitBatch` 最多接收 1000 条任务，只写一条 `OpCreateTaskBatch` Raft 日志。
+- `SubmitBatch` 单请求最多接收 1000 条任务。Leader 把来自所有客户端和 Follower 的并发
+  请求放入同一个 2ms 聚合窗口，合并后的单条 `OpCreateTaskBatch` 仍严格不超过 1000 条；
+  满批立即提交，不额外等待窗口。每个请求的响应顺序、原子租户校验和错误彼此隔离。
 - Follower 把完整请求转发给 Leader，转发窗口为 60 秒，覆盖大 voter 集群的正常提交
   延迟；客户端自己的更短 deadline 仍优先。
 - 携带非空 `idempotency_key` 时，任务 ID 由 `tenant_id + idempotency_key` 稳定生成。
@@ -850,6 +852,36 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   10000 个完成结果窗口约束，业务 Processor 副作用仍必须幂等。
 - **回归覆盖**：`TestSubmitBatchFollowerUsesConfiguredForwardTimeout`、
   `TestSubmitBatchIdempotencyKeysReuseTaskIDs`、`TestHTTPBatchSubmitThroughFollower`。
+
+### SUBMIT-004：并发提交请求各自放大 Raft 往返
+
+- **现象与证据**：页面原来以 batch=500/concurrency=4 提交，2 万条会产生 40 条
+  `OpCreateTaskBatch`。2026-07-28 部署前同形远程基线为 accepted 1.034s、accepted 后
+  排空 8.452s、40 Create Apply/20000 items。批量 API 已存在，但 Leader 仍把每个 HTTP/
+  Follower 请求单独 Apply，单条或小批客户端会按请求数放大共识往返。
+- **协议边界**：Leader 新增唯一 submission dispatcher，跨所有外部 gRPC/HTTP 调用和
+  Follower 转发请求聚合；窗口 2ms、单条 Raft 上限 1000，满批立即 flush。Follower 仍只
+  转发，只有当前 Leader 构造并提交 Create 日志；不增加 voter、不改变 shard 归属，也不
+  把 ingress queue 写入 Raft/FSM/Snapshot。
+- **正确性**：每个原始请求先独立验证结构；dispatcher 在同一个 tenant mutation 读锁内
+  对本批唯一 tenant 各查一次并 Apply。某个请求含未知 tenant 时只拒绝该请求，不能毒化
+  同批合法请求；合法请求的 task/response 输入顺序保持不变。`DeleteAllTenants` 继续持
+  写锁，不能越过已经验证但未提交的批次。Raft 成功后才通知 allocator 和回复成功；
+  客户端在入队后取消仍属于结果未知，必须用既有 idempotency key 安全重试。
+- **页面与观测**：Load Lab/quick load 改为 API 最大值 batch=1000、concurrency=4，
+  因而固定 2 万形状从 40 个请求降为 20 个。Leader performance 当前值和 174 点历史新增
+  submission batches/requests/tasks、queue wait/depth；Create Apply latency/item/batch
+  仍是最终共识证据。观测只在 Leader 进程内存，不参与调度。
+- **非目标**：本轮不把单条 Raft 日志放大到 1000 以上；优化 durable accepted，不声称
+  改善 Claim/Complete、Processor 时长或端到端消费吞吐。未填满的单请求会增加最多 2ms
+  聚合等待，这是吞吐与点延迟的明确交换；更多持续写吞吐仍要按租户归属扩展 Multi-Raft
+  shard。
+- **回归覆盖**：`TestConcurrentSubmitBatchesShareOneLeaderRaftApply` 确定性固定四个
+  250 条请求只产生一条 1000-item Apply；未知 tenant 隔离、tenant clear 串行、幂等重试
+  和观测分别由对应单测覆盖。真实三 voter
+  `TestConcurrentHTTPSubmissionsAggregateAtLeader` 让两个 Follower 并发转发 8×100，
+  验证 Leader 诊断、每请求响应关联、最终 800 条 exactly once；实际合批数只记录，不做
+  跨硬件 timing 门禁。
 
 ### LEADER-001：Leader 同时调度和执行
 

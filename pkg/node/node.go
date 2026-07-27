@@ -184,6 +184,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	// ---- gRPC services (shared by HTTP adapter + gRPC server) ----
 	grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(), bridge, n.pool, logger)
 	grpcSvc.SetWorkAvailableFunc(n.allocEngine.NotifyWorkAvailable)
+	grpcSvc.SetSubmissionPerformanceObserver(n.performance)
 	internalSvc := grpcpkg.NewInternalService(cfg.NodeID, cluster.FSM(), bridge, logger)
 	internalSvc.SetPerformanceObserver(n.performance)
 	n.internalSvc = internalSvc

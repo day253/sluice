@@ -16,6 +16,9 @@ func TestPerformanceRecordsRaftBatchAndSchedulerWindows(t *testing.T) {
 	performance.ObserveRaftApply(claim, 12*time.Millisecond, nil)
 	performance.ObserveRaftApply(claim, 18*time.Millisecond, errors.New("commit failed"))
 	performance.ObservePendingSelection(20_000, 128, 4*time.Millisecond)
+	performance.ObserveSubmissionBatch(4, 1000, 2*time.Millisecond)
+	performance.ObserveSubmissionBatch(2, 500, 4*time.Millisecond)
+	performance.SetSubmissionQueueDepth(5)
 	performance.SetDispatcherQueueDepths(7, 9)
 	performance.ObserveWorkerLoad("worker-a", 720, 5, 10, time.Now())
 	performance.ObserveWorkerLoad("worker-b", 910, 8, 10, time.Now())
@@ -34,6 +37,11 @@ func TestPerformanceRecordsRaftBatchAndSchedulerWindows(t *testing.T) {
 	}
 	if got := snapshot.Scheduler; got.Selections != 1 || got.PendingScanned != 20_000 ||
 		got.TasksSelected != 128 || got.AverageSelectMicros != 4_000 ||
+		got.SubmissionBatches != 2 || got.SubmissionRequests != 6 ||
+		got.SubmissionTasks != 1500 || got.AverageSubmissionBatch != 750 ||
+		got.AverageSubmissionReqs != 3 || got.AverageSubmissionWaitUS != 3_000 ||
+		got.MaxSubmissionWaitUS != 4_000 || got.LastSubmissionWaitUS != 4_000 ||
+		got.SubmissionQueueDepth != 5 ||
 		got.AssignmentQueueDepth != 7 || got.CompletionQueueDepth != 9 ||
 		got.LoadAwareRequests != 12 || got.LoadThrottledRequests != 3 ||
 		got.LoadUnavailableRequests != 2 || got.StaleLoadRequests != 1 ||
@@ -48,8 +56,16 @@ func TestPerformanceRecordsRaftBatchAndSchedulerWindows(t *testing.T) {
 		got.Errors != 1 || got.TotalMicros != 30_000 || got.MaxMicros != 18_000 {
 		t.Fatalf("claim window = %+v", got)
 	}
+	if got := window.Scheduler; got.SubmissionBatches != 2 ||
+		got.SubmissionRequests != 6 || got.SubmissionTasks != 1500 ||
+		got.TotalSubmissionWaitUS != 6_000 ||
+		got.MaxSubmissionWaitUS != 4_000 || got.SubmissionQueueDepth != 5 {
+		t.Fatalf("submission window = %+v", got)
+	}
 	if got := performance.sample(); got.Raft[raftpkg.OpClaimBatch].Applies != 0 ||
 		got.Scheduler.Selections != 0 || got.Scheduler.AssignmentQueueDepth != 7 ||
+		got.Scheduler.SubmissionBatches != 0 ||
+		got.Scheduler.SubmissionQueueDepth != 5 ||
 		got.Scheduler.LoadAwareRequests != 0 ||
 		got.Scheduler.AllocationPlanChecks != 0 ||
 		got.Scheduler.MaxWorkerCPUMillis != 910 ||

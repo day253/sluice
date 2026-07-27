@@ -262,6 +262,32 @@ func TestDashboardPrioritizesChartsAndGroupsRelatedValues(t *testing.T) {
 	}
 }
 
+func TestDashboardUsesMaximumSubmissionBatchesAndShowsIngressDiagnostics(t *testing.T) {
+	handler := Handler(http.NotFoundHandler())
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	body := recorder.Body.String()
+	for _, fragment := range []string{
+		`const SUBMIT_BATCH_SIZE=1000,SUBMIT_BATCH_CONCURRENCY=4`,
+		`Queues S / A / C`,
+		`submission_queue_depth`,
+		`average_submission_batch`,
+		`average_submission_requests`,
+		`average_submission_queue_us`,
+		`performance:scheduler:submission-tasks`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Errorf("submission batching diagnostics are missing %q", fragment)
+		}
+	}
+	if strings.Contains(body, `const SUBMIT_BATCH_SIZE=500`) {
+		t.Fatal("dashboard still emits half-filled submission batches")
+	}
+}
+
 func TestDashboardBoundsHighCardinalityChartsAndUsesEphemeralSessionHistory(t *testing.T) {
 	handler := Handler(http.NotFoundHandler())
 	recorder := httptest.NewRecorder()

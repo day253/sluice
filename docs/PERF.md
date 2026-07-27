@@ -1225,3 +1225,52 @@ Canvas 绘制和 legend DOM 数不再随 90/100 线性增长；`Other` 使用均
 端到端单轮约慢 1.0%，但 submit 与 drain 方向相反，且本轮没有修改任何后端热路径；这是
 race、选举和本机调度噪声，不能宣称性能改善或回退。可以确认同形状任务全部正确排空，
 UI-009 没有新增服务器请求或影响原有 Raft/调度观测。
+
+### 7.20 Leader 全局提交聚批（2026-07-28）
+
+SUBMIT-004 的目标只是在 durable accepted 路径减少 Create 共识往返：不修改 task 状态机、
+Claim/Complete 批次、Processor、allocation、lease 或 recovery。协议仍限制每个外部请求
+和每条 `OpCreateTaskBatch` 最多 1000 条；Leader 只在 2ms 内跨并发客户端/Follower 合并
+小批，满 1000 立即提交。页面从 batch=500/concurrency=4 改为 1000/4。任何端到端变化
+必须把 accepted 与 accepted 后排空拆开，不能把消费阶段波动算作提交优化。
+
+部署前基线直接运行于 revision 72 / `6c5c1d4-20260727160123`：同一台 ThinkPad L14
+Gen 2 的单节点 MicroK8s，5 control voter、HPA 空闲态 5 stateless Worker、每 Pod
+1000 槽，总容量 5000；现有 100 个 Load Lab tenant 各 Limit 50。负载为每 tenant 200
+条、全局 round-robin 共 20000 个小 JSON+唯一幂等键，经 Mac 19090 隧道和 ClusterIP，
+HTTP batch=500/concurrency=4；开始前与结束后 unfinished=0。
+
+| 阶段 | SUBMIT-004 前 |
+|---|---:|
+| durable accepted | 1.034s |
+| accepted 后排空 | 8.452s |
+| 端到端 | 9.486s（2108.4 task/s） |
+| Create Apply/items/平均批次 | 40 / 20000 / 500 |
+| Claim Apply/items | 232 / 20000 |
+| Complete Apply/items | 247 / 20000 |
+| 请求错误 / 最终 unfinished | 0 / 0 |
+
+该轮证明页面的 500 条批次确实把 Create 日志固定为 40 条；accepted 只占端到端约 10.9%，
+所以即使减半也不会让总体吞吐翻倍。修改后的同形远程结果、固定 PERF-001 和完整
+`make test` 在验证完成后追加。
+
+完整 `make test`（Apple M4 Pro、14 logical CPU、48GiB、darwin/arm64、Go 1.26.5，
+全程 `-race -count=1`）通过，真实多节点 integration 阶段为 395.283s。新增三 voter
+SUBMIT-004 Case 中，两个 Follower 的 8×100 并发 HTTP 请求在本机该轮成为 1 条
+800-item Create Apply，800 条均 exactly once；合批数受运行时到达调度影响，只作诊断，
+CI 不要求固定为 1。
+
+固定 PERF-001 仍是 7 replica/3 voter/4 non-voter、每进程 80 槽、4 tenant×Limit 120、
+20000 个约 10ms 小 JSON 任务、Follower HTTP、batch=1000/concurrency=1：
+
+| 阶段 | UI-009 上一轮 | SUBMIT-004 完整测试 |
+|---|---:|---:|
+| durable submit | 2.878s | 2.762s |
+| accepted 后排空 | 11.000s | 11.000s |
+| 端到端 | 13.878s（1441.1 task/s） | 13.762s（1453.3 task/s） |
+| 错误 / unfinished / 重复执行 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+accepted 单轮约快 4.0%、端到端约快 0.8%，但这个固定 Case 原本就是顺序满 1000 请求，
+不会触发跨请求合并；它主要验证唯一 tenant 校验和 dispatcher 没有回退，差值仍可能是
+race/选举/本机调度噪声，不能宣称因果改善。页面 500→1000 和并发小批聚合的效果必须用
+上述远程 100 tenant×200 同形 A/B 复测。

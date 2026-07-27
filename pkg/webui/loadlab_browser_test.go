@@ -473,7 +473,12 @@ func (a *dashboardTrendBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Requ
 				},
 				"scheduler": map[string]any{
 					"pending_scanned": 100, "tasks_selected": 50,
-					"assignment_queue_depth": 3, "completion_queue_depth": 2,
+					"submission_batches": 2, "submission_requests": 5,
+					"submission_tasks": 1000, "average_submission_batch": 500,
+					"average_submission_requests": 2,
+					"average_submission_queue_us": 2300,
+					"submission_queue_depth":      1,
+					"assignment_queue_depth":      3, "completion_queue_depth": 2,
 					"load_aware_requests": 10, "load_throttled_requests": 1,
 					"max_worker_cpu_millis": 690, "worker_telemetry": loads,
 					"worker_loads": loads,
@@ -528,6 +533,8 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 		StandalonePressure  bool   `json:"standalonePressure"`
 		HasTable            bool   `json:"hasTable"`
 		SessionBadge        string `json:"sessionBadge"`
+		SubmissionQueues    string `json:"submissionQueues"`
+		SubmissionQueueNote string `json:"submissionQueueNote"`
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
@@ -558,6 +565,8 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 				standalonePressure: Boolean(document.querySelector(".autoscaling-panel")),
 				hasTable: Boolean(document.querySelector("#monitoring-main table")),
 				sessionBadge: document.querySelector(".session-badge").textContent.trim(),
+				submissionQueues: document.querySelector("#performance-queues").textContent.trim(),
+				submissionQueueNote: document.querySelector("#performance-queues-note").textContent.trim(),
 			};
 		})()`, &state),
 	); err != nil {
@@ -572,7 +581,9 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 		state.WorkerSamples < 2 || state.TenantSamples < 2 ||
 		!state.SessionAfterCharts || !state.RaftAffinity || !state.SchedulerAffinity ||
 		state.StandalonePressure || state.HasTable ||
-		state.SessionBadge != "Up to 60 samples · reset on refresh" {
+		state.SessionBadge != "Up to 60 samples · reset on refresh" ||
+		state.SubmissionQueues != "1 · 3 · 2" ||
+		!strings.Contains(state.SubmissionQueueNote, "submit avg 500 tasks / 2 requests") {
 		t.Fatalf("dashboard trend browser state = %+v", state)
 	}
 }

@@ -3,6 +3,7 @@ package grpc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,34 @@ type deadlineSluiceService struct {
 type batchSpyQueue struct {
 	*queue.MemoryQueue
 	enqueueCalls int
+}
+
+type recordingSubmissionObserver struct {
+	mu       sync.Mutex
+	batches  int
+	requests int
+	tasks    int
+	depth    int
+}
+
+func (o *recordingSubmissionObserver) ObserveSubmissionBatch(requests, tasks int, _ time.Duration) {
+	o.mu.Lock()
+	o.batches++
+	o.requests += requests
+	o.tasks += tasks
+	o.mu.Unlock()
+}
+
+func (o *recordingSubmissionObserver) SetSubmissionQueueDepth(depth int) {
+	o.mu.Lock()
+	o.depth = depth
+	o.mu.Unlock()
+}
+
+func (o *recordingSubmissionObserver) snapshot() (batches, requests, tasks, depth int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.batches, o.requests, o.tasks, o.depth
 }
 
 type blockingCreateRaft struct {
@@ -280,6 +309,118 @@ func TestSubmitBatchUsesOneRaftApply(t *testing.T) {
 		if task.GetTaskId() == "" || fsm.GetTask(task.GetTaskId()) == nil {
 			t.Fatalf("batch task was not persisted: %+v", task)
 		}
+	}
+}
+
+func TestConcurrentSubmitBatchesShareOneLeaderRaftApply(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{ID: "tenant-a", MaxWorkers: 1000})
+	testRaft := &internalTestRaft{fsm: fsm}
+	testRaft.leader.Store(true)
+	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
+	svc.submissionWindow = time.Second
+	observer := &recordingSubmissionObserver{}
+	svc.SetSubmissionPerformanceObserver(observer)
+
+	const (
+		requests        = 4
+		tasksPerRequest = 250
+	)
+	start := make(chan struct{})
+	results := make(chan error, requests)
+	var wg sync.WaitGroup
+	for requestIndex := 0; requestIndex < requests; requestIndex++ {
+		requestIndex := requestIndex
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			tasks := make([]*grpcv1.SubmitRequest, tasksPerRequest)
+			for taskIndex := range tasks {
+				tasks[taskIndex] = &grpcv1.SubmitRequest{
+					TenantId:       "tenant-a",
+					Payload:        []byte(`{"batch":true}`),
+					IdempotencyKey: fmt.Sprintf("request-%d-task-%d", requestIndex, taskIndex),
+				}
+			}
+			response, err := svc.SubmitBatch(
+				context.Background(),
+				&grpcv1.SubmitBatchRequest{Tasks: tasks},
+			)
+			if err == nil && len(response.GetTasks()) != tasksPerRequest {
+				err = fmt.Errorf("response tasks = %d, want %d", len(response.GetTasks()), tasksPerRequest)
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := testRaft.applyCount.Load(); got != 1 {
+		t.Fatalf("concurrent request Raft Apply calls = %d, want one global batch", got)
+	}
+	if got := len(fsm.FindAllPendingTasks()); got != requests*tasksPerRequest {
+		t.Fatalf("pending tasks = %d, want %d", got, requests*tasksPerRequest)
+	}
+	batches, observedRequests, observedTasks, depth := observer.snapshot()
+	if batches != 1 || observedRequests != requests ||
+		observedTasks != requests*tasksPerRequest || depth != 0 {
+		t.Fatalf(
+			"submission observation = batches:%d requests:%d tasks:%d depth:%d",
+			batches, observedRequests, observedTasks, depth,
+		)
+	}
+}
+
+func TestConcurrentSubmitBatchRejectsUnknownTenantWithoutPoisoningValidJobs(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{ID: "tenant-a", MaxWorkers: 10})
+	testRaft := &internalTestRaft{fsm: fsm}
+	testRaft.leader.Store(true)
+	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
+	svc.submissionWindow = 20 * time.Millisecond
+
+	start := make(chan struct{})
+	validResult := make(chan error, 1)
+	invalidResult := make(chan error, 1)
+	go func() {
+		<-start
+		_, err := svc.SubmitBatch(context.Background(), &grpcv1.SubmitBatchRequest{
+			Tasks: []*grpcv1.SubmitRequest{{
+				TenantId: "tenant-a", IdempotencyKey: "valid",
+			}},
+		})
+		validResult <- err
+	}()
+	go func() {
+		<-start
+		_, err := svc.SubmitBatch(context.Background(), &grpcv1.SubmitBatchRequest{
+			Tasks: []*grpcv1.SubmitRequest{{
+				TenantId: "missing", IdempotencyKey: "invalid",
+			}},
+		})
+		invalidResult <- err
+	}()
+	close(start)
+
+	if err := <-validResult; err != nil {
+		t.Fatalf("valid job failed because a coalesced request was invalid: %v", err)
+	}
+	if err := <-invalidResult; status.Code(err) != codes.NotFound {
+		t.Fatalf("unknown tenant error = %v, want NotFound", err)
+	}
+	if got := testRaft.applyCount.Load(); got != 1 {
+		t.Fatalf("valid job Raft Apply calls = %d, want 1", got)
+	}
+	pending := fsm.FindAllPendingTasks()
+	if len(pending) != 1 || pending[0].TenantID != "tenant-a" {
+		t.Fatalf("pending tasks = %+v, want only valid tenant job", pending)
 	}
 }
 
