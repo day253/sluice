@@ -169,7 +169,8 @@ func TestDashboardExposesAtomicLoadLabAndOnlyTheActiveOperation(t *testing.T) {
 		`body:JSON.stringify({total_workers:totalWorkers})`,
 		`id="performance-cpu-admission"`, `CPU admission`,
 		`load_throttled_requests`, `worker_loads`,
-		`id="autoscaling-title"`, `Autoscaling pressure`,
+		`id="workload-trend-panel"`, `Queue signals related to unfinished tasks`,
+		`id="capacity-trend-panel"`, `Worker signals related to allocation capacity`,
 		`id="autoscaling-queue"`, `id="autoscaling-cpu"`,
 		`id="autoscaling-telemetry"`, `/api/v1/admin/autoscaling`,
 		`idempotency_key:`, `buildRoundRobinJobs`,
@@ -240,7 +241,7 @@ func TestDashboardKeepsWorkloadWritesInSidebarAndMonitoringMainReadOnly(t *testi
 	for _, fragment := range []string{
 		`Worker allocation by instance`,
 		`Unfinished tasks by tenant`,
-		`Tenant allocation`,
+		`Tenant allocated slots`,
 	} {
 		if !strings.Contains(monitoring, fragment) {
 			t.Errorf("monitoring main is missing %q", fragment)

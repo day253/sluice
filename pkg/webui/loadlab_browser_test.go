@@ -302,7 +302,7 @@ func (workerLoadBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func TestWorkerPodLoadBrowserShowsStableLiveRows(t *testing.T) {
+func TestWorkerPodLoadBrowserBuildsBoundedSessionChart(t *testing.T) {
 	chromePath := findChrome()
 	if chromePath == "" {
 		t.Skip("Chrome/Chromium is not installed")
@@ -327,40 +327,40 @@ func TestWorkerPodLoadBrowserShowsStableLiveRows(t *testing.T) {
 	defer cancel()
 
 	var state struct {
-		Rows             []string `json:"rows"`
-		Summary          string   `json:"summary"`
-		Worker2          string   `json:"worker2"`
-		Worker10         string   `json:"worker10"`
-		Worker13         string   `json:"worker13"`
-		DownVisible      bool     `json:"downVisible"`
-		PanelInMonitor   bool     `json:"panelInMonitor"`
-		Scrollable       bool     `json:"scrollable"`
-		StickyHeader     string   `json:"stickyHeader"`
-		JSONLabel        string   `json:"jsonLabel"`
-		JSONTarget       string   `json:"jsonTarget"`
-		JSONRelationship string   `json:"jsonRelationship"`
+		Summary          string `json:"summary"`
+		Legend           string `json:"legend"`
+		LegendItems      int    `json:"legendItems"`
+		Samples          int    `json:"samples"`
+		DownVisible      bool   `json:"downVisible"`
+		PanelInMonitor   bool   `json:"panelInMonitor"`
+		HasCanvas        bool   `json:"hasCanvas"`
+		HasTable         bool   `json:"hasTable"`
+		AverageCPU       string `json:"averageCPU"`
+		MaximumCPU       string `json:"maximumCPU"`
+		RunningTasks     string `json:"runningTasks"`
+		JSONLabel        string `json:"jsonLabel"`
+		JSONTarget       string `json:"jsonTarget"`
+		JSONRelationship string `json:"jsonRelationship"`
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
-		chromedp.WaitVisible("#worker-load-list [data-worker-load=worker-2]", chromedp.ByQuery),
+		chromedp.WaitVisible("#worker-cpu-session-chart", chromedp.ByQuery),
+		chromedp.Sleep(1200*time.Millisecond),
 		chromedp.Evaluate(`(() => {
-			const panel = document.querySelector(".worker-load-panel");
-			const wrap = panel.querySelector(".worker-load-table-wrap");
+			const panel = document.querySelector("#worker-session-panel");
 			const link = panel.querySelector(".json-link");
-			const rowText = id => panel.querySelector(
-				'[data-worker-load="' + id + '"]'
-			)?.textContent.replace(/\s+/g, " ").trim() || "";
 			return {
-				rows: [...panel.querySelectorAll("[data-worker-load]")]
-					.map(row => row.dataset.workerLoad),
 				summary: panel.querySelector("#worker-load-summary").textContent.trim(),
-				worker2: rowText("worker-2"),
-				worker10: rowText("worker-10"),
-				worker13: rowText("worker-13"),
-				downVisible: Boolean(panel.querySelector("[data-worker-load=worker-1]")),
+				legend: panel.querySelector("#worker-cpu-session-legend").textContent,
+				legendItems: panel.querySelectorAll("#worker-cpu-session-legend .legend-item").length,
+				samples: S.sessionHistory.workers["worker-2"].cpu.length,
+				downVisible: S.workerCPUSessionHistories.some(item => item.id === "worker-1"),
 				panelInMonitor: document.querySelector("#monitoring-main").contains(panel),
-				scrollable: wrap.scrollHeight > wrap.clientHeight,
-				stickyHeader: getComputedStyle(panel.querySelector("th")).position,
+				hasCanvas: Boolean(panel.querySelector("#worker-cpu-session-chart")),
+				hasTable: Boolean(panel.querySelector("table")),
+				averageCPU: panel.querySelector("#session-worker-average").textContent.trim(),
+				maximumCPU: panel.querySelector("#session-worker-max").textContent.trim(),
+				runningTasks: panel.querySelector("#session-worker-running").textContent.trim(),
 				jsonLabel: link.textContent.trim(),
 				jsonTarget: link.target,
 				jsonRelationship: link.rel,
@@ -369,25 +369,211 @@ func TestWorkerPodLoadBrowserShowsStableLiveRows(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	wantRows := []string{
-		"worker-2", "worker-3", "worker-4", "worker-5", "worker-6", "worker-7",
-		"worker-8", "worker-9", "worker-10", "worker-11", "worker-12", "worker-13",
-	}
-	if fmt.Sprint(state.Rows) != fmt.Sprint(wantRows) ||
-		state.Summary != "11 / 12 reporting" ||
-		!strings.Contains(state.Worker2, "72.0%") ||
-		!strings.Contains(state.Worker2, "5 / 100") ||
-		!strings.Contains(state.Worker2, "100 slots") ||
-		!strings.Contains(state.Worker2, "Fresh") ||
-		!strings.Contains(state.Worker10, "12.0%") ||
-		!strings.Contains(state.Worker10, "1 / 20") ||
-		!strings.Contains(state.Worker10, "20 slots") ||
-		!strings.Contains(state.Worker13, "No fresh sample") ||
-		state.DownVisible || !state.PanelInMonitor || !state.Scrollable ||
-		state.StickyHeader != "sticky" || state.JSONLabel != "JSON ↗" ||
+	if state.Summary != "11 / 12 reporting" ||
+		state.LegendItems != 9 ||
+		!strings.Contains(state.Legend, "worker-2") ||
+		!strings.Contains(state.Legend, "Other 3 Pods (avg)") ||
+		state.Samples < 2 || state.DownVisible || !state.PanelInMonitor ||
+		!state.HasCanvas || state.HasTable || state.AverageCPU == "—" ||
+		state.MaximumCPU != "72.0%" || state.RunningTasks != "15" ||
+		state.JSONLabel != "JSON ↗" ||
 		state.JSONTarget != "_blank" ||
 		!strings.Contains(state.JSONRelationship, "noopener") {
-		t.Fatalf("Worker Pod load browser state = %+v", state)
+		t.Fatalf("Worker Pod session chart state = %+v", state)
+	}
+}
+
+type dashboardTrendBrowserAPI struct {
+	mu   sync.Mutex
+	tick int
+}
+
+func (a *dashboardTrendBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch r.URL.Path {
+	case "/api/v1/health":
+		writeBrowserJSON(w, map[string]any{
+			"status": "ok", "node_id": "control-0", "leader": "127.0.0.1:7000",
+		})
+	case "/api/v1/admin/nodes":
+		nodes := []map[string]any{{
+			"node_id": "control-0", "role": "control", "status": "up",
+			"total_workers": 0,
+		}}
+		for index := 0; index < 12; index++ {
+			nodes = append(nodes, map[string]any{
+				"node_id": fmt.Sprintf("worker-%02d", index),
+				"role":    "worker", "status": "up", "total_workers": 100,
+			})
+		}
+		writeBrowserJSON(w, map[string]any{"nodes": nodes})
+	case "/api/v1/admin/tenants":
+		tenants := make(map[string]any)
+		for index := 0; index < 12; index++ {
+			id := fmt.Sprintf("tenant-%02d", index)
+			tenants[id] = map[string]any{
+				"id": id, "name": fmt.Sprintf("Tenant %02d", index),
+				"max_workers": 100 - index, "inflight": 12 - index,
+			}
+		}
+		writeBrowserJSON(w, tenants)
+	case "/api/v1/metrics":
+		prefix := r.URL.Query().Get("prefix")
+		metrics := make([]map[string]any, 0, 12)
+		for index := 0; index < 12; index++ {
+			value := 12 - index
+			name := ""
+			switch prefix {
+			case "unfinished:":
+				name = "unfinished:" + fmt.Sprintf("tenant-%02d", index)
+			case "allocated-workers:node:":
+				name = "allocated-workers:node:" + fmt.Sprintf("worker-%02d", index)
+			case "allocated-workers:tenant:":
+				name = "allocated-workers:tenant:" + fmt.Sprintf("tenant-%02d", index)
+			}
+			if name == "" {
+				continue
+			}
+			metrics = append(metrics, map[string]any{
+				"name": name, "days": []int{value}, "hours": []int{value},
+				"mins": []int{value}, "secs": []int{value, value + 1},
+			})
+		}
+		writeBrowserJSON(w, metrics)
+	case "/api/v1/admin/autoscaling":
+		writeBrowserJSON(w, map[string]any{
+			"observed_at": time.Now().UTC(), "pending_tasks": 50,
+			"running_tasks": 28, "oldest_pending_age_ms": 1700,
+			"task_breakdown_valid": true, "average_worker_cpu_millis": 410,
+			"max_worker_cpu_millis": 690, "reporting_workers": 12,
+			"worker_instances": 12, "telemetry_source": "control-0",
+		})
+	case "/api/v1/admin/performance":
+		a.mu.Lock()
+		a.tick++
+		tick := a.tick
+		a.mu.Unlock()
+		loads := make(map[string]any)
+		for index := 0; index < 12; index++ {
+			loads[fmt.Sprintf("worker-%02d", index)] = map[string]any{
+				"cpu_utilization_millis": 200 + index*20 + tick,
+				"running_tasks":          index + tick,
+				"capacity":               100,
+				"observed_at":            time.Now().UTC(),
+			}
+		}
+		writeBrowserJSON(w, map[string]any{
+			"node_id": "control-0", "collected_at": time.Now().UTC(),
+			"current": map[string]any{
+				"raft": map[string]any{
+					"create_task_batch": map[string]any{
+						"applies": 10, "average_us": 1200, "max_us": 2000,
+						"average_batch": 50,
+					},
+				},
+				"scheduler": map[string]any{
+					"pending_scanned": 100, "tasks_selected": 50,
+					"assignment_queue_depth": 3, "completion_queue_depth": 2,
+					"load_aware_requests": 10, "load_throttled_requests": 1,
+					"max_worker_cpu_millis": 690, "worker_telemetry": loads,
+					"worker_loads": loads,
+				},
+			},
+			"history": map[string]any{},
+		})
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *testing.T) {
+	chromePath := findChrome()
+	if chromePath == "" {
+		t.Skip("Chrome/Chromium is not installed")
+	}
+	api := &dashboardTrendBrowserAPI{}
+	server := httptest.NewServer(Handler(api))
+	defer server.Close()
+
+	allocator, cancelAllocator := chromedp.NewExecAllocator(
+		context.Background(),
+		append(chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.ExecPath(chromePath),
+			chromedp.Flag("headless", true),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("no-sandbox", true),
+			chromedp.WindowSize(1440, 1000),
+		)...,
+	)
+	defer cancelAllocator()
+	browserContext, cancelBrowser := chromedp.NewContext(allocator)
+	defer cancelBrowser()
+	ctx, cancel := context.WithTimeout(browserContext, 15*time.Second)
+	defer cancel()
+
+	var state struct {
+		WorkerLegendItems   int    `json:"workerLegendItems"`
+		TenantLegendItems   int    `json:"tenantLegendItems"`
+		SessionWorkerItems  int    `json:"sessionWorkerItems"`
+		SessionTenantItems  int    `json:"sessionTenantItems"`
+		WorkerLegend        string `json:"workerLegend"`
+		TenantLegend        string `json:"tenantLegend"`
+		SessionWorkerLegend string `json:"sessionWorkerLegend"`
+		SessionTenantLegend string `json:"sessionTenantLegend"`
+		WorkerSamples       int    `json:"workerSamples"`
+		TenantSamples       int    `json:"tenantSamples"`
+		SessionAfterCharts  bool   `json:"sessionAfterCharts"`
+		RaftAffinity        bool   `json:"raftAffinity"`
+		SchedulerAffinity   bool   `json:"schedulerAffinity"`
+		StandalonePressure  bool   `json:"standalonePressure"`
+		HasTable            bool   `json:"hasTable"`
+		SessionBadge        string `json:"sessionBadge"`
+	}
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(server.URL),
+		chromedp.WaitVisible("#tenant-allocation-session-chart", chromedp.ByQuery),
+		chromedp.Sleep(2200*time.Millisecond),
+		chromedp.Evaluate(`(() => {
+			const charts = document.querySelector("#primary-charts");
+			const session = document.querySelector("#session-charts");
+			const performanceCards = document.querySelectorAll(".performance-chart");
+			return {
+				workerLegendItems: document.querySelectorAll("#worker-chart-legend .legend-item").length,
+				tenantLegendItems: document.querySelectorAll("#tenant-chart-legend .legend-item").length,
+				sessionWorkerItems: document.querySelectorAll("#worker-cpu-session-legend .legend-item").length,
+				sessionTenantItems: document.querySelectorAll("#tenant-allocation-session-legend .legend-item").length,
+				workerLegend: document.querySelector("#worker-chart-legend").textContent,
+				tenantLegend: document.querySelector("#tenant-chart-legend").textContent,
+				sessionWorkerLegend: document.querySelector("#worker-cpu-session-legend").textContent,
+				sessionTenantLegend: document.querySelector("#tenant-allocation-session-legend").textContent,
+				workerSamples: S.sessionHistory.workers["worker-00"].cpu.length,
+				tenantSamples: S.sessionHistory.tenants["tenant-00"].allocated.length,
+				sessionAfterCharts: Boolean(
+					charts.compareDocumentPosition(session) & Node.DOCUMENT_POSITION_FOLLOWING
+				),
+				raftAffinity: performanceCards[0].contains(document.querySelector("#performance-create-apply")) &&
+					performanceCards[0].contains(document.querySelector("#performance-raft-chart")),
+				schedulerAffinity: performanceCards[1].contains(document.querySelector("#performance-scan-ratio")) &&
+					performanceCards[1].contains(document.querySelector("#performance-scheduler-chart")),
+				standalonePressure: Boolean(document.querySelector(".autoscaling-panel")),
+				hasTable: Boolean(document.querySelector("#monitoring-main table")),
+				sessionBadge: document.querySelector(".session-badge").textContent.trim(),
+			};
+		})()`, &state),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if state.WorkerLegendItems != 9 || state.TenantLegendItems != 9 ||
+		state.SessionWorkerItems != 9 || state.SessionTenantItems != 9 ||
+		!strings.Contains(state.WorkerLegend, "Other 4 Pods (avg)") ||
+		!strings.Contains(state.TenantLegend, "Other 4 tenants (avg)") ||
+		!strings.Contains(state.SessionWorkerLegend, "Other 4 Pods (avg)") ||
+		!strings.Contains(state.SessionTenantLegend, "Other 4 tenants (avg)") ||
+		state.WorkerSamples < 2 || state.TenantSamples < 2 ||
+		!state.SessionAfterCharts || !state.RaftAffinity || !state.SchedulerAffinity ||
+		state.StandalonePressure || state.HasTable ||
+		state.SessionBadge != "Up to 60 samples · reset on refresh" {
+		t.Fatalf("dashboard trend browser state = %+v", state)
 	}
 }
 

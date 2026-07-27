@@ -1185,3 +1185,43 @@ unfinished=0。固定 PERF-001 的本地完整基线和部署后远程同形状�
 不能据此宣称吞吐提升。可以确认同形状正确性和性能没有回退；PERF-005 的主要收益应在
 数十万 backlog、数百 tenant、周期 allocator/UI 读取和高 Raft latency 的远程形状验证，
 而不是这个 20k/4 tenant 的小矩阵。
+
+### 7.19 图表优先与高标签量收敛（2026-07-27）
+
+UI-009 只修改 WebUI 的组织和浏览器端渲染，不修改 submission、scheduler、Raft Apply、
+storage、worker execution 或 recovery 路径，因此不能沿用它宣称后端吞吐变化，也没有为
+纯 UI 改动单独制造一组不可比的 PERF-001 数字。最终 `make test` 仍会运行仓库固定形状
+基线并记录正确性结果。
+
+页面仍按原频率读取相同端点：workload/性能每秒一次，拓扑每 5 秒一次；没有新增请求。
+服务端已有 unfinished/Worker allocation 继续各返回 174 点，Performance 继续使用 Leader
+完整诊断。只有 Worker telemetry 和 tenant allocated slots 这两类当前镜像被浏览器采样，
+每个实体最多 60 点，实体消失后 prune，刷新后全部丢弃；不写浏览器持久化、Raft 或
+Snapshot。
+
+本地预览连接同一远程运行集群时观察到约 90 个 live Worker、100 个 tenant。旧页面会把
+全部 Worker/tenant 明细作为表格或全量系列交给 DOM/Canvas；新页面没有监控表格，每个
+高基数图最多绘制 9 条系列（Top 8 + `Other N (avg)`），图例同样最多 9 项。这个边界使
+Canvas 绘制和 legend DOM 数不再随 90/100 线性增长；`Other` 使用均值避免总和拉高纵轴、
+压扁热点线。它是前端复杂度和可读性改进，不代表后端吞吐提升。
+
+确定性 `dashboardtrend` 单测覆盖 60 点边界、prune、Top 8 稳定排序与 remainder 平均值；
+真实 Chrome Case 使用 12 Worker/12 tenant 的生产页面响应，确认零表格、legend≤9、
+两个会话采样点、Performance 指标亲和和原 JSON 入口保留。完整测试与固定 PERF-001 的
+最终结果如下。
+
+完整 `make test`（Apple M4 Pro、14 logical CPU、48GiB、darwin/arm64、Go 1.26.5，
+全程 `-race -count=1`）通过，真实多节点 integration 阶段为 412.000s。固定 PERF-001
+仍是 7 replica/3 voter/4 non-voter、每进程 80 槽、4 tenant×Limit 120、20000 个约
+10ms 小 JSON 任务、Follower HTTP、batch=1000/concurrency=1：
+
+| 阶段 | PERF-005 上一轮 | UI-009 完整测试 |
+|---|---:|---:|
+| durable submit | 2.543s | 2.878s |
+| accepted 后排空 | 11.201s | 11.000s |
+| 端到端 | 13.743s（1455.3 task/s） | 13.878s（1441.1 task/s） |
+| 错误 / unfinished / 重复执行 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+端到端单轮约慢 1.0%，但 submit 与 drain 方向相反，且本轮没有修改任何后端热路径；这是
+race、选举和本机调度噪声，不能宣称性能改善或回退。可以确认同形状任务全部正确排空，
+UI-009 没有新增服务器请求或影响原有 Raft/调度观测。

@@ -757,41 +757,43 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 
 ### UI-007：按 Worker Pod 展示当前执行负载
 
-- **需求与数据语义**：主监控区增加 `Worker Pod load`，按 Pod 名称稳定排序，逐个展示
-  Worker 进程 CPU、正在执行任务数/自报槽数、槽占用率、Raft 当前容量上限和采样新鲜度。
+- **需求与数据语义**：主监控区通过 `Worker Pod CPU` 时序图展示各 Pod 的进程 CPU，
+  当前统计与图放在同一个卡片中，包括平均/最大 CPU、正在执行任务数和上报覆盖率。
   CPU 是 SCHED-006 已有的 `0..1000` 进程利用率：优先按 cgroup CPU quota 归一化，无
   quota 时按 Go 可用并行度归一化；页面显示为百分比，但不把它冒充 metrics-server 的
   Kubernetes container CPU request/limit 指标。
 - **当前镜像边界**：页面复用 Leader `/api/v1/admin/performance` 的
   `worker_telemetry`（兼容旧 Leader 时回退 `worker_loads`）。
   服务端只保留每 Pod 最近 5 秒的 Leader 进程内镜像；WebUI 每秒刷新，不新增 174 点
-  序列、Raft 字段、FSM/Snapshot 数据或额外轮询。所有 live Worker 都必须出现；没有新鲜
-  feedback 时显示 `No fresh sample`，不能把缺失值画成 0%。feedback 在 AssignmentStream
-  入口按每 Pod 最多 250ms 一次采样，因此 dispatcher 深队列只让该请求对 admission
-  fail-open，不能抹掉刚到达 Leader 的监控值。
+  序列、Raft 字段、FSM/Snapshot 数据或额外轮询。浏览器只把同一当前镜像在内存中采样成
+  最多 60 点的会话趋势，刷新立即清空。没有新鲜 feedback 的 live Worker 计入覆盖率但不
+  画成 0%；retained down/未知 Worker 不进入图。feedback 在 AssignmentStream 入口按每
+  Pod 最多 250ms 一次采样，因此 dispatcher 深队列只让该请求对 admission fail-open，
+  不能抹掉刚到达 Leader 的监控值。
 - **一致性与非目标**：live Pod 集合和 Raft limit 来自当前 nodes 镜像，软负载来自同次
-  Leader performance 响应；retained down/未知 Worker feedback 不进入表。该面板只读，
+  Leader performance 响应。该面板只读，
   不改变 Leader admission、allocator、HPA、capacity override 或任务迁移，也不新增
   Kubernetes Metrics API 依赖；历史 CPU、内存、GPU、网络/磁盘属于后续观测范围。
 - **回归覆盖**：`pkg/grpc.TestAssignmentIngressPreservesWorkerLoadWhenDispatcherSampleIsStale`
   固定入口采样、250ms 限频和 dispatcher 超过 2 秒后的展示/调度语义分离；
-  `pkg/webui.TestDashboardShowsCurrentWorkerPodLoadMirror` 固定当前镜像、5 秒新鲜度、
-  缺失态、稳定 live Worker 集合和无新历史/API；真实 Chrome
-  `TestWorkerPodLoadBrowserShowsStableLiveRows` 用乱序 live/down 节点与 CPU feedback
-  验证自然名称排序、72%/12% CPU、running/capacity、Raft limit、fresh 状态、down 排除和
-  可滚动表格。同已有 `test/integration.TestLeaderAssignmentUsesWorkerCPULoadFeedback`
-  继续保证真实 3-voter/Follower/Worker 路径产生的负载反馈与 Leader-only 调度正确性。
+  `pkg/webui.TestDashboardTurnsCurrentWorkerPodLoadIntoSessionChart` 固定当前镜像、5 秒
+  新鲜度、缺失态、稳定 live Worker 集合和无新服务端历史/API；真实 Chrome
+  `TestWorkerPodLoadBrowserBuildsBoundedSessionChart` 用乱序 live/down 节点与 CPU
+  feedback 验证 72%/12% CPU、running、缺失不归零、down 排除和有界会话图。同已有
+  `test/integration.TestLeaderAssignmentUsesWorkerCPULoadFeedback` 继续保证真实
+  3-voter/Follower/Worker 路径产生的负载反馈与 Leader-only 调度正确性。
 
 ### UI-008：租户槽位聚合替代 node×tenant 分配详情
 
 - **问题与需求**：90 Worker、数百 tenant 时，`Tenant allocation` 每秒读取约 1.18MiB
   的 `/admin/allocations`，在浏览器构造完整 placement chip 矩阵；这既不是主监控所需，
-  也放大 Leader/网络/DOM 开销。主表现在只按 Limit 降序展示 tenant、状态、Limit、
-  当前聚合 `Allocated slots` 和 unfinished，不再展示每 Pod 分配详情。
+  也放大 Leader/网络/DOM 开销。页面现在只画每租户当前聚合 `Allocated slots` 的浏览器
+  会话趋势，虚线叠加配置 Limit，不再展示表格或每 Pod 分配详情。
 - **数据语义**：每租户槽位来自既有 `allocated-workers:tenant:<id>` collector 指标的
   最新一秒。`current=1` 在复制 ring 前只返回一个 `secs` 值，其他历史数组为空；这是
-  allocation 当前镜像的轻量读法，不新增长期存储。Worker allocation 和 unfinished 两张
-  主图仍分别保留 174 点。nodes/tenants 拓扑每 5 秒刷新，负载、历史和性能继续每秒刷新。
+  allocation 当前镜像的轻量读法。浏览器内存每秒采样并最多保留 60 点，刷新清空，不新增
+  服务端长期存储。Worker allocation 和 unfinished 两张主图仍分别保留 174 点。
+  nodes/tenants 拓扑每 5 秒刷新，负载、历史和性能继续每秒刷新。
 - **负载操作状态**：空的 `Execution`/saved run history 和含义含混的 `Clear history`
   被删除；只在当前 Load Lab operation 存在时显示状态、Stop 与 current JSON。浏览器不再
   把最近 run 写入 `localStorage`。这不清理 server task/history，也不影响 durable accepted
@@ -800,11 +802,34 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   轮询它。聚合值只读，不能用于 task→node ownership、capacity 校验或调度反馈；Leader
   仍提交完整 allocation 镜像。页面变化不改变租户 Limit、借用、unfinished 历史、Raft
   或任务生命周期。
-- **回归覆盖**：组件测试固定聚合列/current-only URL/Limit 排序并禁止 placement、
+- **回归覆盖**：组件测试固定 current-only URL、Limit 图层和会话采样并禁止 placement/
+  table、
   `S.allocations`、allocation endpoint、saved history 和 Clear history；真实 Chrome
   完整创建/提交/排空 Case 要求 allocation endpoint 读取次数为 0、只出现当前 operation
   JSON 且所有 JSON 控件保持紧凑。真实三 voter诊断 Case 验证 Follower 上 current-only
   tenant allocation 恰好一个点，同时保留完整 174 点 unfinished。
+
+### UI-009：图表优先、关联指标共置与高标签量收敛
+
+- **布局边界**：只读监控主区不再保留任何数据表。服务端 174 点的 `Unfinished tasks by
+  tenant` 和 `Worker allocation by instance` 位于顶部；Performance 紧随其后；浏览器
+  会话趋势放在下方。Raft 当前 Apply 值与 Raft 图共置，pending scan/dispatcher queue/
+  CPU admission 与 scheduler 图共置，队列和容量当前值也分别归入对应的主图。
+- **标签收敛**：Worker、tenant 等高基数图按整个可见历史窗口的最大值降序选择 Top 8，
+  保证真正的热点不会因当前瞬时下降而跳出；剩余系列合成一条 `Other N ... (avg)`。
+  使用平均值而非求和，避免大量低值系列的总和压扁 Top 8 的纵轴；legend 最多 9 项。
+- **存储和轮询**：已有 174 点仍由服务端 bounded collector 返回。Worker CPU 和 tenant
+  allocated slots 原本只有当前镜像，页面用 JavaScript 进程内对象形成最多 60 点会话图，
+  实体消失时立即 prune；不使用 `localStorage`/`sessionStorage`，刷新即丢失。这项变化
+  不增加 API 请求，不写 Raft/FSM/Snapshot，也不把 UI 采样反馈给 HPA 或调度。
+- **正确性和非目标**：图只做汇总观测；`Other` 不能用于定位单实例，需通过原始 JSON
+  查看完整当前/历史值。本轮不改变指标定义、174 点服务端保留策略、任务状态、分配协议
+  或性能结论。
+- **回归覆盖**：`dashboardtrend` 单测固定 60 点上限、实体清理、稳定 Top 8 与 remainder
+  平均值；WebUI 组件测试固定图表顺序、指标亲和、零 `<table>`、无浏览器持久化和无新增
+  API；真实 Chrome `TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends`
+  在 12 Worker/12 tenant 响应下验证 legend≤9、`Other (avg)`、至少两个会话采样、
+  Performance 共置和页面零表格。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 
@@ -1387,14 +1412,14 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **初始界面边界**：桌面布局先把单 tenant/all tenant 快速加任务、样例 tenant、tenant
   新建/修改、负载 recipe、自定义 workload、当时的执行状态以及实例并发配置从主区移入 sticky
   sidebar。主区只显示集群摘要、Worker 分配、tenant unfinished、autoscaling/performance
-  信号和 tenant allocation 表，不在表格行内混入加任务或编辑入口。UI-LOAD-003 在保留
+  信号和只读 tenant allocation 观测，不混入加任务或编辑入口。UI-LOAD-003 在保留
   该只读主区边界的前提下继续把这一个混合侧栏拆成左右两类。
 - **响应式行为**：宽屏侧栏固定在 topbar 下并独立滚动，监控主区持续可见；窄于 900px
   时不再强行挤压图表，监控主区排在 workload builder 前面。布局变化不改变每秒轮询、
   174 点历史、JSON 链接、任务提交顺序、当前负载 operation 或任何 Raft/FSM 数据。
 - **回归覆盖**：组件测试固定 sidebar→monitoring 的 DOM 边界，要求所有写入口都属于
-  sidebar 且主区表格只读；真实 Chrome 使用 1440px viewport 验证两栏几何关系、核心
-  图表归属和主表无写按钮，并继续完成 tenant 创建、Worker capacity 修改与 round-robin
+  sidebar 且主区只读；真实 Chrome 使用 1440px viewport 验证两栏几何关系、核心
+  图表归属和主区无写按钮，并继续完成 tenant 创建、Worker capacity 修改与 round-robin
   任务提交，防止只改外观却破坏真实入口。
 
 ### UI-LOAD-003：配置、监控与负载三栏分离

@@ -7,7 +7,7 @@ import (
 	"net/http"
 )
 
-//go:embed index.html loadlab.js
+//go:embed index.html loadlab.js dashboardtrend.js
 var content embed.FS
 
 // Handler returns an http.Handler serving the dashboard on / and falling
@@ -24,10 +24,14 @@ func Handler(apiHandler http.Handler) http.Handler {
 			apiHandler.ServeHTTP(w, r)
 			return
 		}
-		if r.URL.Path == "/assets/loadlab.js" {
-			asset, readErr := fs.ReadFile(content, "loadlab.js")
+		if r.URL.Path == "/assets/loadlab.js" || r.URL.Path == "/assets/dashboardtrend.js" {
+			name := "loadlab.js"
+			if r.URL.Path == "/assets/dashboardtrend.js" {
+				name = "dashboardtrend.js"
+			}
+			asset, readErr := fs.ReadFile(content, name)
 			if readErr != nil {
-				http.Error(w, "load lab asset unavailable", http.StatusInternalServerError)
+				http.Error(w, "dashboard asset unavailable", http.StatusInternalServerError)
 				return
 			}
 			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")

@@ -122,7 +122,7 @@ func TestDashboardUsesOneCompactJSONLinkStyle(t *testing.T) {
 	}
 }
 
-func TestDashboardShowsCurrentWorkerPodLoadMirror(t *testing.T) {
+func TestDashboardTurnsCurrentWorkerPodLoadIntoSessionChart(t *testing.T) {
 	handler := Handler(http.NotFoundHandler())
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -134,16 +134,19 @@ func TestDashboardShowsCurrentWorkerPodLoadMirror(t *testing.T) {
 	for _, fragment := range []string{
 		`id="worker-load-title"`,
 		`id="worker-load-summary"`,
-		`id="worker-load-list"`,
-		`aria-label="Current load for every live Worker Pod"`,
+		`id="worker-cpu-session-chart"`,
+		`id="worker-cpu-session-legend"`,
+		`aria-label="Worker Pod CPU trend recorded in this browser session"`,
 		`aria-label="View current Worker Pod load as JSON"`,
 		`loads=scheduler.worker_telemetry||scheduler.worker_loads||{}`,
 		`cpu_utilization_millis`,
 		`running_tasks`,
-		`reportedCapacity`,
-		`age>5000`,
-		`No fresh sample`,
-		`sorted by Pod name · no history`,
+		`S.sessionHistory.workers`,
+		`S.sessionHistory.workers`,
+		`TREND.recordSample`,
+		`renderSessionTrends()`,
+		`mode='server'`,
+		`'session'`,
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Errorf("dashboard is missing Worker Pod load fragment %q", fragment)
@@ -152,6 +155,8 @@ func TestDashboardShowsCurrentWorkerPodLoadMirror(t *testing.T) {
 	for _, forbidden := range []string{
 		`worker-load-history`,
 		`/api/v1/admin/worker-load`,
+		`id="worker-load-list"`,
+		`<table`,
 	} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("current Worker Pod load mirror unexpectedly adds %q", forbidden)
@@ -173,7 +178,7 @@ func TestWorkerChartUsesOnlyCurrentLiveWorkerNodes(t *testing.T) {
 		`S.nodeAllocationTotals[node.node_id]||0`,
 		`getJSON('/api/v1/metrics?prefix=allocated-workers%3Anode%3A&performance=0')`,
 		`const capacity=liveWorkers.reduce((sum,node)=>sum+Number(node.total_workers||0),0)`,
-		`S.workerHistories.reduce((sum,item)=>sum+item.limit,0)`,
+		`S.workerSeriesMeta.limitTotal`,
 	} {
 		if !strings.Contains(recorder.Body.String(), fragment) {
 			t.Fatalf("dashboard current Worker mirror is missing %q", fragment)
@@ -181,7 +186,7 @@ func TestWorkerChartUsesOnlyCurrentLiveWorkerNodes(t *testing.T) {
 	}
 }
 
-func TestDashboardUsesAggregateTenantSlotsWithoutPlacementMatrix(t *testing.T) {
+func TestDashboardChartsAggregateTenantSlotsWithoutPlacementMatrix(t *testing.T) {
 	handler := Handler(http.NotFoundHandler())
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -190,12 +195,16 @@ func TestDashboardUsesAggregateTenantSlotsWithoutPlacementMatrix(t *testing.T) {
 	}
 	body := recorder.Body.String()
 	for _, fragment := range []string{
-		`<th>Limit</th><th>Allocated slots</th><th>Unfinished</th>`,
-		`current total slots and unfinished tasks · no per-Pod placement details`,
+		`Tenant allocated slots`,
+		`id="tenant-allocation-session-chart"`,
+		`id="tenant-allocation-session-legend"`,
+		`aria-label="Tenant allocated slots trend recorded in this browser session"`,
 		`S.tenantAllocationTotals`,
 		`totals[tenant.id]||0`,
-		`sort((a,b)=>(Number(b.max_workers||0)-Number(a.max_workers||0))`,
 		`prefix=allocated-workers%3Atenant%3A&performance=0&current=1`,
+		`S.sessionHistory.tenants`,
+		`TREND.collapseSeries(tenantSeries,CHART_SERIES_LIMIT,'tenants',false,'average')`,
+		`limit:Number(tenant.max_workers||0)`,
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Errorf("aggregate tenant-slot mirror is missing %q", fragment)
@@ -206,9 +215,88 @@ func TestDashboardUsesAggregateTenantSlotsWithoutPlacementMatrix(t *testing.T) {
 		`S.allocations`,
 		`<th>Placement</th>`,
 		`placement-chip`,
+		`id="tenant-list"`,
+		`<table`,
 	} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("dashboard still exposes per-Pod allocation detail %q", forbidden)
+		}
+	}
+}
+
+func TestDashboardPrioritizesChartsAndGroupsRelatedValues(t *testing.T) {
+	handler := Handler(http.NotFoundHandler())
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	body := recorder.Body.String()
+	primaryCharts := strings.Index(body, `id="primary-charts"`)
+	performance := strings.Index(body, `id="performance-title"`)
+	details := strings.Index(body, `class="details-heading"`)
+	workerSession := strings.Index(body, `id="worker-session-panel"`)
+	tenantSession := strings.Index(body, `id="tenant-session-panel"`)
+	if primaryCharts < 0 || performance <= primaryCharts || details <= performance ||
+		workerSession <= details || tenantSession <= workerSession {
+		t.Fatalf(
+			"dashboard order charts=%d performance=%d details=%d worker=%d tenant=%d",
+			primaryCharts, performance, details, workerSession, tenantSession,
+		)
+	}
+	for _, fragment := range []string{
+		`id="workload-trend-panel"`,
+		`aria-label="Queue signals related to unfinished tasks"`,
+		`id="autoscaling-queue"`,
+		`id="autoscaling-oldest"`,
+		`id="capacity-trend-panel"`,
+		`aria-label="Worker signals related to allocation capacity"`,
+		`id="autoscaling-cpu"`,
+		`id="autoscaling-telemetry"`,
+		`aria-label="Current Raft Apply values"`,
+		`aria-label="Current scheduler values"`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Errorf("dashboard affinity layout is missing %q", fragment)
+		}
+	}
+}
+
+func TestDashboardBoundsHighCardinalityChartsAndUsesEphemeralSessionHistory(t *testing.T) {
+	handler := Handler(http.NotFoundHandler())
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("GET / status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	body := recorder.Body.String()
+	for _, fragment := range []string{
+		`<script src="/assets/dashboardtrend.js"></script>`,
+		`SESSION_HISTORY_LIMIT=60`,
+		`CHART_SERIES_LIMIT=8`,
+		`TREND.collapseSeries(workerSeries,CHART_SERIES_LIMIT,'Pods',false,'average')`,
+		`TREND.collapseSeries(tenantSeries,CHART_SERIES_LIMIT,'tenants',true,'average')`,
+		`sampleSessionState()`,
+		`Up to 60 samples · reset on refresh`,
+		`id="session-charts"`,
+		`id="worker-cpu-session-chart"`,
+		`id="tenant-allocation-session-chart"`,
+		`S.workerSeriesMeta.hidden?`,
+	} {
+		if !strings.Contains(body, fragment) {
+			t.Errorf("bounded dashboard history contract is missing %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{
+		`localStorage.setItem('sluice.dashboard.trends`,
+		`sessionStorage`,
+		`autoscaling-counters`,
+		`submitted_tasks_total`,
+		`completed_tasks_total`,
+		`<table`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("ephemeral chart trend unexpectedly contains %q", forbidden)
 		}
 	}
 }
