@@ -859,10 +859,11 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   `OpCreateTaskBatch`。2026-07-28 部署前同形远程基线为 accepted 1.034s、accepted 后
   排空 8.452s、40 Create Apply/20000 items。批量 API 已存在，但 Leader 仍把每个 HTTP/
   Follower 请求单独 Apply，单条或小批客户端会按请求数放大共识往返。
-- **协议边界**：Leader 新增唯一 submission dispatcher，跨所有外部 gRPC/HTTP 调用和
-  Follower 转发请求聚合；窗口 2ms、单条 Raft 上限 1000，满批立即 flush。Follower 仍只
-  转发，只有当前 Leader 构造并提交 Create 日志；不增加 voter、不改变 shard 归属，也不
-  把 ingress queue 写入 Raft/FSM/Snapshot。
+- **协议边界**：Leader 新增唯一 partial submission dispatcher，跨所有外部 gRPC/HTTP
+  调用和 Follower 转发请求聚合；窗口 2ms、单条 Raft 上限 1000。未满请求进入 dispatcher，
+  满 1000 的请求不能再聚合，直接并发调用 Raft Apply，以保留 Hashicorp Raft 的 ingress
+  pipeline。Follower 仍只转发，只有当前 Leader 构造并提交 Create 日志；不增加 voter、
+  不改变 shard 归属，也不把 ingress queue 写入 Raft/FSM/Snapshot。
 - **正确性**：每个原始请求先独立验证结构；dispatcher 在同一个 tenant mutation 读锁内
   对本批唯一 tenant 各查一次并 Apply。某个请求含未知 tenant 时只拒绝该请求，不能毒化
   同批合法请求；合法请求的 task/response 输入顺序保持不变。`DeleteAllTenants` 继续持
@@ -882,6 +883,25 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   `TestConcurrentHTTPSubmissionsAggregateAtLeader` 让两个 Follower 并发转发 8×100，
   验证 Leader 诊断、每请求响应关联、最终 800 条 exactly once；实际合批数只记录，不做
   跨硬件 timing 门禁。
+
+### SUBMIT-005：满批被 submission dispatcher 串行等待
+
+- **现象与证据**：revision 73 首轮远程同形 A/B 虽把 2 万条的 Create Apply 从 40 减到
+  20，但 durable accepted 从 1.034s 回退到 1.191s。每个 1000 条请求已占满日志上限，
+  无法再合并，却仍排在单 goroutine dispatcher 后等待上一条 Raft Future，页面的
+  concurrency=4 因而失效。
+- **修复边界**：满 1000 条的合法请求绕过 partial dispatcher，允许多个调用并发进入
+  Hashicorp Raft Apply；Raft 仍按日志顺序串行提交/FSM Apply。小于 1000 条的请求继续由
+  唯一 dispatcher 在 2ms/1000 条边界聚合。不能并行直接调用 FSM，也不改变 ACK、租户
+  clear 锁、幂等、allocator notify、task lifecycle 或失败恢复语义。
+- **观测与非目标**：满批仍记录为每请求一个 submission batch，queue wait 只统计到进入
+  Raft 前；`SubmissionBatches == Create Applies`。本修复消除应用层 head-of-line blocking，
+  不绕过 Raft durability，也不保证某个绝对吞吐数字。
+- **回归覆盖**：`TestFullSubmitBatchesRetainConcurrentRaftIngress` 用阻塞 Raft double
+  确定性要求两个 1000 条调用在释放第一个 Future 前都进入 Apply，随后串行 FSM Apply 并
+  验证 2000 条 durable pending。真实三 voter
+  `TestConcurrentFullHTTPBatchesRetainRaftIngress` 经两个 Follower 并发提交 4×1000，
+  验证 4 Create Apply、诊断对齐和全部任务 exactly once；跨硬件不设耗时门禁。
 
 ### LEADER-001：Leader 同时调度和执行
 

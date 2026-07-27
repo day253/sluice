@@ -1453,6 +1453,146 @@ func TestConcurrentHTTPSubmissionsAggregateAtLeader(t *testing.T) {
 	)
 }
 
+// TestConcurrentFullHTTPBatchesRetainRaftIngress preserves SUBMIT-005 across
+// the real follower HTTP, gRPC forwarding, three-voter Raft, Worker, and final
+// result boundary. The focused unit test deterministically proves concurrent
+// ingress; this integration case avoids a machine-dependent timing threshold.
+func TestConcurrentFullHTTPBatchesRetainRaftIngress(t *testing.T) {
+	tc := newTestCluster(t, 3, 100)
+	defer tc.shutdown()
+
+	const (
+		requestCount    = 4
+		tasksPerRequest = 1000
+		totalTasks      = requestCount * tasksPerRequest
+	)
+	tc.addTenant("submit-full-pipeline", totalTasks)
+	tc.waitAllocation(10 * time.Second)
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
+	followers := make([]int, 0, 2)
+	for index := range tc.nodes {
+		if index != leader {
+			followers = append(followers, index)
+		}
+	}
+
+	type submissionResult struct {
+		tasks []types.TaskResponse
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan submissionResult, requestCount)
+	var wg sync.WaitGroup
+	for requestIndex := 0; requestIndex < requestCount; requestIndex++ {
+		requestIndex := requestIndex
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			request := types.BatchTaskSubmitRequest{
+				Tasks: make([]types.TaskSubmitRequest, tasksPerRequest),
+			}
+			for taskIndex := range request.Tasks {
+				request.Tasks[taskIndex] = types.TaskSubmitRequest{
+					TenantID: "submit-full-pipeline",
+					Payload: json.RawMessage(fmt.Sprintf(
+						`{"request":%d,"task":%d}`, requestIndex, taskIndex,
+					)),
+					IdempotencyKey: fmt.Sprintf(
+						"submit-full-pipeline-%d-%d", requestIndex, taskIndex,
+					),
+				}
+			}
+			body, err := json.Marshal(request)
+			if err != nil {
+				results <- submissionResult{err: err}
+				return
+			}
+			response, err := (&http.Client{Timeout: 70 * time.Second}).Post(
+				"http://"+tc.httpAddrs[followers[requestIndex%len(followers)]]+"/api/v1/tasks/batch",
+				"application/json",
+				bytes.NewReader(body),
+			)
+			if err != nil {
+				results <- submissionResult{err: err}
+				return
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusAccepted {
+				payload, _ := io.ReadAll(response.Body)
+				results <- submissionResult{err: fmt.Errorf(
+					"request %d status=%s body=%s",
+					requestIndex, response.Status, payload,
+				)}
+				return
+			}
+			var accepted types.BatchTaskResponse
+			if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+				results <- submissionResult{err: err}
+				return
+			}
+			results <- submissionResult{tasks: accepted.Tasks}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	taskIDs := make([]string, 0, totalTasks)
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if len(result.tasks) != tasksPerRequest {
+			t.Fatalf("accepted tasks = %d, want %d", len(result.tasks), tasksPerRequest)
+		}
+		for _, task := range result.tasks {
+			taskIDs = append(taskIDs, task.TaskID)
+		}
+	}
+	if len(taskIDs) != totalTasks {
+		t.Fatalf("total accepted IDs = %d, want %d", len(taskIDs), totalTasks)
+	}
+
+	tc.waitProcessed(totalTasks, 60*time.Second)
+	processed := tc.proc.processedTaskCounts()
+	for _, taskID := range taskIDs {
+		if got := processed[taskID]; got != 1 {
+			t.Fatalf("task %s processed %d times, want once", taskID, got)
+		}
+	}
+
+	var diagnostics metricspkg.PerformanceDiagnostics
+	tc.waitFor(func() bool {
+		response, err := (&http.Client{Timeout: 5 * time.Second}).Get(
+			"http://" + tc.httpAddrs[followers[0]] + "/api/v1/admin/performance?history=0",
+		)
+		if err != nil {
+			return false
+		}
+		decodeErr := json.NewDecoder(response.Body).Decode(&diagnostics)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK || decodeErr != nil {
+			return false
+		}
+		return diagnostics.Current.Scheduler.SubmissionTasks == totalTasks
+	}, 10*time.Second, "full-batch Leader submission diagnostics through follower")
+
+	scheduler := diagnostics.Current.Scheduler
+	create := diagnostics.Current.Raft[raftpkg.OpCreateTaskBatch]
+	if scheduler.SubmissionRequests != requestCount ||
+		scheduler.SubmissionBatches != requestCount ||
+		scheduler.SubmissionQueueDepth != 0 ||
+		create.Applies != requestCount ||
+		create.Items != totalTasks ||
+		create.Errors != 0 {
+		t.Fatalf("full submission diagnostics = scheduler:%+v create:%+v", scheduler, create)
+	}
+}
+
 // TestAtomicHundredTenantLoadThroughFollowerHTTP locks UI-LOAD-001 at the
 // production boundary. The browser operation is deliberately only a composer:
 // tenant upserts and one round-robin task stream still cross follower HTTP,

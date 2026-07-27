@@ -88,6 +88,44 @@ func (r *blockingCreateRaft) Apply(cmd []byte, _ int) raft.ApplyResult {
 func (r *blockingCreateRaft) IsLeader() bool     { return true }
 func (r *blockingCreateRaft) LeaderAddr() string { return "test:7000" }
 
+type concurrentCreateRaft struct {
+	fsm        *raft.FSM
+	twoStarted chan struct{}
+	release    chan struct{}
+	startOnce  sync.Once
+	applyMu    sync.Mutex
+	entered    atomic.Int32
+	applies    atomic.Int32
+}
+
+func (r *concurrentCreateRaft) Apply(cmd []byte, _ int) raft.ApplyResult {
+	var envelope raft.Command
+	if err := json.Unmarshal(cmd, &envelope); err != nil {
+		return internalTestApplyResult{response: err}
+	}
+	if envelope.Op != raft.OpCreateTaskBatch {
+		return internalTestApplyResult{response: fmt.Errorf("unexpected operation %s", envelope.Op)}
+	}
+	r.applies.Add(1)
+	if r.entered.Add(1) == 2 {
+		r.startOnce.Do(func() { close(r.twoStarted) })
+	}
+	<-r.release
+
+	// Hashicorp Raft accepts concurrent Apply calls but serializes FSM Apply.
+	// Preserve that property in this test double after proving both callers
+	// reached the ingress boundary.
+	r.applyMu.Lock()
+	response := r.fsm.Apply(&hashicorpraft.Log{
+		Data: cmd, Type: hashicorpraft.LogCommand,
+	})
+	r.applyMu.Unlock()
+	return internalTestApplyResult{response: response}
+}
+
+func (r *concurrentCreateRaft) IsLeader() bool     { return true }
+func (r *concurrentCreateRaft) LeaderAddr() string { return "test:7000" }
+
 func newBatchSpyQueue() *batchSpyQueue {
 	return &batchSpyQueue{MemoryQueue: queue.NewMemoryQueue()}
 }
@@ -371,6 +409,90 @@ func TestConcurrentSubmitBatchesShareOneLeaderRaftApply(t *testing.T) {
 	batches, observedRequests, observedTasks, depth := observer.snapshot()
 	if batches != 1 || observedRequests != requests ||
 		observedTasks != requests*tasksPerRequest || depth != 0 {
+		t.Fatalf(
+			"submission observation = batches:%d requests:%d tasks:%d depth:%d",
+			batches, observedRequests, observedTasks, depth,
+		)
+	}
+}
+
+func TestFullSubmitBatchesRetainConcurrentRaftIngress(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{
+		ID: "tenant-a", MaxWorkers: 1000,
+	})
+	testRaft := &concurrentCreateRaft{
+		fsm:        fsm,
+		twoStarted: make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
+	observer := &recordingSubmissionObserver{}
+	svc.SetSubmissionPerformanceObserver(observer)
+
+	const requests = 2
+	start := make(chan struct{})
+	results := make(chan error, requests)
+	for requestIndex := 0; requestIndex < requests; requestIndex++ {
+		requestIndex := requestIndex
+		go func() {
+			<-start
+			tasks := make([]*grpcv1.SubmitRequest, maxSubmitBatchTasks)
+			for taskIndex := range tasks {
+				tasks[taskIndex] = &grpcv1.SubmitRequest{
+					TenantId: "tenant-a",
+					Payload:  []byte(`{"full":true}`),
+					IdempotencyKey: fmt.Sprintf(
+						"full-request-%d-task-%d", requestIndex, taskIndex,
+					),
+				}
+			}
+			response, err := svc.SubmitBatch(
+				context.Background(),
+				&grpcv1.SubmitBatchRequest{Tasks: tasks},
+			)
+			if err == nil && len(response.GetTasks()) != maxSubmitBatchTasks {
+				err = fmt.Errorf(
+					"response tasks = %d, want %d",
+					len(response.GetTasks()), maxSubmitBatchTasks,
+				)
+			}
+			results <- err
+		}()
+	}
+	close(start)
+
+	released := false
+	defer func() {
+		if !released {
+			close(testRaft.release)
+		}
+	}()
+	select {
+	case <-testRaft.twoStarted:
+	case <-time.After(time.Second):
+		t.Fatal("two full batches did not concurrently reach Raft ingress")
+	}
+	close(testRaft.release)
+	released = true
+	for requestIndex := 0; requestIndex < requests; requestIndex++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := testRaft.applies.Load(); got != requests {
+		t.Fatalf("Raft Apply calls = %d, want %d full batches", got, requests)
+	}
+	if got := len(fsm.FindAllPendingTasks()); got != requests*maxSubmitBatchTasks {
+		t.Fatalf(
+			"pending tasks = %d, want %d",
+			got, requests*maxSubmitBatchTasks,
+		)
+	}
+	batches, observedRequests, observedTasks, depth := observer.snapshot()
+	if batches != requests || observedRequests != requests ||
+		observedTasks != requests*maxSubmitBatchTasks || depth != 0 {
 		t.Fatalf(
 			"submission observation = batches:%d requests:%d tasks:%d depth:%d",
 			batches, observedRequests, observedTasks, depth,

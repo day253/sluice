@@ -1274,3 +1274,39 @@ accepted 单轮约快 4.0%、端到端约快 0.8%，但这个固定 Case 原本�
 不会触发跨请求合并；它主要验证唯一 tenant 校验和 dispatcher 没有回退，差值仍可能是
 race/选举/本机调度噪声，不能宣称因果改善。页面 500→1000 和并发小批聚合的效果必须用
 上述远程 100 tenant×200 同形 A/B 复测。
+
+revision 73 / `1103ecd-20260727163236` 的首轮远程复测发现性能回退，因此没有把
+“日志减半”等同于“提交更快”。拓扑、tenant、task、payload、幂等键和隧道与 revision 72
+相同，只有页面请求形状从 500/4 改成 1000/4：
+
+| 阶段 | revision 72（500/4） | revision 73（1000/4） |
+|---|---:|---:|
+| durable accepted | 1.034s | 1.191s |
+| accepted 后排空 | 8.452s | 8.911s |
+| 端到端 | 9.486s（2108.4 task/s） | 10.102s（1979.8 task/s） |
+| Create Apply/items/平均批次 | 40 / 20000 / 500 | 20 / 20000 / 1000 |
+| Claim Apply/items | 232 / 20000 | 261 / 20000 |
+| Complete Apply/items | 247 / 20000 | 275 / 20000 |
+| submission batch/request/task | 无该指标 | 20 / 20 / 20000 |
+| submission 平均/最大 queue wait | 无该指标 | 57.603ms / 148.324ms |
+| 请求错误 / 最终 unfinished | 0 / 0 | 0 / 0 |
+
+Create 日志减半但 accepted 慢约 15.2%，根因是所有满 1000 条请求也经过单 goroutine
+dispatcher；dispatcher 同步等待上一条 Raft Future 后才取下一条，抹掉 HTTP
+concurrency=4 原本能提供的 Hashicorp Raft ingress pipeline。SUBMIT-005 改为只有未满
+请求进入聚合器，满批直接并发 Apply；最终同形远程结果必须在修复部署后追加。
+
+SUBMIT-005 修复后的完整 `make test`（同一 Apple M4 Pro/14 logical CPU/48GiB、
+darwin/arm64/Go 1.26.5，`-race -count=1`）通过，真实 integration 阶段为 414.581s。
+固定 PERF-001 仍是顺序 batch=1000/concurrency=1：
+
+| 阶段 | SUBMIT-004 完整测试 | SUBMIT-005 完整测试 |
+|---|---:|---:|
+| durable submit | 2.762s | 2.647s |
+| accepted 后排空 | 11.000s | 12.001s |
+| 端到端 | 13.762s（1453.3 task/s） | 14.649s（1365.3 task/s） |
+| 错误 / unfinished / 重复执行 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+该轮 submit 快约 4.2%，但 drain 慢约 9.1%、端到端慢约 6.4%；顺序单请求既不经过
+partial dispatcher，也不产生多个并发满批，无法测量 SUBMIT-005，差值按测试/选举/本机
+调度波动记录，不能作为改善或回退结论。修复收益只与下一轮相同远程 1000/4 A/B 比较。

@@ -123,11 +123,13 @@ func (s *Service) Submit(ctx context.Context, req *grpcv1.SubmitRequest) (*grpcv
 
 const maxSubmitBatchTasks = 1000
 
-// SubmitBatch persists pending tasks through the Leader-wide submission
-// dispatcher. Concurrent requests from every HTTP/gRPC client and every
-// forwarding follower can share one bounded Raft log entry. Tenant validation
-// happens only on the leader: a follower may have a briefly stale FSM snapshot
-// and must forward the complete request before validating it.
+// SubmitBatch persists pending tasks through the Leader-wide submission path.
+// Partial concurrent requests from every HTTP/gRPC client and every forwarding
+// follower can share one bounded Raft log entry. Full requests bypass the
+// partial-request dispatcher so concurrent callers retain Raft ingress
+// pipelining. Tenant validation happens only on the leader: a follower may
+// have a briefly stale FSM snapshot and must forward the complete request
+// before validating it.
 func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchRequest) (*grpcv1.SubmitBatchResponse, error) {
 	if req == nil || len(req.Tasks) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "at least one task is required")
@@ -166,12 +168,22 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 		resp.Tasks[i] = &grpcv1.SubmitResponse{TaskId: taskID, TenantId: item.TenantId, Status: types.TaskStatusPending}
 	}
 
-	s.submissionOnce.Do(func() { go s.runSubmissionDispatcher() })
 	outcome := make(chan submissionOutcome, 1)
 	job := submissionJob{
 		create: create, response: resp,
 		receivedAt: time.Now(), outcome: outcome,
 	}
+	// A request that already fills the replicated 1000-task limit cannot
+	// benefit from coalescing. Apply it directly so concurrent full batches
+	// retain Hashicorp Raft's ingress pipelining instead of waiting behind the
+	// dispatcher's previous ApplyFuture.
+	if len(create) == s.submissionMax {
+		s.applySubmissionJobs([]submissionJob{job})
+		result := <-outcome
+		return result.response, result.err
+	}
+
+	s.submissionOnce.Do(func() { go s.runSubmissionDispatcher() })
 	select {
 	case s.submissionJobs <- job:
 		s.setSubmissionQueueDepth(0)
