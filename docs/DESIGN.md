@@ -896,7 +896,10 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   clear 锁、幂等、allocator notify、task lifecycle 或失败恢复语义。
 - **观测与非目标**：满批仍记录为每请求一个 submission batch，queue wait 只统计到进入
   Raft 前；`SubmissionBatches == Create Applies`。本修复消除应用层 head-of-line blocking，
-  不绕过 Raft durability，也不保证某个绝对吞吐数字。
+  不绕过 Raft durability，也不保证某个绝对吞吐数字。revision 74 在与回退轮相同的
+  5 control/5 idle Worker、100 tenant×200、1000/4 远程形状下，把 durable accepted
+  从 1.191s 恢复到 0.636s，Create 仍为 20/20000，最终 unfinished=0；后续两轮 accepted
+  为 0.753s/0.806s，但 HPA 已扩 Worker，因此其消费耗时不与冷态 A/B 混比。
 - **回归覆盖**：`TestFullSubmitBatchesRetainConcurrentRaftIngress` 用阻塞 Raft double
   确定性要求两个 1000 条调用在释放第一个 Future 前都进入 Apply，随后串行 FSM Apply 并
   验证 2000 条 durable pending。真实三 voter

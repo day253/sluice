@@ -1310,3 +1310,31 @@ darwin/arm64/Go 1.26.5，`-race -count=1`）通过，真实 integration 阶段�
 该轮 submit 快约 4.2%，但 drain 慢约 9.1%、端到端慢约 6.4%；顺序单请求既不经过
 partial dispatcher，也不产生多个并发满批，无法测量 SUBMIT-005，差值按测试/选举/本机
 调度波动记录，不能作为改善或回退结论。修复收益只与下一轮相同远程 1000/4 A/B 比较。
+
+revision 74 / `0c5af8c-20260727165411` 部署后先确认 5 control voter、5 个 idle
+stateless Worker、每 Pod 1000 槽、总容量 5000，再执行与 revision 73 完全相同的
+100 tenant×200、小 JSON+唯一幂等键、round-robin、Mac 19090 隧道、batch=1000/
+concurrency=4。第一轮为可比冷态 A/B：
+
+| 阶段 | revision 72（500/4） | revision 73 回退（1000/4） | revision 74 修复（1000/4） |
+|---|---:|---:|---:|
+| durable accepted | 1.034s | 1.191s | 0.636s |
+| accepted 后排空 | 8.452s | 8.911s | 7.835s |
+| 端到端 | 9.486s（2108.4 task/s） | 10.102s（1979.8 task/s） | 8.471s（2360.9 task/s） |
+| Create Apply/items | 40 / 20000 | 20 / 20000 | 20 / 20000 |
+| Claim Apply/items | 232 / 20000 | 261 / 20000 | 220 / 20000 |
+| Complete Apply/items | 247 / 20000 | 275 / 20000 | 233 / 20000 |
+| submission batch/request/task | 无该指标 | 20 / 20 / 20000 | 20 / 20 / 20000 |
+| submission 平均/最大 queue wait | 无该指标 | 57.603ms / 148.324ms | 0.751ms / 10.259ms |
+| 请求错误 / 最终 unfinished | 0 / 0 | 0 / 0 | 0 / 0 |
+
+revision 74 的 accepted 比错误 revision 73 快约 46.6%，也比原 500/4 基线快约 38.5%；
+Create 日志保持减半，说明“满批直达 Raft pipeline、小批才聚合”同时保留了两个收益。
+accepted 后排空和端到端还受 Claim/Complete 批次、Processor、CPU 与 HPA 时序影响，
+不能把该轮 16.1% 的端到端差值全部归因于提交修复。
+
+紧接着再执行两轮相同提交形状，accepted 分别为 0.753s、0.806s，均为
+20 request/20 Create Apply/20000 items、0 错误、0 unfinished；每轮推导的 submission
+平均等待约 1.523ms、1.656ms，queue depth 最终均为 0。其排空分别为 3.722s、3.168s，
+但最终检查时 HPA 已从冷态 5 Worker 扩到 35，处理拓扑不再与前三列一致，所以这两轮只
+证明满批提交没有重新串行化，不用于宣称消费吞吐提升。
