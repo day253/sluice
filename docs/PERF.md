@@ -1375,3 +1375,46 @@ submit 单轮慢约 4.5%、端到端慢约 0.8%，而此形状既不发生 backp
 httptest HTTP/1.1 同 host 实际最多观察到 6 个在途连接。首请求故意延迟 400ms、其余
 20ms 时，20 个请求全部在慢首请求结束前启动，证明滚动补位已经消除整轮 barrier；这只
 是客户端调度证据，不与远程 Raft 吞吐数字混比，也不把 16 误报成浏览器实际 socket 数。
+
+revision 75 / `0243312-20260728171340` 部署到单机 MicroK8s：Tiger ThinkPad L14
+Gen 2，AMD Ryzen 7 PRO 5850U（8 core/16 thread）、60GiB RAM、Ubuntu 26.04、
+Kubernetes 1.36.2、Go 1.26.0。所有 control、Worker、registry 和客户端隧道仍位于同一
+物理故障域；Mac 经 `127.0.0.1:19090` SSH 隧道提交。发布时为 5 control voter/
+0 non-voter、5 个冷态 stateless Worker、每 Pod 1000 槽、总容量 5000；DemoProcessor
+仍为每条 50–200ms，小 JSON payload 包含 source/run/index，所有 20000 条使用唯一
+idempotency key。发布前远端非 race `go test ./...` 的 integration 为 323.417s；
+本机完整 `make test -race -count=1` 的 integration 为 420.764s。期间确认并修复
+CI-003：测试预取后关闭 ephemeral port 会在 7 节点启动前被内核复用；该测试隔离修复
+不进入生产镜像的监听或任务路径。
+
+先执行与 revision 74 完全同形的冷态 `100 tenant × 200`、round-robin、
+batch=1000、`Promise.all` wave concurrency=4：
+
+| 阶段 | revision 74（SUBMIT-005） | revision 75（SUBMIT-006） |
+|---|---:|---:|
+| durable accepted | 0.636s | 0.722s |
+| accepted 后排空 | 7.835s | 7.469s |
+| 端到端 | 8.471s（2360.9 task/s） | 8.191s（2441.7 task/s） |
+| Create Apply/items/error | 20 / 20000 / 0 | 20 / 20000 / 0 |
+| Claim Apply/items/error | 220 / 20000 / 0 | 197 / 20000 / 0 |
+| Complete Apply/items/error | 233 / 20000 / 0 | 204 / 20000 / 0 |
+| Create Apply 平均/最大 | 未记录 | 51.029ms / 67.216ms |
+| submission queue 平均/最大 | 0.751ms / 10.259ms | 1.559ms / 15.958ms |
+| Apply wait / 429 / 最终 in-flight / waiting | 无该指标 | 0 / 0 / 0 / 0 |
+| 请求错误 / 最终 unfinished | 0 / 0 | 0 / 0 |
+
+accepted 单轮慢 13.5%，排空快 4.7%，端到端快 3.3%；请求数和 Create Apply 完全相同，
+没有进入新增 backpressure，且差值同时受 Raft/CPU/HPA 时序影响，因此按噪声记录，
+不宣称 SUBMIT-006 对旧 `1000/4` 有改善或回退。该轮结束后 workload autoscaler 已把
+Worker 从 5 扩到 15，证明后续轮次不再是冷态可比拓扑。
+
+随后直接调用页面实际 `createSubmissionController("auto")` 和 `runRolling`，在 15
+个起始 Worker 上再提交相同 20 个满批。Auto 从 8 增到 12，实际最大在途 10，
+backoff=0；durable accepted=0.538s，20 Create Apply/20000 items、0 error、0 wait、
+0 rejection。按两次累计计数反推，本轮 Create Apply 平均约 81.641ms，submission
+queue 平均约 5.401ms，累计最大分别 120.246ms/83.666ms。排空为 3.641s，端到端
+4.179s（4785.8 task/s），Claim/Complete 分别为 87/91 Apply；但期间 Worker 又从
+15 扩到 18，所以这些消费数字单列为动态拓扑证据，不能与冷态结果比较。accepted 比
+前一轮短 25.5% 只说明相同 control/请求量下滚动流水线没有被旧 wave barrier 阻塞，
+仍不是严格冷态 A/B。最终 100 个租户 unfinished=0，Leader pressure
+in-flight=0、waiting=0，在线配置 limit=16。
