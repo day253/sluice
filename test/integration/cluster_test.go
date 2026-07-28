@@ -44,6 +44,7 @@ import (
 	k8slog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	workloadautoscaler "github.com/day253/sluice/internal/autoscaler"
+	"github.com/day253/sluice/internal/testutil"
 	metricspkg "github.com/day253/sluice/pkg/metrics"
 	"github.com/day253/sluice/pkg/node"
 	"github.com/day253/sluice/pkg/queue"
@@ -203,21 +204,28 @@ func newTestClusterWithMemberAdder(
 		submissionApplyLimit:       submissionApplyLimit,
 	}
 
-	// ---- Allocate random loopback ports ----
+	// ---- Reserve random loopback ports ----
+	//
+	// Keep every port bound until immediately before its Node is constructed.
+	// Closing all ephemeral listeners up front lets the kernel recycle an
+	// address inside this same cluster, which made large integration clusters
+	// fail intermittently with "bind: address already in use".
+	addresses, err := testutil.ReserveLoopbackTCP(2 * n)
+	if err != nil {
+		tb.Fatalf("reserve cluster ports: %v", err)
+	}
+	tb.Cleanup(func() { _ = addresses.Close() })
 	for i := 0; i < n; i++ {
-		raftL, err := net.Listen("tcp", "127.0.0.1:0")
+		raftAddress, err := addresses.Address(2 * i)
 		if err != nil {
-			tb.Fatalf("allocate raft port: %v", err)
+			tb.Fatalf("read raft port reservation: %v", err)
 		}
-		tc.raftAddrs[i] = raftL.Addr().String()
-		raftL.Close()
-
-		httpL, err := net.Listen("tcp", "127.0.0.1:0")
+		httpAddress, err := addresses.Address(2*i + 1)
 		if err != nil {
-			tb.Fatalf("allocate http port: %v", err)
+			tb.Fatalf("read HTTP port reservation: %v", err)
 		}
-		tc.httpAddrs[i] = httpL.Addr().String()
-		httpL.Close()
+		tc.raftAddrs[i] = raftAddress
+		tc.httpAddrs[i] = httpAddress
 
 		dir, err := os.MkdirTemp("", "rl-int-*")
 		if err != nil {
@@ -227,6 +235,12 @@ func newTestClusterWithMemberAdder(
 	}
 
 	// ---- Create node 0 (bootstrap) ----
+	if err := addresses.Release(0); err != nil {
+		tb.Fatalf("release node-0 raft port: %v", err)
+	}
+	if err := addresses.Release(1); err != nil {
+		tb.Fatalf("release node-0 HTTP port: %v", err)
+	}
 	node0, err := node.New(node.Config{
 		NodeID:                     "node-0",
 		APIAddress:                 tc.httpAddrs[0],
@@ -256,6 +270,12 @@ func newTestClusterWithMemberAdder(
 	// ---- Create remaining nodes (add voter before Start) ----
 	for i := 1; i < n; i++ {
 		nodeID := fmt.Sprintf("node-%d", i)
+		if err := addresses.Release(2 * i); err != nil {
+			tb.Fatalf("release %s raft port: %v", nodeID, err)
+		}
+		if err := addresses.Release(2*i + 1); err != nil {
+			tb.Fatalf("release %s HTTP port: %v", nodeID, err)
+		}
 		nd, err := node.New(node.Config{
 			NodeID:                     nodeID,
 			APIAddress:                 tc.httpAddrs[i],
@@ -797,18 +817,20 @@ func TestStatelessWorkerRoleSplit(t *testing.T) {
 	dirs := make([]string, controlCount)
 	raftAddrs := make([]string, controlCount)
 	httpAddrs := make([]string, controlCount)
-	allocateAddress := func() string {
-		listener, err := net.Listen("tcp", "127.0.0.1:0")
+	addresses, err := testutil.ReserveLoopbackTCP(2 * controlCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = addresses.Close() })
+	for index := 0; index < controlCount; index++ {
+		raftAddrs[index], err = addresses.Address(2 * index)
 		if err != nil {
 			t.Fatal(err)
 		}
-		address := listener.Addr().String()
-		listener.Close()
-		return address
-	}
-	for index := 0; index < controlCount; index++ {
-		raftAddrs[index] = allocateAddress()
-		httpAddrs[index] = allocateAddress()
+		httpAddrs[index], err = addresses.Address(2*index + 1)
+		if err != nil {
+			t.Fatal(err)
+		}
 		dir, err := os.MkdirTemp("", "sluice-control-role-*")
 		if err != nil {
 			t.Fatal(err)
@@ -816,6 +838,12 @@ func TestStatelessWorkerRoleSplit(t *testing.T) {
 		dirs[index] = dir
 	}
 	for index := 0; index < controlCount; index++ {
+		if err := addresses.Release(2 * index); err != nil {
+			t.Fatalf("release control-%d raft port: %v", index, err)
+		}
+		if err := addresses.Release(2*index + 1); err != nil {
+			t.Fatalf("release control-%d HTTP port: %v", index, err)
+		}
 		control, err := node.New(node.Config{
 			Role: types.NodeRoleControl, NodeID: fmt.Sprintf("control-%d", index),
 			APIAddress: httpAddrs[index], RaftAddress: raftAddrs[index], DataDir: dirs[index],
@@ -3484,6 +3512,34 @@ func TestAllocationScaleDownLetsInflightProcessorsFinish(t *testing.T) {
 		if got := processed[taskID]; got != 1 {
 			t.Fatalf("task %s processed %d times, want once", taskID, got)
 		}
+	}
+}
+
+// TestReservedClusterAddressesStartAllMembers preserves CI-003 at the real
+// multi-node boundary. The harness must keep every address unique until the
+// corresponding Raft transport and cmux server take ownership.
+func TestReservedClusterAddressesStartAllMembers(t *testing.T) {
+	tc := newTestClusterWithVoterLimit(t, 7, 0, 3, zap.NewNop())
+	defer tc.shutdown()
+
+	seen := make(map[string]string, len(tc.raftAddrs)+len(tc.httpAddrs))
+	for index := range tc.nodes {
+		for role, address := range map[string]string{
+			"raft": tc.raftAddrs[index],
+			"http": tc.httpAddrs[index],
+		} {
+			if owner, duplicate := seen[address]; duplicate {
+				t.Fatalf("%s address %s duplicates %s", role, address, owner)
+			}
+			seen[address] = fmt.Sprintf("node-%d/%s", index, role)
+		}
+	}
+	status, err := tc.nodes[tc.leaderIdx()].RaftCluster().MembershipStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(status.Voters) != 3 || len(status.Nonvoters) != 4 {
+		t.Fatalf("membership = voters %v nonvoters %v, want 3/4", status.Voters, status.Nonvoters)
 	}
 }
 
