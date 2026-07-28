@@ -10,6 +10,13 @@ var SluiceLoadLab = (function () {
     minRandomTenants: 3,
     maxRandomTenants: 7
   });
+  const SUBMISSION_CONCURRENCY = Object.freeze({
+    autoStart: 8,
+    autoMin: 4,
+    autoMax: 16,
+    manual: Object.freeze([4, 8, 16, 32]),
+    slowMilliseconds: 1000
+  });
 
   const RANDOM_TENANT_ADJECTIVES = Object.freeze([
     'Amber', 'Atlas', 'Blue', 'Cedar', 'Cloud', 'Copper',
@@ -213,8 +220,107 @@ var SluiceLoadLab = (function () {
     return RECIPES.find(item => item.id === id) || null;
   }
 
+  function normalizeSubmissionMode(value) {
+    if (value === 'auto' || value === undefined || value === null) return 'auto';
+    const parsed = Number(value);
+    return SUBMISSION_CONCURRENCY.manual.includes(parsed) ? String(parsed) : 'auto';
+  }
+
+  // Auto uses additive increase and multiplicative decrease. It controls only
+  // browser request concurrency; the Leader remains the authoritative,
+  // bounded Raft ingress boundary.
+  function createSubmissionController(value) {
+    const mode = normalizeSubmissionMode(value);
+    const fixed = mode === 'auto' ? null : Number(mode);
+    const state = {
+      mode,
+      current: fixed || SUBMISSION_CONCURRENCY.autoStart,
+      maxObserved: fixed || SUBMISSION_CONCURRENCY.autoStart,
+      backoffs: 0,
+      successful: 0
+    };
+    state.observe = sample => {
+      if (fixed) return state.current;
+      const failed = Boolean(sample && sample.failed);
+      const backpressured = Boolean(sample && sample.backpressured);
+      const latency = Math.max(0, Number(sample && sample.latencyMs) || 0);
+      if (failed || backpressured || latency >= SUBMISSION_CONCURRENCY.slowMilliseconds) {
+        state.current = Math.max(
+          SUBMISSION_CONCURRENCY.autoMin,
+          Math.floor(state.current / 2)
+        );
+        state.backoffs++;
+        state.successful = 0;
+        return state.current;
+      }
+      state.successful++;
+      if (state.successful >= state.current) {
+        state.current = Math.min(SUBMISSION_CONCURRENCY.autoMax, state.current + 2);
+        state.maxObserved = Math.max(state.maxObserved, state.current);
+        state.successful = 0;
+      }
+      return state.current;
+    };
+    return state;
+  }
+
+  // Keep the pipeline full as each request settles instead of imposing
+  // Promise.all wave barriers. The controller may change its target while the
+  // operation is running.
+  function runRolling(items, controller, work, onSettled, shouldStop) {
+    return new Promise(resolve => {
+      const results = new Array(items.length);
+      let next = 0;
+      let active = 0;
+      const pump = () => {
+        while (
+          next < items.length &&
+          active < controller.current &&
+          !(shouldStop && shouldStop())
+        ) {
+          const index = next++;
+          const started = Date.now();
+          active++;
+          Promise.resolve()
+            .then(() => work(items[index], index))
+            .then(
+              value => ({status: 'fulfilled', value}),
+              reason => ({status: 'rejected', reason})
+            )
+            .then(result => {
+              active--;
+              results[index] = result;
+              const status = Number(result.reason && result.reason.status) || 0;
+              controller.observe({
+                latencyMs: Date.now() - started,
+                failed: result.status === 'rejected',
+                backpressured: status === 429 || status === 503
+              });
+              if (onSettled) onSettled(result, items[index], index, controller);
+              if (
+                active === 0 &&
+                (next >= items.length || (shouldStop && shouldStop()))
+              ) {
+                resolve(results);
+                return;
+              }
+              pump();
+            });
+        }
+        if (
+          active === 0 &&
+          (next >= items.length || (shouldStop && shouldStop()))
+        ) {
+          resolve(results);
+        }
+      };
+      pump();
+    });
+  }
+
   return Object.freeze({
     LIMITS,
+    SUBMISSION_CONCURRENCY,
     RECIPES,
     normalizeOptions,
     buildTenantSpecs,
@@ -222,6 +328,9 @@ var SluiceLoadLab = (function () {
     buildRoundRobinJobs,
     splitWaves,
     summarize,
-    recipe
+    recipe,
+    normalizeSubmissionMode,
+    createSubmissionController,
+    runRolling
   });
 })();

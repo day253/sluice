@@ -640,6 +640,8 @@ func (h *Handler) writeGRPCError(w http.ResponseWriter, err error) {
 		httpCode = http.StatusConflict
 	case codes.DeadlineExceeded:
 		httpCode = http.StatusRequestTimeout
+	case codes.ResourceExhausted:
+		httpCode = http.StatusTooManyRequests
 	case codes.Unavailable:
 		httpCode = http.StatusServiceUnavailable
 	}

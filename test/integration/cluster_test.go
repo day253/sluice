@@ -92,6 +92,7 @@ type testCluster struct {
 	maxVoters                   int
 	disableVoterReconciliation  bool
 	allocatorInterval           time.Duration
+	submissionApplyLimit        int
 	leaderElectionRetryInterval time.Duration
 
 	mu      sync.Mutex
@@ -129,7 +130,7 @@ func newClaimRejectCountingLogger(rejectedClaims *atomic.Int64) *zap.Logger {
 }
 
 func newTestClusterWithLogger(tb testing.TB, n int, totalWorkersPerNode int, logger *zap.Logger) *testCluster {
-	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, raftpkg.DefaultMaxVoters, false, 0, logger,
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, raftpkg.DefaultMaxVoters, false, 0, 0, logger,
 		func(cluster *raftpkg.Cluster, nodeID, address string) error {
 			return cluster.AddVoter(nodeID, address)
 		})
@@ -138,24 +139,36 @@ func newTestClusterWithLogger(tb testing.TB, n int, totalWorkersPerNode int, log
 func newTestClusterWithAllocatorInterval(
 	tb testing.TB, n int, totalWorkersPerNode int, interval time.Duration,
 ) *testCluster {
-	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, raftpkg.DefaultMaxVoters, false, interval, zap.NewNop(),
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, raftpkg.DefaultMaxVoters, false, interval, 0, zap.NewNop(),
 		func(cluster *raftpkg.Cluster, nodeID, address string) error {
 			return cluster.AddVoter(nodeID, address)
 		})
 }
 
 func newTestClusterWithVoterLimit(tb testing.TB, n int, totalWorkersPerNode, maxVoters int, logger *zap.Logger) *testCluster {
-	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, maxVoters, false, 0, logger,
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, maxVoters, false, 0, 0, logger,
 		func(cluster *raftpkg.Cluster, nodeID, address string) error {
 			return cluster.AddServer(nodeID, address, maxVoters)
 		})
 }
 
 func newAllVoterTestCluster(tb testing.TB, n int, totalWorkersPerNode int) *testCluster {
-	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, n, true, 0, zap.NewNop(),
+	return newTestClusterWithMemberAdder(tb, n, totalWorkersPerNode, n, true, 0, 0, zap.NewNop(),
 		func(cluster *raftpkg.Cluster, nodeID, address string) error {
 			return cluster.AddVoter(nodeID, address)
 		})
+}
+
+func newTestClusterWithSubmissionApplyLimit(
+	tb testing.TB, n int, totalWorkersPerNode, submissionApplyLimit int,
+) *testCluster {
+	return newTestClusterWithMemberAdder(
+		tb, n, totalWorkersPerNode, raftpkg.DefaultMaxVoters, false, 0,
+		submissionApplyLimit, zap.NewNop(),
+		func(cluster *raftpkg.Cluster, nodeID, address string) error {
+			return cluster.AddVoter(nodeID, address)
+		},
+	)
 }
 
 func newTestClusterWithMemberAdder(
@@ -165,6 +178,7 @@ func newTestClusterWithMemberAdder(
 	maxVoters int,
 	disableVoterReconciliation bool,
 	allocatorInterval time.Duration,
+	submissionApplyLimit int,
 	logger *zap.Logger,
 	addMember func(*raftpkg.Cluster, string, string) error,
 ) *testCluster {
@@ -186,6 +200,7 @@ func newTestClusterWithMemberAdder(
 		maxVoters:                  maxVoters,
 		disableVoterReconciliation: disableVoterReconciliation,
 		allocatorInterval:          allocatorInterval,
+		submissionApplyLimit:       submissionApplyLimit,
 	}
 
 	// ---- Allocate random loopback ports ----
@@ -222,6 +237,7 @@ func newTestClusterWithMemberAdder(
 		MaxRaftVoters:              maxVoters,
 		DisableVoterReconciliation: disableVoterReconciliation,
 		AllocatorInterval:          allocatorInterval,
+		SubmissionApplyLimit:       submissionApplyLimit,
 	}, tc.proc, logger)
 	if err != nil {
 		tb.Fatalf("create node-0: %v", err)
@@ -250,6 +266,7 @@ func newTestClusterWithMemberAdder(
 			MaxRaftVoters:              maxVoters,
 			DisableVoterReconciliation: disableVoterReconciliation,
 			AllocatorInterval:          allocatorInterval,
+			SubmissionApplyLimit:       submissionApplyLimit,
 		}, tc.proc, logger)
 		if err != nil {
 			tb.Fatalf("create node-%d: %v", i, err)
@@ -497,6 +514,7 @@ func (tc *testCluster) recreateAllForRestart() {
 			MaxRaftVoters:               tc.maxVoters,
 			DisableVoterReconciliation:  tc.disableVoterReconciliation,
 			AllocatorInterval:           tc.allocatorInterval,
+			SubmissionApplyLimit:        tc.submissionApplyLimit,
 			LeaderElectionRetryInterval: tc.leaderElectionRetryInterval,
 		}, tc.proc, logger)
 		if err != nil {
@@ -1458,7 +1476,7 @@ func TestConcurrentHTTPSubmissionsAggregateAtLeader(t *testing.T) {
 // result boundary. The focused unit test deterministically proves concurrent
 // ingress; this integration case avoids a machine-dependent timing threshold.
 func TestConcurrentFullHTTPBatchesRetainRaftIngress(t *testing.T) {
-	tc := newTestCluster(t, 3, 100)
+	tc := newTestClusterWithSubmissionApplyLimit(t, 3, 100, 2)
 	defer tc.shutdown()
 
 	const (
@@ -1586,6 +1604,9 @@ func TestConcurrentFullHTTPBatchesRetainRaftIngress(t *testing.T) {
 	if scheduler.SubmissionRequests != requestCount ||
 		scheduler.SubmissionBatches != requestCount ||
 		scheduler.SubmissionQueueDepth != 0 ||
+		scheduler.SubmissionApplyInFlight != 0 ||
+		scheduler.SubmissionApplyWaiting != 0 ||
+		scheduler.SubmissionApplyLimit != 2 ||
 		create.Applies != requestCount ||
 		create.Items != totalTasks ||
 		create.Errors != 0 {

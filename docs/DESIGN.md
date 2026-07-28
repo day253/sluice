@@ -872,7 +872,8 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **页面与观测**：Load Lab/quick load 改为 API 最大值 batch=1000、concurrency=4，
   因而固定 2 万形状从 40 个请求降为 20 个。Leader performance 当前值和 174 点历史新增
   submission batches/requests/tasks、queue wait/depth；Create Apply latency/item/batch
-  仍是最终共识证据。观测只在 Leader 进程内存，不参与调度。
+  仍是最终共识证据。观测只在 Leader 进程内存，不参与调度。后续 SUBMIT-006 已用
+  滚动自适应流水线取代这里的固定 concurrency=4。
 - **非目标**：本轮不把单条 Raft 日志放大到 1000 以上；优化 durable accepted，不声称
   改善 Claim/Complete、Processor 时长或端到端消费吞吐。未填满的单请求会增加最多 2ms
   聚合等待，这是吞吐与点延迟的明确交换；更多持续写吞吐仍要按租户归属扩展 Multi-Raft
@@ -905,6 +906,43 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   验证 2000 条 durable pending。真实三 voter
   `TestConcurrentFullHTTPBatchesRetainRaftIngress` 经两个 Follower 并发提交 4×1000，
   验证 4 Create Apply、诊断对齐和全部任务 exactly once；跨硬件不设耗时门禁。
+
+### SUBMIT-006：浏览器固定波次与 Leader 无界满批 Apply
+
+- **现象与证据**：页面把 1000 条请求按 `concurrency=4` 分组后逐轮
+  `Promise.allSettled`；同轮一个慢请求会阻止下一轮全部请求，且这个浏览器常量并不是
+  API 安全边界，任意客户端都能同时把更多未完成 Future 压到 Leader。revision 74 的
+  100 tenant×200 基线虽只有 20 个请求并已达到 0.636s accepted，但更大的 burst 没有
+  Leader 端内存/未决 Apply 上限，也无法区分“客户端波次等待”和“Raft ingress 饱和”。
+- **协议边界**：每个 control 进程配置 `submit-apply-limit`，默认 16、合法范围 1..128；
+  只有当前 Leader 在 tenant validation/Create Apply 之前取得进程内 slot。最多再容纳
+  `4×limit` 个等待者，之后在肯定尚未调用 Raft Apply 的边界返回 gRPC
+  `ResourceExhausted`/HTTP 429。等待 request context 到期也肯定未 Apply；一旦取得 slot
+  并进入 Raft，仍沿用既有未知结果和幂等键语义。slot/等待队列是 process-local current
+  state，不写 Raft/FSM/Snapshot；Leader 变更自然建立新进程边界。
+- **正确性与失败模型**：配额只包围 `OpCreateTaskBatch` 的未完成 Apply Future，不改变
+  单条最大 1000、日志/FSM 顺序、唯一 Leader、tenant mutation 临界区、durable ACK、
+  allocator notify、task owner 或 final commit。partial dispatcher 也经过同一个 slot
+  边界，不能绕过保护。429 的 quick/load 请求均携带稳定 run/tenant/index 幂等键并带
+  抖动重试；网络超时仍可能是未知结果，不能把 429 机制泛化为 exactly-once 业务副作用。
+- **页面流水线**：浏览器把所有 1000 条 batch 放入滚动队列，请求一结束就补下一个，
+  不再等待整轮最慢请求。Auto 从 8 起步，连续成功按 `+2` 增至 16；429/503、失败或
+  ≥1s 延迟按 `÷2` 降至最小 4。操作者可显式选 4/8/16/32；这是排队目标，不是安全限制，
+  也不承诺 HTTP/1.1 的实际 socket 数（真实 Chrome 同 host 测试为 6）。当前 run JSON
+  保存 mode/current/max/backoff，仅属刷新即失的浏览器 operation 状态。
+- **可观测与非目标**：Leader current JSON 和 174 点历史新增 Apply
+  in-flight/waiting/limit、backpressure waits/rejections/latency；页面与原始 JSON同时可见。
+  这些诊断不参与配额决策之外的调度反馈，也不写 Raft。本轮不增加单日志任务数、不改变
+  Claim/Complete/Processor/HPA、不承诺 Worker 扩容能突破单 shard Create commit 上限；
+  超过单 shard 的持续写入仍由后续 Multi-Raft 分片解决。
+- **回归覆盖**：`TestFullSubmitBatchesRespectGlobalRaftApplyLimit` 确定性阻塞 4 个满批，
+  要求同时进入 Raft 的调用恰好为 2；deadline 测试要求等待者未 Apply；有界队列测试要求
+  第 6 个调用在 `limit=1` 时得到 ResourceExhausted。metrics/API/Chart 测试固定指标、
+  429 映射和三种 control 启动路径。纯 JS 测试固定 AIMD/手动模式；真实 Chrome
+  `TestLoadLabBrowserUsesRollingSubmissionConcurrency` 用一个慢首请求证明 20 个 batch
+  均在它结束前启动。真实三 voter `TestConcurrentFullHTTPBatchesRetainRaftIngress`
+  以 `limit=2` 经两个 Follower 提交 4×1000，要求配置镜像、队列归零、4 次 Create
+  和全部任务 exactly once。
 
 ### LEADER-001：Leader 同时调度和执行
 
@@ -1444,8 +1482,9 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   `load-lab-001..100` tenant，以及按 tenant 轮转构造任务流。quota 可取相同、5/20/100
   分层或斜坡；任务可取均匀、单热 tenant 或 1/3/8 金字塔；delivery 可取立即 burst 或
   最多 20 个一秒 wave。preset 只是这些原子的已命名参数，不另开测试后门。
-- **提交与边界**：任务仍使用 `/api/v1/tasks/batch`，batch=500、并发=4，跨 tenant
-  round-robin，每条任务携带 run/tenant/index 幂等键；未知结果只重试一次。浏览器硬上限
+- **提交与边界**：任务仍使用 `/api/v1/tasks/batch`，batch=1000、滚动 Auto 8→16
+  （或手动 4/8/16/32），跨 tenant round-robin，每条任务携带 run/tenant/index 幂等键；
+  未知结果只重试一次，SUBMIT-006 的 Leader slot/429 才是服务端安全边界。浏览器硬上限
   为 100 tenant、单 tenant 5000 条、单次合计 100000 条。开始前若共享 Load Lab pool
   仍有 unfinished，拒绝覆盖；Stop 只停止未来批次，已经 durable accepted 的任务继续
   排空。

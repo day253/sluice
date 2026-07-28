@@ -7,9 +7,20 @@ import (
 	"testing"
 	"time"
 
+	grpcpkg "github.com/day253/sluice/pkg/grpc"
 	raftpkg "github.com/day253/sluice/pkg/raft"
 	"github.com/day253/sluice/pkg/types"
 )
+
+func TestNodeRejectsUnsafeSubmissionApplyLimit(t *testing.T) {
+	_, err := New(Config{
+		MaxRaftVoters:        1,
+		SubmissionApplyLimit: grpcpkg.MaxSubmissionApplyLimit + 1,
+	}, nil, nil)
+	if err == nil {
+		t.Fatal("oversized submission Apply limit was accepted")
+	}
+}
 
 func TestWaitForRaftLeaderKeepsProcessAliveAcrossRetryWindows(t *testing.T) {
 	var waits atomic.Int32

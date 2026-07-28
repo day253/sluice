@@ -18,15 +18,22 @@ import (
 )
 
 type loadLabBrowserAPI struct {
-	mu                sync.Mutex
-	tenants           map[string]map[string]any
-	submitted         int
-	idempotencyKey    map[string]bool
-	workerCapacity    int
-	capacityWrites    int
-	allCapacityWrites int
-	clearTenantWrites int
-	allocationReads   int
+	mu                            sync.Mutex
+	tenants                       map[string]map[string]any
+	submitted                     int
+	idempotencyKey                map[string]bool
+	workerCapacity                int
+	capacityWrites                int
+	allCapacityWrites             int
+	clearTenantWrites             int
+	allocationReads               int
+	submitRequests                int
+	activeSubmits                 int
+	maxActiveSubmits              int
+	startedBeforeFirstSubmitEnded int
+	firstSubmitEnded              bool
+	submitDelay                   time.Duration
+	firstSubmitDelay              time.Duration
 }
 
 func newLoadLabBrowserAPI() *loadLabBrowserAPI {
@@ -197,6 +204,32 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"error":"bad batch"}`, http.StatusBadRequest)
 			return
 		}
+		a.mu.Lock()
+		requestIndex := a.submitRequests
+		a.submitRequests++
+		a.activeSubmits++
+		if a.activeSubmits > a.maxActiveSubmits {
+			a.maxActiveSubmits = a.activeSubmits
+		}
+		if !a.firstSubmitEnded {
+			a.startedBeforeFirstSubmitEnded++
+		}
+		delay := a.submitDelay
+		if requestIndex == 0 && a.firstSubmitDelay > 0 {
+			delay = a.firstSubmitDelay
+		}
+		a.mu.Unlock()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		defer func() {
+			a.mu.Lock()
+			a.activeSubmits--
+			if requestIndex == 0 {
+				a.firstSubmitEnded = true
+			}
+			a.mu.Unlock()
+		}()
 		tasks := make([]map[string]any, 0, len(request.Tasks))
 		a.mu.Lock()
 		for index, task := range request.Tasks {
@@ -883,7 +916,7 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	api.mu.Lock()
 	defer api.mu.Unlock()
 	if len(api.tenants) != 0 || api.submitted != 7 ||
-		len(api.idempotencyKey) != 6 || api.capacityWrites != 1 ||
+		len(api.idempotencyKey) != 7 || api.capacityWrites != 1 ||
 		api.allCapacityWrites != 1 || api.clearTenantWrites != 1 ||
 		api.allocationReads != 0 {
 		t.Fatalf(
@@ -891,6 +924,71 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 			len(api.tenants), api.submitted, len(api.idempotencyKey),
 			api.capacityWrites, api.allCapacityWrites, api.clearTenantWrites,
 			api.allocationReads,
+		)
+	}
+}
+
+func TestLoadLabBrowserUsesRollingSubmissionConcurrency(t *testing.T) {
+	chromePath := findChrome()
+	if chromePath == "" {
+		t.Skip("Chrome/Chromium is not installed")
+	}
+	api := newLoadLabBrowserAPI()
+	api.submitDelay = 20 * time.Millisecond
+	api.firstSubmitDelay = 400 * time.Millisecond
+	server := httptest.NewServer(Handler(api))
+	defer server.Close()
+
+	allocator, cancelAllocator := chromedp.NewExecAllocator(
+		context.Background(),
+		append(chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.ExecPath(chromePath),
+			chromedp.Flag("headless", true),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("no-sandbox", true),
+			chromedp.WindowSize(1440, 1000),
+		)...,
+	)
+	defer cancelAllocator()
+	browserContext, cancelBrowser := chromedp.NewContext(allocator)
+	defer cancelBrowser()
+	ctx, cancel := context.WithTimeout(browserContext, 25*time.Second)
+	defer cancel()
+
+	if err := chromedp.Run(ctx,
+		chromedp.Navigate(server.URL),
+		chromedp.WaitVisible("#load-run-custom", chromedp.ByQuery),
+		chromedp.SetValue("#load-tenant-count", "4", chromedp.ByQuery),
+		chromedp.SetValue("#load-tasks-per-tenant", "5000", chromedp.ByQuery),
+		chromedp.Evaluate(`(() => {
+			const select = document.querySelector("#submit-concurrency");
+			select.value = "16";
+			select.dispatchEvent(new Event("change", {bubbles: true}));
+		})()`, nil),
+		chromedp.Click("#load-run-custom", chromedp.ByQuery),
+	); err != nil {
+		t.Fatal(err)
+	}
+	waitForLoadLabStatus(t, ctx, "completed", 15*time.Second)
+	var configuredConcurrency int
+	if err := chromedp.Run(ctx, chromedp.Evaluate(
+		`S.loadRun.submissionConcurrency`, &configuredConcurrency,
+	)); err != nil {
+		t.Fatal(err)
+	}
+
+	api.mu.Lock()
+	submitted := api.submitted
+	requests := api.submitRequests
+	maxActive := api.maxActiveSubmits
+	startedBeforeFirstEnded := api.startedBeforeFirstSubmitEnded
+	api.mu.Unlock()
+	if submitted != 20_000 || requests != 20 ||
+		maxActive < 5 || maxActive > 6 || startedBeforeFirstEnded != 20 ||
+		configuredConcurrency != 16 {
+		t.Fatalf(
+			"rolling submits tasks=%d requests=%d configured=%d max-active=%d before-slow-first-ended=%d",
+			submitted, requests, configuredConcurrency, maxActive, startedBeforeFirstEnded,
 		)
 	}
 }

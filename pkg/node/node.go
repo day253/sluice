@@ -50,6 +50,9 @@ type Config struct {
 	TotalWorkers    int
 	MaxRaftVoters   int // odd voter cap; remaining members replicate as non-voters
 	MaxRaftMembers  int // zero keeps legacy membership; production control plane sets a fixed bound
+	// SubmissionApplyLimit bounds unresolved Submit Raft Apply futures on the
+	// Leader. Zero selects grpc.DefaultSubmissionApplyLimit.
+	SubmissionApplyLimit int
 	// DisableVoterReconciliation is reserved for externally managed embedded
 	// clusters and protocol tests. Production leaves it false.
 	DisableVoterReconciliation bool
@@ -103,6 +106,17 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	}
 	if cfg.MaxRaftVoters < 1 || cfg.MaxRaftVoters%2 == 0 {
 		return nil, fmt.Errorf("max Raft voters must be a positive odd number, got %d", cfg.MaxRaftVoters)
+	}
+	if cfg.SubmissionApplyLimit == 0 {
+		cfg.SubmissionApplyLimit = grpcpkg.DefaultSubmissionApplyLimit
+	}
+	if cfg.SubmissionApplyLimit < 1 ||
+		cfg.SubmissionApplyLimit > grpcpkg.MaxSubmissionApplyLimit {
+		return nil, fmt.Errorf(
+			"submission Apply limit must be between 1 and %d, got %d",
+			grpcpkg.MaxSubmissionApplyLimit,
+			cfg.SubmissionApplyLimit,
+		)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -183,6 +197,7 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 	// ---- gRPC services (shared by HTTP adapter + gRPC server) ----
 	grpcSvc := grpcpkg.NewService(cfg.NodeID, q, cluster.FSM(), bridge, n.pool, logger)
+	grpcSvc.SetSubmissionApplyLimit(cfg.SubmissionApplyLimit)
 	grpcSvc.SetWorkAvailableFunc(n.allocEngine.NotifyWorkAvailable)
 	grpcSvc.SetSubmissionPerformanceObserver(n.performance)
 	internalSvc := grpcpkg.NewInternalService(cfg.NodeID, cluster.FSM(), bridge, logger)

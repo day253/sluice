@@ -34,48 +34,60 @@ type operationAggregate struct {
 }
 
 type schedulerAggregate struct {
-	SelectionCount          uint64
-	PendingScanned          uint64
-	TasksSelected           uint64
-	LoadAwareRequests       uint64
-	LoadThrottledRequests   uint64
-	LoadUnavailableRequests uint64
-	StaleLoadRequests       uint64
-	TotalSelectMicros       int64
-	MaxSelectMicros         int64
-	LastSelectMicros        int64
-	SubmissionBatches       uint64
-	SubmissionRequests      uint64
-	SubmissionTasks         uint64
-	TotalSubmissionWaitUS   int64
-	MaxSubmissionWaitUS     int64
-	LastSubmissionWaitUS    int64
-	SubmissionQueueDepth    int64
-	AssignmentQueueDepth    int64
-	CompletionQueueDepth    int64
-	AllocationPlanChecks    uint64
-	AllocationPlanApplies   uint64
-	AllocationPlanNoops     uint64
-	WorkerLoads             map[string]WorkerLoadSnapshot
-	WorkerTelemetry         map[string]WorkerLoadSnapshot
+	SelectionCount                   uint64
+	PendingScanned                   uint64
+	TasksSelected                    uint64
+	LoadAwareRequests                uint64
+	LoadThrottledRequests            uint64
+	LoadUnavailableRequests          uint64
+	StaleLoadRequests                uint64
+	TotalSelectMicros                int64
+	MaxSelectMicros                  int64
+	LastSelectMicros                 int64
+	SubmissionBatches                uint64
+	SubmissionRequests               uint64
+	SubmissionTasks                  uint64
+	TotalSubmissionWaitUS            int64
+	MaxSubmissionWaitUS              int64
+	LastSubmissionWaitUS             int64
+	SubmissionQueueDepth             int64
+	SubmissionBackpressureWaits      uint64
+	SubmissionBackpressureRejections uint64
+	TotalSubmissionBackpressureUS    int64
+	MaxSubmissionBackpressureUS      int64
+	LastSubmissionBackpressureUS     int64
+	SubmissionApplyInFlight          int64
+	SubmissionApplyWaiting           int64
+	SubmissionApplyLimit             int64
+	AssignmentQueueDepth             int64
+	CompletionQueueDepth             int64
+	AllocationPlanChecks             uint64
+	AllocationPlanApplies            uint64
+	AllocationPlanNoops              uint64
+	WorkerLoads                      map[string]WorkerLoadSnapshot
+	WorkerTelemetry                  map[string]WorkerLoadSnapshot
 
-	windowSelectionCount          uint64
-	windowPendingScanned          uint64
-	windowTasksSelected           uint64
-	windowLoadAwareRequests       uint64
-	windowLoadThrottledRequests   uint64
-	windowLoadUnavailableRequests uint64
-	windowStaleLoadRequests       uint64
-	windowAllocationPlanChecks    uint64
-	windowAllocationPlanApplies   uint64
-	windowAllocationPlanNoops     uint64
-	windowTotalSelectMicros       int64
-	windowMaxSelectMicros         int64
-	windowSubmissionBatches       uint64
-	windowSubmissionRequests      uint64
-	windowSubmissionTasks         uint64
-	windowTotalSubmissionWaitUS   int64
-	windowMaxSubmissionWaitUS     int64
+	windowSelectionCount                   uint64
+	windowPendingScanned                   uint64
+	windowTasksSelected                    uint64
+	windowLoadAwareRequests                uint64
+	windowLoadThrottledRequests            uint64
+	windowLoadUnavailableRequests          uint64
+	windowStaleLoadRequests                uint64
+	windowAllocationPlanChecks             uint64
+	windowAllocationPlanApplies            uint64
+	windowAllocationPlanNoops              uint64
+	windowTotalSelectMicros                int64
+	windowMaxSelectMicros                  int64
+	windowSubmissionBatches                uint64
+	windowSubmissionRequests               uint64
+	windowSubmissionTasks                  uint64
+	windowTotalSubmissionWaitUS            int64
+	windowMaxSubmissionWaitUS              int64
+	windowSubmissionBackpressureWaits      uint64
+	windowSubmissionBackpressureRejections uint64
+	windowTotalSubmissionBackpressureUS    int64
+	windowMaxSubmissionBackpressureUS      int64
 }
 
 type RaftOperationSnapshot struct {
@@ -89,33 +101,41 @@ type RaftOperationSnapshot struct {
 }
 
 type SchedulerSnapshot struct {
-	Selections              uint64                        `json:"selections"`
-	PendingScanned          uint64                        `json:"pending_scanned"`
-	TasksSelected           uint64                        `json:"tasks_selected"`
-	LoadAwareRequests       uint64                        `json:"load_aware_requests"`
-	LoadThrottledRequests   uint64                        `json:"load_throttled_requests"`
-	LoadUnavailableRequests uint64                        `json:"load_unavailable_requests"`
-	StaleLoadRequests       uint64                        `json:"stale_load_requests"`
-	AverageSelectMicros     int64                         `json:"average_select_us"`
-	MaxSelectMicros         int64                         `json:"max_select_us"`
-	LastSelectMicros        int64                         `json:"last_select_us"`
-	SubmissionBatches       uint64                        `json:"submission_batches"`
-	SubmissionRequests      uint64                        `json:"submission_requests"`
-	SubmissionTasks         uint64                        `json:"submission_tasks"`
-	AverageSubmissionBatch  int64                         `json:"average_submission_batch"`
-	AverageSubmissionReqs   int64                         `json:"average_submission_requests"`
-	AverageSubmissionWaitUS int64                         `json:"average_submission_queue_us"`
-	MaxSubmissionWaitUS     int64                         `json:"max_submission_queue_us"`
-	LastSubmissionWaitUS    int64                         `json:"last_submission_queue_us"`
-	SubmissionQueueDepth    int64                         `json:"submission_queue_depth"`
-	AssignmentQueueDepth    int64                         `json:"assignment_queue_depth"`
-	CompletionQueueDepth    int64                         `json:"completion_queue_depth"`
-	AllocationPlanChecks    uint64                        `json:"allocation_plan_checks"`
-	AllocationPlanApplies   uint64                        `json:"allocation_plan_applies"`
-	AllocationPlanNoops     uint64                        `json:"allocation_plan_noops"`
-	MaxWorkerCPUMillis      int64                         `json:"max_worker_cpu_millis"`
-	WorkerLoads             map[string]WorkerLoadSnapshot `json:"worker_loads"`
-	WorkerTelemetry         map[string]WorkerLoadSnapshot `json:"worker_telemetry"`
+	Selections                       uint64                        `json:"selections"`
+	PendingScanned                   uint64                        `json:"pending_scanned"`
+	TasksSelected                    uint64                        `json:"tasks_selected"`
+	LoadAwareRequests                uint64                        `json:"load_aware_requests"`
+	LoadThrottledRequests            uint64                        `json:"load_throttled_requests"`
+	LoadUnavailableRequests          uint64                        `json:"load_unavailable_requests"`
+	StaleLoadRequests                uint64                        `json:"stale_load_requests"`
+	AverageSelectMicros              int64                         `json:"average_select_us"`
+	MaxSelectMicros                  int64                         `json:"max_select_us"`
+	LastSelectMicros                 int64                         `json:"last_select_us"`
+	SubmissionBatches                uint64                        `json:"submission_batches"`
+	SubmissionRequests               uint64                        `json:"submission_requests"`
+	SubmissionTasks                  uint64                        `json:"submission_tasks"`
+	AverageSubmissionBatch           int64                         `json:"average_submission_batch"`
+	AverageSubmissionReqs            int64                         `json:"average_submission_requests"`
+	AverageSubmissionWaitUS          int64                         `json:"average_submission_queue_us"`
+	MaxSubmissionWaitUS              int64                         `json:"max_submission_queue_us"`
+	LastSubmissionWaitUS             int64                         `json:"last_submission_queue_us"`
+	SubmissionQueueDepth             int64                         `json:"submission_queue_depth"`
+	SubmissionBackpressureWaits      uint64                        `json:"submission_backpressure_waits"`
+	SubmissionBackpressureRejections uint64                        `json:"submission_backpressure_rejections"`
+	AverageSubmissionBackpressureUS  int64                         `json:"average_submission_backpressure_us"`
+	MaxSubmissionBackpressureUS      int64                         `json:"max_submission_backpressure_us"`
+	LastSubmissionBackpressureUS     int64                         `json:"last_submission_backpressure_us"`
+	SubmissionApplyInFlight          int64                         `json:"submission_apply_inflight"`
+	SubmissionApplyWaiting           int64                         `json:"submission_apply_waiting"`
+	SubmissionApplyLimit             int64                         `json:"submission_apply_limit"`
+	AssignmentQueueDepth             int64                         `json:"assignment_queue_depth"`
+	CompletionQueueDepth             int64                         `json:"completion_queue_depth"`
+	AllocationPlanChecks             uint64                        `json:"allocation_plan_checks"`
+	AllocationPlanApplies            uint64                        `json:"allocation_plan_applies"`
+	AllocationPlanNoops              uint64                        `json:"allocation_plan_noops"`
+	MaxWorkerCPUMillis               int64                         `json:"max_worker_cpu_millis"`
+	WorkerLoads                      map[string]WorkerLoadSnapshot `json:"worker_loads"`
+	WorkerTelemetry                  map[string]WorkerLoadSnapshot `json:"worker_telemetry"`
 }
 
 // WorkerLoadSnapshot is a recent Leader-local observation. It is intentionally
@@ -152,28 +172,35 @@ type operationWindow struct {
 }
 
 type schedulerWindow struct {
-	Selections              uint64
-	PendingScanned          uint64
-	TasksSelected           uint64
-	LoadAwareRequests       uint64
-	LoadThrottledRequests   uint64
-	LoadUnavailableRequests uint64
-	StaleLoadRequests       uint64
-	AllocationPlanChecks    uint64
-	AllocationPlanApplies   uint64
-	AllocationPlanNoops     uint64
-	TotalSelectMicros       int64
-	MaxSelectMicros         int64
-	SubmissionBatches       uint64
-	SubmissionRequests      uint64
-	SubmissionTasks         uint64
-	TotalSubmissionWaitUS   int64
-	MaxSubmissionWaitUS     int64
-	SubmissionQueueDepth    int64
-	AssignmentQueueDepth    int64
-	CompletionQueueDepth    int64
-	MaxWorkerCPUMillis      int64
-	ReportingWorkers        int64
+	Selections                       uint64
+	PendingScanned                   uint64
+	TasksSelected                    uint64
+	LoadAwareRequests                uint64
+	LoadThrottledRequests            uint64
+	LoadUnavailableRequests          uint64
+	StaleLoadRequests                uint64
+	AllocationPlanChecks             uint64
+	AllocationPlanApplies            uint64
+	AllocationPlanNoops              uint64
+	TotalSelectMicros                int64
+	MaxSelectMicros                  int64
+	SubmissionBatches                uint64
+	SubmissionRequests               uint64
+	SubmissionTasks                  uint64
+	TotalSubmissionWaitUS            int64
+	MaxSubmissionWaitUS              int64
+	SubmissionQueueDepth             int64
+	SubmissionBackpressureWaits      uint64
+	SubmissionBackpressureRejections uint64
+	TotalSubmissionBackpressureUS    int64
+	MaxSubmissionBackpressureUS      int64
+	SubmissionApplyInFlight          int64
+	SubmissionApplyWaiting           int64
+	SubmissionApplyLimit             int64
+	AssignmentQueueDepth             int64
+	CompletionQueueDepth             int64
+	MaxWorkerCPUMillis               int64
+	ReportingWorkers                 int64
 }
 
 type performanceWindow struct {
@@ -294,6 +321,38 @@ func (p *Performance) SetSubmissionQueueDepth(depth int) {
 	p.mu.Unlock()
 }
 
+func (p *Performance) ObserveSubmissionBackpressure(wait time.Duration, rejected bool) {
+	waitMicros := max(wait.Microseconds(), 0)
+	p.mu.Lock()
+	s := &p.scheduler
+	if rejected {
+		s.SubmissionBackpressureRejections++
+		s.windowSubmissionBackpressureRejections++
+		p.mu.Unlock()
+		return
+	}
+	s.SubmissionBackpressureWaits++
+	s.TotalSubmissionBackpressureUS += waitMicros
+	s.LastSubmissionBackpressureUS = waitMicros
+	if waitMicros > s.MaxSubmissionBackpressureUS {
+		s.MaxSubmissionBackpressureUS = waitMicros
+	}
+	s.windowSubmissionBackpressureWaits++
+	s.windowTotalSubmissionBackpressureUS += waitMicros
+	if waitMicros > s.windowMaxSubmissionBackpressureUS {
+		s.windowMaxSubmissionBackpressureUS = waitMicros
+	}
+	p.mu.Unlock()
+}
+
+func (p *Performance) SetSubmissionApplyPressure(inFlight, waiting, limit int) {
+	p.mu.Lock()
+	p.scheduler.SubmissionApplyInFlight = int64(max(inFlight, 0))
+	p.scheduler.SubmissionApplyWaiting = int64(max(waiting, 0))
+	p.scheduler.SubmissionApplyLimit = int64(max(limit, 0))
+	p.mu.Unlock()
+}
+
 func (p *Performance) ObserveAllocationPlan(applied, unchanged bool) {
 	p.mu.Lock()
 	s := &p.scheduler
@@ -390,24 +449,31 @@ func (p *Performance) sample() performanceWindow {
 	window.Scheduler = schedulerWindow{
 		Selections: s.windowSelectionCount, PendingScanned: s.windowPendingScanned,
 		TasksSelected: s.windowTasksSelected, TotalSelectMicros: s.windowTotalSelectMicros,
-		LoadAwareRequests:       s.windowLoadAwareRequests,
-		LoadThrottledRequests:   s.windowLoadThrottledRequests,
-		LoadUnavailableRequests: s.windowLoadUnavailableRequests,
-		StaleLoadRequests:       s.windowStaleLoadRequests,
-		AllocationPlanChecks:    s.windowAllocationPlanChecks,
-		AllocationPlanApplies:   s.windowAllocationPlanApplies,
-		AllocationPlanNoops:     s.windowAllocationPlanNoops,
-		MaxSelectMicros:         s.windowMaxSelectMicros,
-		SubmissionBatches:       s.windowSubmissionBatches,
-		SubmissionRequests:      s.windowSubmissionRequests,
-		SubmissionTasks:         s.windowSubmissionTasks,
-		TotalSubmissionWaitUS:   s.windowTotalSubmissionWaitUS,
-		MaxSubmissionWaitUS:     s.windowMaxSubmissionWaitUS,
-		SubmissionQueueDepth:    s.SubmissionQueueDepth,
-		AssignmentQueueDepth:    s.AssignmentQueueDepth,
-		CompletionQueueDepth:    s.CompletionQueueDepth,
-		MaxWorkerCPUMillis:      int64(maxCPU),
-		ReportingWorkers:        int64(len(workerLoads)),
+		LoadAwareRequests:                s.windowLoadAwareRequests,
+		LoadThrottledRequests:            s.windowLoadThrottledRequests,
+		LoadUnavailableRequests:          s.windowLoadUnavailableRequests,
+		StaleLoadRequests:                s.windowStaleLoadRequests,
+		AllocationPlanChecks:             s.windowAllocationPlanChecks,
+		AllocationPlanApplies:            s.windowAllocationPlanApplies,
+		AllocationPlanNoops:              s.windowAllocationPlanNoops,
+		MaxSelectMicros:                  s.windowMaxSelectMicros,
+		SubmissionBatches:                s.windowSubmissionBatches,
+		SubmissionRequests:               s.windowSubmissionRequests,
+		SubmissionTasks:                  s.windowSubmissionTasks,
+		TotalSubmissionWaitUS:            s.windowTotalSubmissionWaitUS,
+		MaxSubmissionWaitUS:              s.windowMaxSubmissionWaitUS,
+		SubmissionQueueDepth:             s.SubmissionQueueDepth,
+		SubmissionBackpressureWaits:      s.windowSubmissionBackpressureWaits,
+		SubmissionBackpressureRejections: s.windowSubmissionBackpressureRejections,
+		TotalSubmissionBackpressureUS:    s.windowTotalSubmissionBackpressureUS,
+		MaxSubmissionBackpressureUS:      s.windowMaxSubmissionBackpressureUS,
+		SubmissionApplyInFlight:          s.SubmissionApplyInFlight,
+		SubmissionApplyWaiting:           s.SubmissionApplyWaiting,
+		SubmissionApplyLimit:             s.SubmissionApplyLimit,
+		AssignmentQueueDepth:             s.AssignmentQueueDepth,
+		CompletionQueueDepth:             s.CompletionQueueDepth,
+		MaxWorkerCPUMillis:               int64(maxCPU),
+		ReportingWorkers:                 int64(len(workerLoads)),
 	}
 	s.windowSelectionCount = 0
 	s.windowPendingScanned = 0
@@ -426,6 +492,10 @@ func (p *Performance) sample() performanceWindow {
 	s.windowSubmissionTasks = 0
 	s.windowTotalSubmissionWaitUS = 0
 	s.windowMaxSubmissionWaitUS = 0
+	s.windowSubmissionBackpressureWaits = 0
+	s.windowSubmissionBackpressureRejections = 0
+	s.windowTotalSubmissionBackpressureUS = 0
+	s.windowMaxSubmissionBackpressureUS = 0
 	return window
 }
 
@@ -454,23 +524,31 @@ func (p *Performance) snapshotLocked() PerformanceSnapshot {
 		StaleLoadRequests:       s.StaleLoadRequests,
 		AverageSelectMicros:     divideInt64(s.TotalSelectMicros, s.SelectionCount),
 		MaxSelectMicros:         s.MaxSelectMicros, LastSelectMicros: s.LastSelectMicros,
-		SubmissionBatches:       s.SubmissionBatches,
-		SubmissionRequests:      s.SubmissionRequests,
-		SubmissionTasks:         s.SubmissionTasks,
-		AverageSubmissionBatch:  divideUint64(s.SubmissionTasks, s.SubmissionBatches),
-		AverageSubmissionReqs:   divideUint64(s.SubmissionRequests, s.SubmissionBatches),
-		AverageSubmissionWaitUS: divideInt64(s.TotalSubmissionWaitUS, s.SubmissionBatches),
-		MaxSubmissionWaitUS:     s.MaxSubmissionWaitUS,
-		LastSubmissionWaitUS:    s.LastSubmissionWaitUS,
-		SubmissionQueueDepth:    s.SubmissionQueueDepth,
-		AssignmentQueueDepth:    s.AssignmentQueueDepth,
-		CompletionQueueDepth:    s.CompletionQueueDepth,
-		AllocationPlanChecks:    s.AllocationPlanChecks,
-		AllocationPlanApplies:   s.AllocationPlanApplies,
-		AllocationPlanNoops:     s.AllocationPlanNoops,
-		MaxWorkerCPUMillis:      int64(maxCPU),
-		WorkerLoads:             workerLoads,
-		WorkerTelemetry:         workerTelemetry,
+		SubmissionBatches:                s.SubmissionBatches,
+		SubmissionRequests:               s.SubmissionRequests,
+		SubmissionTasks:                  s.SubmissionTasks,
+		AverageSubmissionBatch:           divideUint64(s.SubmissionTasks, s.SubmissionBatches),
+		AverageSubmissionReqs:            divideUint64(s.SubmissionRequests, s.SubmissionBatches),
+		AverageSubmissionWaitUS:          divideInt64(s.TotalSubmissionWaitUS, s.SubmissionBatches),
+		MaxSubmissionWaitUS:              s.MaxSubmissionWaitUS,
+		LastSubmissionWaitUS:             s.LastSubmissionWaitUS,
+		SubmissionQueueDepth:             s.SubmissionQueueDepth,
+		SubmissionBackpressureWaits:      s.SubmissionBackpressureWaits,
+		SubmissionBackpressureRejections: s.SubmissionBackpressureRejections,
+		AverageSubmissionBackpressureUS:  divideInt64(s.TotalSubmissionBackpressureUS, s.SubmissionBackpressureWaits),
+		MaxSubmissionBackpressureUS:      s.MaxSubmissionBackpressureUS,
+		LastSubmissionBackpressureUS:     s.LastSubmissionBackpressureUS,
+		SubmissionApplyInFlight:          s.SubmissionApplyInFlight,
+		SubmissionApplyWaiting:           s.SubmissionApplyWaiting,
+		SubmissionApplyLimit:             s.SubmissionApplyLimit,
+		AssignmentQueueDepth:             s.AssignmentQueueDepth,
+		CompletionQueueDepth:             s.CompletionQueueDepth,
+		AllocationPlanChecks:             s.AllocationPlanChecks,
+		AllocationPlanApplies:            s.AllocationPlanApplies,
+		AllocationPlanNoops:              s.AllocationPlanNoops,
+		MaxWorkerCPUMillis:               int64(maxCPU),
+		WorkerLoads:                      workerLoads,
+		WorkerTelemetry:                  workerTelemetry,
 	}
 	return snapshot
 }

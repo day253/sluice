@@ -12,6 +12,8 @@ import (
 	"github.com/gorilla/mux"
 	hashicorpraft "github.com/hashicorp/raft"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	grpcpkg "github.com/day253/sluice/pkg/grpc"
 	metricspkg "github.com/day253/sluice/pkg/metrics"
@@ -28,6 +30,25 @@ import (
 type mockRaft struct {
 	leader bool
 	fsm    *raftpkg.FSM
+}
+
+func TestResourceExhaustedMapsToHTTPTooManyRequests(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	(&Handler{}).writeGRPCError(
+		recorder,
+		status.Error(codes.ResourceExhausted, "submission apply backlog is full"),
+	)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("HTTP status = %d, want 429", recorder.Code)
+	}
+	var body types.ErrorResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != http.StatusTooManyRequests ||
+		body.Error != "submission apply backlog is full" {
+		t.Fatalf("HTTP error body = %+v", body)
+	}
 }
 
 func (m *mockRaft) Apply(cmd []byte, timeoutMs int) raftpkg.ApplyResult {

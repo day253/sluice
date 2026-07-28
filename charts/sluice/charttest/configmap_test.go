@@ -126,6 +126,40 @@ func TestWorkerEntrypointUsesStableServiceIPInsteadOfClusterDNS(t *testing.T) {
 	}
 }
 
+func TestControlEntrypointConfiguresBoundedSubmissionRaftIngress(t *testing.T) {
+	type values struct {
+		Control struct {
+			SubmitApplyLimit int `json:"submitApplyLimit"`
+		} `json:"control"`
+	}
+	valuesData, err := os.ReadFile("../values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chartValues values
+	if err := yaml.Unmarshal(valuesData, &chartValues); err != nil {
+		t.Fatal(err)
+	}
+	if chartValues.Control.SubmitApplyLimit != 16 {
+		t.Fatalf(
+			"default control submitApplyLimit = %d, want 16",
+			chartValues.Control.SubmitApplyLimit,
+		)
+	}
+
+	configData, err := os.ReadFile("../templates/configmap.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	argument := `--submit-apply-limit={{ .Values.control.submitApplyLimit }}`
+	if got := strings.Count(string(configData), argument); got != 3 {
+		t.Fatalf(
+			"control entrypoint submission limit occurrences = %d, want bootstrap/restart/join",
+			got,
+		)
+	}
+}
+
 func TestControlStatefulSetCanRecoverAllRaftVotersInParallel(t *testing.T) {
 	data, err := os.ReadFile("../templates/statefulset.yaml")
 	if err != nil {

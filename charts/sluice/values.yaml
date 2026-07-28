@@ -2,6 +2,9 @@
 # and never execute business Processor work.
 control:
   replicas: 5
+  # Maximum unresolved CreateTaskBatch Raft Apply futures on the Leader.
+  # Up to four times this many callers may wait before the API returns 429.
+  submitApplyLimit: 16
   # Raft voters restore the complete FSM task set into memory. Keep this
   # budget independent from stateless Workers: a large durable backlog must
   # not make every voter restart under a Worker-sized cgroup limit.

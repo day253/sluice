@@ -18,6 +18,9 @@ func TestPerformanceRecordsRaftBatchAndSchedulerWindows(t *testing.T) {
 	performance.ObservePendingSelection(20_000, 128, 4*time.Millisecond)
 	performance.ObserveSubmissionBatch(4, 1000, 2*time.Millisecond)
 	performance.ObserveSubmissionBatch(2, 500, 4*time.Millisecond)
+	performance.ObserveSubmissionBackpressure(6*time.Millisecond, false)
+	performance.ObserveSubmissionBackpressure(0, true)
+	performance.SetSubmissionApplyPressure(3, 2, 16)
 	performance.SetSubmissionQueueDepth(5)
 	performance.SetDispatcherQueueDepths(7, 9)
 	performance.ObserveWorkerLoad("worker-a", 720, 5, 10, time.Now())
@@ -41,6 +44,14 @@ func TestPerformanceRecordsRaftBatchAndSchedulerWindows(t *testing.T) {
 		got.SubmissionTasks != 1500 || got.AverageSubmissionBatch != 750 ||
 		got.AverageSubmissionReqs != 3 || got.AverageSubmissionWaitUS != 3_000 ||
 		got.MaxSubmissionWaitUS != 4_000 || got.LastSubmissionWaitUS != 4_000 ||
+		got.SubmissionBackpressureWaits != 1 ||
+		got.SubmissionBackpressureRejections != 1 ||
+		got.AverageSubmissionBackpressureUS != 6_000 ||
+		got.MaxSubmissionBackpressureUS != 6_000 ||
+		got.LastSubmissionBackpressureUS != 6_000 ||
+		got.SubmissionApplyInFlight != 3 ||
+		got.SubmissionApplyWaiting != 2 ||
+		got.SubmissionApplyLimit != 16 ||
 		got.SubmissionQueueDepth != 5 ||
 		got.AssignmentQueueDepth != 7 || got.CompletionQueueDepth != 9 ||
 		got.LoadAwareRequests != 12 || got.LoadThrottledRequests != 3 ||
@@ -59,12 +70,25 @@ func TestPerformanceRecordsRaftBatchAndSchedulerWindows(t *testing.T) {
 	if got := window.Scheduler; got.SubmissionBatches != 2 ||
 		got.SubmissionRequests != 6 || got.SubmissionTasks != 1500 ||
 		got.TotalSubmissionWaitUS != 6_000 ||
-		got.MaxSubmissionWaitUS != 4_000 || got.SubmissionQueueDepth != 5 {
+		got.MaxSubmissionWaitUS != 4_000 ||
+		got.SubmissionBackpressureWaits != 1 ||
+		got.SubmissionBackpressureRejections != 1 ||
+		got.TotalSubmissionBackpressureUS != 6_000 ||
+		got.MaxSubmissionBackpressureUS != 6_000 ||
+		got.SubmissionApplyInFlight != 3 ||
+		got.SubmissionApplyWaiting != 2 ||
+		got.SubmissionApplyLimit != 16 ||
+		got.SubmissionQueueDepth != 5 {
 		t.Fatalf("submission window = %+v", got)
 	}
 	if got := performance.sample(); got.Raft[raftpkg.OpClaimBatch].Applies != 0 ||
 		got.Scheduler.Selections != 0 || got.Scheduler.AssignmentQueueDepth != 7 ||
 		got.Scheduler.SubmissionBatches != 0 ||
+		got.Scheduler.SubmissionBackpressureWaits != 0 ||
+		got.Scheduler.SubmissionBackpressureRejections != 0 ||
+		got.Scheduler.SubmissionApplyInFlight != 3 ||
+		got.Scheduler.SubmissionApplyWaiting != 2 ||
+		got.Scheduler.SubmissionApplyLimit != 16 ||
 		got.Scheduler.SubmissionQueueDepth != 5 ||
 		got.Scheduler.LoadAwareRequests != 0 ||
 		got.Scheduler.AllocationPlanChecks != 0 ||

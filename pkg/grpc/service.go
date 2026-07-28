@@ -50,6 +50,9 @@ type Service struct {
 	submissionWindow     time.Duration
 	submissionMax        int
 	submissionObserver   SubmissionPerformanceObserver
+	submissionApplySlots chan struct{}
+	submissionWaitSlots  chan struct{}
+	submissionApplyLimit int
 
 	forwardMu     sync.Mutex
 	forwardAddr   string
@@ -62,7 +65,9 @@ type Service struct {
 // replicated state.
 type SubmissionPerformanceObserver interface {
 	ObserveSubmissionBatch(requests, tasks int, queueWait time.Duration)
+	ObserveSubmissionBackpressure(wait time.Duration, rejected bool)
 	SetSubmissionQueueDepth(depth int)
+	SetSubmissionApplyPressure(inFlight, waiting, limit int)
 }
 
 type submissionJob struct {
@@ -86,7 +91,27 @@ func (s *Service) SetWorkAvailableFunc(fn func([]string)) {
 
 func (s *Service) SetSubmissionPerformanceObserver(observer SubmissionPerformanceObserver) {
 	s.submissionObserver = observer
+	s.setSubmissionApplyPressure()
 }
+
+// SetSubmissionApplyLimit bounds concurrent, unresolved CreateTaskBatch Raft
+// Apply futures on this process. Only the current Leader uses the slots;
+// followers forward complete requests before reaching this boundary.
+func (s *Service) SetSubmissionApplyLimit(limit int) {
+	if limit < 1 {
+		limit = DefaultSubmissionApplyLimit
+	}
+	s.submissionApplyLimit = limit
+	s.submissionApplySlots = make(chan struct{}, limit)
+	s.submissionWaitSlots = make(chan struct{}, limit*submissionWaiterMultiplier)
+	s.setSubmissionApplyPressure()
+}
+
+const (
+	DefaultSubmissionApplyLimit = 16
+	MaxSubmissionApplyLimit     = 128
+	submissionWaiterMultiplier  = 4
+)
 
 func NewService(
 	nodeID string,
@@ -103,6 +128,9 @@ func NewService(
 		submissionJobs:       make(chan submissionJob, 1024),
 		submissionWindow:     2 * time.Millisecond,
 		submissionMax:        maxSubmitBatchTasks,
+		submissionApplySlots: make(chan struct{}, DefaultSubmissionApplyLimit),
+		submissionWaitSlots:  make(chan struct{}, DefaultSubmissionApplyLimit*submissionWaiterMultiplier),
+		submissionApplyLimit: DefaultSubmissionApplyLimit,
 	}
 }
 
@@ -178,7 +206,7 @@ func (s *Service) SubmitBatch(ctx context.Context, req *grpcv1.SubmitBatchReques
 	// retain Hashicorp Raft's ingress pipelining instead of waiting behind the
 	// dispatcher's previous ApplyFuture.
 	if len(create) == s.submissionMax {
-		s.applySubmissionJobs([]submissionJob{job})
+		s.applySubmissionJobs(ctx, []submissionJob{job})
 		result := <-outcome
 		return result.response, result.err
 	}
@@ -236,11 +264,19 @@ func (s *Service) runSubmissionDispatcher() {
 			}
 		}
 		s.setSubmissionQueueDepth(len(pending))
-		s.applySubmissionJobs(jobs)
+		s.applySubmissionJobs(context.Background(), jobs)
 	}
 }
 
-func (s *Service) applySubmissionJobs(jobs []submissionJob) {
+func (s *Service) applySubmissionJobs(ctx context.Context, jobs []submissionJob) {
+	if err := s.acquireSubmissionApply(ctx); err != nil {
+		for _, job := range jobs {
+			job.outcome <- submissionOutcome{err: err}
+		}
+		return
+	}
+	defer s.releaseSubmissionApply()
+
 	// Keep tenant validation and durable Create in one Leader-local read
 	// section. DeleteAllTenants takes the write side so no validated job can
 	// commit after the atomic clear and create orphaned work.
@@ -327,6 +363,62 @@ func (s *Service) applySubmissionJobs(jobs []submissionJob) {
 func (s *Service) setSubmissionQueueDepth(extra int) {
 	if s.submissionObserver != nil {
 		s.submissionObserver.SetSubmissionQueueDepth(len(s.submissionJobs) + extra)
+	}
+}
+
+func (s *Service) acquireSubmissionApply(ctx context.Context) error {
+	select {
+	case s.submissionApplySlots <- struct{}{}:
+		s.setSubmissionApplyPressure()
+		return nil
+	default:
+	}
+
+	select {
+	case s.submissionWaitSlots <- struct{}{}:
+	default:
+		if s.submissionObserver != nil {
+			s.submissionObserver.ObserveSubmissionBackpressure(0, true)
+		}
+		return status.Error(
+			codes.ResourceExhausted,
+			"submission apply backlog is full; retry with idempotency keys",
+		)
+	}
+	s.setSubmissionApplyPressure()
+	started := time.Now()
+	defer func() {
+		<-s.submissionWaitSlots
+		s.setSubmissionApplyPressure()
+	}()
+
+	select {
+	case s.submissionApplySlots <- struct{}{}:
+		if s.submissionObserver != nil {
+			s.submissionObserver.ObserveSubmissionBackpressure(time.Since(started), false)
+		}
+		s.setSubmissionApplyPressure()
+		return nil
+	case <-ctx.Done():
+		if s.submissionObserver != nil {
+			s.submissionObserver.ObserveSubmissionBackpressure(time.Since(started), false)
+		}
+		return status.FromContextError(ctx.Err()).Err()
+	}
+}
+
+func (s *Service) releaseSubmissionApply() {
+	<-s.submissionApplySlots
+	s.setSubmissionApplyPressure()
+}
+
+func (s *Service) setSubmissionApplyPressure() {
+	if s.submissionObserver != nil {
+		s.submissionObserver.SetSubmissionApplyPressure(
+			len(s.submissionApplySlots),
+			len(s.submissionWaitSlots),
+			s.submissionApplyLimit,
+		)
 	}
 }
 

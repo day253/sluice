@@ -148,6 +148,44 @@ func TestLoadLabBuildsBoundedUniqueRandomTenantConfigs(t *testing.T) {
 	}
 }
 
+func TestSubmissionConcurrencyUsesAIMDAndSupportsExplicitOverrides(t *testing.T) {
+	runtime := loadLabRuntime(t)
+	type controllerState struct {
+		Mode        string `json:"mode"`
+		Current     int    `json:"current"`
+		MaxObserved int    `json:"maxObserved"`
+		Backoffs    int    `json:"backoffs"`
+	}
+	auto := evaluateJSON[controllerState](t, runtime, `(() => {
+		const controller = SluiceLoadLab.createSubmissionController("auto");
+		for (let index = 0; index < 8; index++) {
+			controller.observe({latencyMs: 40});
+		}
+		controller.observe({latencyMs: 1200});
+		controller.observe({backpressured: true});
+		return controller;
+	})()`)
+	if auto.Mode != "auto" || auto.Current != 4 ||
+		auto.MaxObserved != 10 || auto.Backoffs != 2 {
+		t.Fatalf("auto submission controller = %+v", auto)
+	}
+
+	fixed := evaluateJSON[controllerState](t, runtime, `(() => {
+		const controller = SluiceLoadLab.createSubmissionController("32");
+		controller.observe({failed: true, latencyMs: 5000});
+		return controller;
+	})()`)
+	if fixed.Mode != "32" || fixed.Current != 32 ||
+		fixed.MaxObserved != 32 || fixed.Backoffs != 0 {
+		t.Fatalf("fixed submission controller = %+v", fixed)
+	}
+	if mode := evaluateJSON[string](
+		t, runtime, `SluiceLoadLab.normalizeSubmissionMode("999")`,
+	); mode != "auto" {
+		t.Fatalf("invalid submission mode normalized to %q, want auto", mode)
+	}
+}
+
 func TestDashboardExposesAtomicLoadLabAndOnlyTheActiveOperation(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	Handler(http.NotFoundHandler()).ServeHTTP(

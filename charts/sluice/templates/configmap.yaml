@@ -49,6 +49,7 @@ data:
         --role=control --data="${DATA}" --bootstrap --workers=0 \
         --raft-voters={{ .Values.raftVoters }} \
         --raft-members={{ .Values.control.replicas }} \
+        --submit-apply-limit={{ .Values.control.submitApplyLimit }} \
         --log-level={{ .Values.logLevel }}
     else
       # Existing members must start immediately after a full-cluster restart.
@@ -60,6 +61,7 @@ data:
           --role=control --data="${DATA}" --workers=0 \
           --raft-voters={{ .Values.raftVoters }} \
           --raft-members={{ .Values.control.replicas }} \
+          --submit-apply-limit={{ .Values.control.submitApplyLimit }} \
           --log-level={{ .Values.logLevel }}
       fi
 
@@ -92,6 +94,7 @@ data:
         --role=control --data="${DATA}" --workers=0 \
         --raft-voters={{ .Values.raftVoters }} \
         --raft-members={{ .Values.control.replicas }} \
+        --submit-apply-limit={{ .Values.control.submitApplyLimit }} \
         --log-level={{ .Values.logLevel }}
     fi
 

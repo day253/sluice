@@ -32,11 +32,16 @@ type batchSpyQueue struct {
 }
 
 type recordingSubmissionObserver struct {
-	mu       sync.Mutex
-	batches  int
-	requests int
-	tasks    int
-	depth    int
+	mu                   sync.Mutex
+	batches              int
+	requests             int
+	tasks                int
+	depth                int
+	backpressureWaits    int
+	backpressureRejected int
+	applyInFlight        int
+	applyWaiting         int
+	applyLimit           int
 }
 
 func (o *recordingSubmissionObserver) ObserveSubmissionBatch(requests, tasks int, _ time.Duration) {
@@ -53,10 +58,41 @@ func (o *recordingSubmissionObserver) SetSubmissionQueueDepth(depth int) {
 	o.mu.Unlock()
 }
 
+func (o *recordingSubmissionObserver) ObserveSubmissionBackpressure(
+	_ time.Duration, rejected bool,
+) {
+	o.mu.Lock()
+	if rejected {
+		o.backpressureRejected++
+	} else {
+		o.backpressureWaits++
+	}
+	o.mu.Unlock()
+}
+
+func (o *recordingSubmissionObserver) SetSubmissionApplyPressure(
+	inFlight, waiting, limit int,
+) {
+	o.mu.Lock()
+	o.applyInFlight = inFlight
+	o.applyWaiting = waiting
+	o.applyLimit = limit
+	o.mu.Unlock()
+}
+
 func (o *recordingSubmissionObserver) snapshot() (batches, requests, tasks, depth int) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.batches, o.requests, o.tasks, o.depth
+}
+
+func (o *recordingSubmissionObserver) pressureSnapshot() (
+	waits, rejected, inFlight, waiting, limit int,
+) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.backpressureWaits, o.backpressureRejected,
+		o.applyInFlight, o.applyWaiting, o.applyLimit
 }
 
 type blockingCreateRaft struct {
@@ -498,6 +534,189 @@ func TestFullSubmitBatchesRetainConcurrentRaftIngress(t *testing.T) {
 			batches, observedRequests, observedTasks, depth,
 		)
 	}
+}
+
+func TestFullSubmitBatchesRespectGlobalRaftApplyLimit(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{
+		ID: "tenant-a", MaxWorkers: 1000,
+	})
+	testRaft := &concurrentCreateRaft{
+		fsm:        fsm,
+		twoStarted: make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
+	svc.SetSubmissionApplyLimit(2)
+	observer := &recordingSubmissionObserver{}
+	svc.SetSubmissionPerformanceObserver(observer)
+
+	const requests = 4
+	start := make(chan struct{})
+	results := make(chan error, requests)
+	for requestIndex := 0; requestIndex < requests; requestIndex++ {
+		requestIndex := requestIndex
+		go func() {
+			<-start
+			tasks := make([]*grpcv1.SubmitRequest, maxSubmitBatchTasks)
+			for taskIndex := range tasks {
+				tasks[taskIndex] = &grpcv1.SubmitRequest{
+					TenantId:       "tenant-a",
+					IdempotencyKey: fmt.Sprintf("limited-%d-%d", requestIndex, taskIndex),
+				}
+			}
+			_, err := svc.SubmitBatch(
+				context.Background(),
+				&grpcv1.SubmitBatchRequest{Tasks: tasks},
+			)
+			results <- err
+		}()
+	}
+	close(start)
+
+	select {
+	case <-testRaft.twoStarted:
+	case <-time.After(time.Second):
+		t.Fatal("two full batches did not fill the configured Apply slots")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := testRaft.entered.Load(); got != 2 {
+		t.Fatalf("Raft Apply callers = %d while blocked, want configured limit 2", got)
+	}
+	close(testRaft.release)
+	for requestIndex := 0; requestIndex < requests; requestIndex++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := testRaft.applies.Load(); got != requests {
+		t.Fatalf("Raft Apply calls = %d, want %d after slots drain", got, requests)
+	}
+	if got := len(fsm.FindAllPendingTasks()); got != requests*maxSubmitBatchTasks {
+		t.Fatalf("pending tasks = %d, want %d", got, requests*maxSubmitBatchTasks)
+	}
+	waits, rejected, inFlight, waiting, limit := observer.pressureSnapshot()
+	if waits < requests-2 || rejected != 0 || inFlight != 0 || waiting != 0 || limit != 2 {
+		t.Fatalf(
+			"Apply pressure waits=%d rejected=%d in-flight=%d waiting=%d limit=%d",
+			waits, rejected, inFlight, waiting, limit,
+		)
+	}
+}
+
+func TestSubmissionApplyWaitHonorsRequestDeadlineBeforeRaftApply(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{
+		ID: "tenant-a", MaxWorkers: 1000,
+	})
+	testRaft := &blockingCreateRaft{
+		fsm:           fsm,
+		createStarted: make(chan struct{}),
+		createRelease: make(chan struct{}),
+	}
+	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
+	svc.SetSubmissionApplyLimit(1)
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := svc.SubmitBatch(
+			context.Background(),
+			fullSubmitRequest("tenant-a", "first"),
+		)
+		firstDone <- err
+	}()
+	select {
+	case <-testRaft.createStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first full batch did not enter Raft Apply")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := svc.SubmitBatch(ctx, fullSubmitRequest("tenant-a", "second"))
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("waiting Submit error = %v, want DeadlineExceeded", err)
+	}
+	close(testRaft.createRelease)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := len(fsm.FindAllPendingTasks()); got != maxSubmitBatchTasks {
+		t.Fatalf("pending tasks = %d, canceled waiter must not reach Raft Apply", got)
+	}
+}
+
+func TestSubmissionApplyWaitQueueRejectsBeforeUnboundedGrowth(t *testing.T) {
+	fsm := raft.NewFSM(zap.NewNop())
+	applyInternalTestCommand(fsm, raft.OpUpsertTenant, types.TenantConfig{
+		ID: "tenant-a", MaxWorkers: 1000,
+	})
+	testRaft := &blockingCreateRaft{
+		fsm:           fsm,
+		createStarted: make(chan struct{}),
+		createRelease: make(chan struct{}),
+	}
+	svc := NewService("leader", queue.NewMemoryQueue(), fsm, testRaft, nil, zap.NewNop())
+	svc.SetSubmissionApplyLimit(1)
+	observer := &recordingSubmissionObserver{}
+	svc.SetSubmissionPerformanceObserver(observer)
+	results := make(chan error, 6)
+	go func() {
+		_, err := svc.SubmitBatch(
+			context.Background(), fullSubmitRequest("tenant-a", "active"),
+		)
+		results <- err
+	}()
+	select {
+	case <-testRaft.createStarted:
+	case <-time.After(time.Second):
+		t.Fatal("active full batch did not enter Raft Apply")
+	}
+	for requestIndex := 0; requestIndex < 5; requestIndex++ {
+		requestIndex := requestIndex
+		go func() {
+			_, err := svc.SubmitBatch(
+				context.Background(),
+				fullSubmitRequest("tenant-a", fmt.Sprintf("waiter-%d", requestIndex)),
+			)
+			results <- err
+		}()
+	}
+
+	select {
+	case err := <-results:
+		if status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("overflow waiter error = %v, want ResourceExhausted", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded waiter queue did not reject the overflow request")
+	}
+	close(testRaft.createRelease)
+	for completed := 0; completed < 5; completed++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(fsm.FindAllPendingTasks()); got != 5*maxSubmitBatchTasks {
+		t.Fatalf("pending tasks = %d, want only five admitted batches", got)
+	}
+	waits, rejected, inFlight, waiting, limit := observer.pressureSnapshot()
+	if waits != 4 || rejected != 1 || inFlight != 0 || waiting != 0 || limit != 1 {
+		t.Fatalf(
+			"bounded pressure waits=%d rejected=%d in-flight=%d waiting=%d limit=%d",
+			waits, rejected, inFlight, waiting, limit,
+		)
+	}
+}
+
+func fullSubmitRequest(tenantID, prefix string) *grpcv1.SubmitBatchRequest {
+	tasks := make([]*grpcv1.SubmitRequest, maxSubmitBatchTasks)
+	for index := range tasks {
+		tasks[index] = &grpcv1.SubmitRequest{
+			TenantId: tenantID, IdempotencyKey: fmt.Sprintf("%s-%d", prefix, index),
+		}
+	}
+	return &grpcv1.SubmitBatchRequest{Tasks: tasks}
 }
 
 func TestConcurrentSubmitBatchRejectsUnknownTenantWithoutPoisoningValidJobs(t *testing.T) {

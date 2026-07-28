@@ -1338,3 +1338,40 @@ accepted 后排空和端到端还受 Claim/Complete 批次、Processor、CPU 与
 平均等待约 1.523ms、1.656ms，queue depth 最终均为 0。其排空分别为 3.722s、3.168s，
 但最终检查时 HPA 已从冷态 5 Worker 扩到 35，处理拓扑不再与前三列一致，所以这两轮只
 证明满批提交没有重新串行化，不用于宣称消费吞吐提升。
+
+## 2026-07-29：SUBMIT-006 有界 Leader ingress 与浏览器滚动流水线
+
+本轮把页面固定 `1000/4 + Promise.all wave` 改为 batch=1000、滚动 Auto 8→16（手动
+4/8/16/32），同时给当前 Leader 的 Create Apply 增加默认 16 个未决 slot 和 64 个等待
+slot。该改变可能影响 submission、Raft ingress 和客户端请求形状，因此重新运行完整
+race 门禁和固定 PERF-001；新的 in-flight/waiting/limit、backpressure
+wait/rejection/latency 是 Leader 进程内 current/174 点诊断，不写 Raft，也不反馈给任务
+调度。
+
+完整 `make test` 在 Apple M4 Pro、14 logical CPU、48GiB、darwin/arm64、Go 1.26.5
+上以 `-race -count=1` 通过，真实 integration 阶段为 435.762s。SUBMIT-006 的真实
+三 voter Case 从两个 Follower 以配置 `submitApplyLimit=2` 并发提交 4×1000，经生产
+HTTP/gRPC/Raft/Worker/result 路径得到 4 Create Apply/4000 items，最终 pressure
+in-flight=0、waiting=0、错误=0、unfinished=0、每 task 执行一次。
+
+固定 PERF-001 与上一轮完全同形：7 replica（3 voter/4 non-voter）、每进程 80 槽、
+4 tenant×Limit 120、20000 个约 10ms 小 JSON 任务、Follower HTTP、batch=1000/
+concurrency=1。单并发不会填满新增 slot，所以该 Case 是协议回退门禁，不是本轮页面
+流水线收益测量：
+
+| 阶段 | SUBMIT-005 | SUBMIT-006 |
+|---|---:|---:|
+| durable submit | 2.647s | 2.767s |
+| accepted 后排空 | 12.001s | 12.001s |
+| 端到端 | 14.649s（1365.3 task/s） | 14.768s（1354.3 task/s） |
+| 错误 / unfinished / 重复执行 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+submit 单轮慢约 4.5%、端到端慢约 0.8%，而此形状既不发生 backpressure，也不改变请求
+并发，按选举/race/本机调度噪声记录，不能宣称新 slot 造成性能回退。部署后仍必须在同一
+远程 5-control、冷态 Worker、100 tenant×200、小 JSON+唯一幂等键形状下分别记录旧
+1000/4 和新滚动流水线的 accepted/drain/Apply/pressure，不能拿本机固定 Case替代。
+
+真实 Chrome 组件 Case 另固定 4 tenant×5000=20000、20 个满批，页面目标并发 16；
+httptest HTTP/1.1 同 host 实际最多观察到 6 个在途连接。首请求故意延迟 400ms、其余
+20ms 时，20 个请求全部在慢首请求结束前启动，证明滚动补位已经消除整轮 barrier；这只
+是客户端调度证据，不与远程 Raft 吞吐数字混比，也不把 16 误报成浏览器实际 socket 数。

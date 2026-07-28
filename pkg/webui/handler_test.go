@@ -271,9 +271,16 @@ func TestDashboardUsesMaximumSubmissionBatchesAndShowsIngressDiagnostics(t *test
 	}
 	body := recorder.Body.String()
 	for _, fragment := range []string{
-		`const SUBMIT_BATCH_SIZE=1000,SUBMIT_BATCH_CONCURRENCY=4`,
+		`const SUBMIT_BATCH_SIZE=1000`,
+		`id="submit-concurrency"`,
+		`Auto · 8 → 16`,
+		`LOAD.runRolling`,
+		`createSubmissionController`,
 		`Queues S / A / C`,
 		`submission_queue_depth`,
+		`submission_apply_inflight`,
+		`submission_apply_limit`,
+		`submission_backpressure_waits`,
 		`average_submission_batch`,
 		`average_submission_requests`,
 		`average_submission_queue_us`,
@@ -285,6 +292,10 @@ func TestDashboardUsesMaximumSubmissionBatchesAndShowsIngressDiagnostics(t *test
 	}
 	if strings.Contains(body, `const SUBMIT_BATCH_SIZE=500`) {
 		t.Fatal("dashboard still emits half-filled submission batches")
+	}
+	if strings.Contains(body, `SUBMIT_BATCH_CONCURRENCY=4`) ||
+		strings.Contains(body, `Promise.allSettled(batches.map`) {
+		t.Fatal("dashboard still imposes fixed four-request submission waves")
 	}
 }
 
