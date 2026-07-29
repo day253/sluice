@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -26,6 +27,12 @@ const DefaultMaxVoters = 5
 
 const defaultRaftLogCompactionThresholdBytes int64 = 64 << 20
 
+const (
+	defaultRaftTrailingLogs      uint64 = 1024
+	defaultRaftSnapshotThreshold uint64 = 4096
+	defaultRaftSnapshotInterval         = 30 * time.Second
+)
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -42,6 +49,11 @@ type ClusterConfig struct {
 	// Raft opens its log store. Zero selects the production default. Tests may
 	// lower it to reproduce long-running free-page growth without huge files.
 	LogCompactionThresholdBytes int64
+	// TrailingLogs, SnapshotThreshold and SnapshotInterval override the bounded
+	// production retention policy. Zero selects the production default.
+	TrailingLogs      uint64
+	SnapshotThreshold uint64
+	SnapshotInterval  time.Duration
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +71,7 @@ type Cluster struct {
 	dataDir   string
 	config    ClusterConfig
 	logger    *zap.Logger
+	trailing  uint64
 
 	membershipMu sync.Mutex
 }
@@ -145,6 +158,18 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	raftCfg := raft.DefaultConfig()
 	raftCfg.LocalID = raft.ServerID(cfg.NodeID)
 	raftCfg.LogLevel = "INFO"
+	raftCfg.TrailingLogs = cfg.TrailingLogs
+	if raftCfg.TrailingLogs == 0 {
+		raftCfg.TrailingLogs = defaultRaftTrailingLogs
+	}
+	raftCfg.SnapshotThreshold = cfg.SnapshotThreshold
+	if raftCfg.SnapshotThreshold == 0 {
+		raftCfg.SnapshotThreshold = defaultRaftSnapshotThreshold
+	}
+	raftCfg.SnapshotInterval = cfg.SnapshotInterval
+	if raftCfg.SnapshotInterval == 0 {
+		raftCfg.SnapshotInterval = defaultRaftSnapshotInterval
+	}
 
 	// ---- create Raft ----
 	rf, err := raft.NewRaft(raftCfg, fsm, logStore, stableStore, snapStore, transport)
@@ -165,6 +190,7 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 		dataDir:   cfg.DataDir,
 		config:    cfg,
 		logger:    logger,
+		trailing:  raftCfg.TrailingLogs,
 	}
 
 	// ---- bootstrap ----
@@ -188,6 +214,93 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 	}
 
 	return c, nil
+}
+
+// LogRetentionResult describes one local, process-only maintenance attempt.
+// A successful snapshot durably covers the FSM state before obsolete Raft log
+// keys are deleted. The Bolt file is physically rewritten on the next startup.
+type LogRetentionResult struct {
+	Needed         bool
+	SnapshotTaken  bool
+	FirstIndex     uint64
+	LastIndex      uint64
+	RetainedBefore uint64
+	RetainedAfter  uint64
+}
+
+type LogRange struct {
+	First    uint64
+	Last     uint64
+	Retained uint64
+}
+
+func (c *Cluster) LogRange() (LogRange, error) {
+	first, err := c.logStore.FirstIndex()
+	if err != nil {
+		return LogRange{}, fmt.Errorf("first log index: %w", err)
+	}
+	last, err := c.logStore.LastIndex()
+	if err != nil {
+		return LogRange{}, fmt.Errorf("last log index: %w", err)
+	}
+	return LogRange{First: first, Last: last, Retained: retainedLogCount(first, last)}, nil
+}
+
+// SnapshotOversizedLogWindow asks Hashicorp Raft to snapshot and trim a local
+// log window that is more than twice the configured trailing allowance. It is
+// safe on leaders and followers; ErrNothingNewToSnapshot means the caller
+// should retry after a newer committed entry is applied.
+func (c *Cluster) SnapshotOversizedLogWindow() (LogRetentionResult, error) {
+	logRange, err := c.LogRange()
+	if err != nil {
+		return LogRetentionResult{}, err
+	}
+	result := LogRetentionResult{
+		FirstIndex:     logRange.First,
+		LastIndex:      logRange.Last,
+		RetainedBefore: logRange.Retained,
+	}
+	if !oversizedLogWindow(logRange.First, logRange.Last, c.trailing) {
+		result.RetainedAfter = result.RetainedBefore
+		return result, nil
+	}
+	result.Needed = true
+
+	if err := c.raft.Snapshot().Error(); err != nil {
+		if errors.Is(err, raft.ErrNothingNewToSnapshot) {
+			return result, nil
+		}
+		return result, fmt.Errorf("take retention snapshot: %w", err)
+	}
+	result.SnapshotTaken = true
+	afterFirst, err := c.logStore.FirstIndex()
+	if err != nil {
+		return result, fmt.Errorf("first log index after snapshot: %w", err)
+	}
+	afterLast, err := c.logStore.LastIndex()
+	if err != nil {
+		return result, fmt.Errorf("last log index after snapshot: %w", err)
+	}
+	result.RetainedAfter = retainedLogCount(afterFirst, afterLast)
+	return result, nil
+}
+
+func retainedLogCount(first, last uint64) uint64 {
+	if first == 0 || last < first {
+		return 0
+	}
+	return last - first + 1
+}
+
+func oversizedLogWindow(first, last, trailing uint64) bool {
+	if trailing == 0 {
+		return false
+	}
+	retained := retainedLogCount(first, last)
+	if trailing > ^uint64(0)/2 {
+		return false
+	}
+	return retained > trailing*2
 }
 
 // ---------------------------------------------------------------------------

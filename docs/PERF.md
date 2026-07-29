@@ -1494,3 +1494,28 @@ submit 快约 8.2%、排空慢约 7.4%、端到端慢约 4.2%，方向相反且�
 启动峰值/重启次数，并重跑同形 100 tenant×200 Pod-side baseline。该结果将与
 revision 75 的浏览器流水线分栏：客户端已从 Mac 浏览器迁到集群 Pod，拓扑和请求来源
 不同，不能宣称百分比改善。
+
+revision 77 / `33d1c56-20260729161118` 的远程非 race integration 为 336.952s，Helm
+77 成功 rollout，但这是一次有价值的失败结论：free-page 估算正确地没有重写仍含大量
+live bucket allocation 的 1.5–1.7 GiB 文件；90 Worker 恢复后 4/5 control 再次出现
+`OOMKilled`，部分重启后的文件仍为 1.2–1.5 GiB。根因从“只有 Bolt 不缩文件”收窄为
+“Hashicorp 默认 `TrailingLogs=10240` 保留了大批量 entry + Bolt 在 logical delete 后
+不缩文件”。因此 revision 77 不能描述为修复完成，也没有运行 workload baseline。
+为保护集群，先暂停 autoscaler、把 Worker 降到 5，并临时用 4 GiB control 完成后续
+retention 迁移；最终目标仍回到 2 GiB，而不是把加内存当永久修复。
+
+修订后的 STORAGE-001 先把生产 `TrailingLogs/SnapshotThreshold/SnapshotInterval`
+固定为 `1024/4096/30s`。启动时 retained window 超过 2048 才请求本地 snapshot；
+Hashicorp 完整持久化 snapshot 后自行删除 covered log keys，下一次启动才由既有原子
+Bolt copy 回收物理页。新的 focused 3-voter Case 不再人工创建 free bucket，而是写入
+64×128 KiB 的真实 live Raft entries、以旧大 allowance snapshot，再经过“低 allowance
+启动 snapshot→第二次启动物理压缩”。完整 `make test` 在相同 Apple M4 Pro 环境以
+`-race -count=1` 通过，integration 为 445.508s；STORAGE-001 Case 为 14.83s，三份
+文件均缩小一半以上，旧 final state 保留，恢复后的 Follower HTTP 新任务
+exactly-once。
+
+同一测试进程的 PERF-001 durable submit 为 2.888s、accepted 后排空 11.200s、端到端
+14.088s（1419.6 task/s），错误 / unfinished / 重复执行仍为 0 / 0 / 0。相对上一轮
+STORAGE-001 端到端 14.200s 仅快约 0.8%，属于本机噪声；这证明缩短日志保留窗口未观察到
+steady-state 吞吐回退，不证明吞吐提升。远程 before/after 和 Pod-side baseline 仍需在
+最终 revision 下重新记录，不能沿用上面的 revision 77 数字。

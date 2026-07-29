@@ -32,7 +32,6 @@ import (
 
 	"github.com/go-logr/logr"
 	hashicorpraft "github.com/hashicorp/raft"
-	bolt "go.etcd.io/bbolt"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -97,6 +96,9 @@ type testCluster struct {
 	allocatorInterval           time.Duration
 	submissionApplyLimit        int
 	raftLogCompactionThreshold  int64
+	raftTrailingLogs            uint64
+	raftSnapshotThreshold       uint64
+	raftSnapshotInterval        time.Duration
 	leaderElectionRetryInterval time.Duration
 
 	mu      sync.Mutex
@@ -539,6 +541,9 @@ func (tc *testCluster) recreateAllForRestart() {
 			AllocatorInterval:               tc.allocatorInterval,
 			SubmissionApplyLimit:            tc.submissionApplyLimit,
 			RaftLogCompactionThresholdBytes: tc.raftLogCompactionThreshold,
+			RaftTrailingLogs:                tc.raftTrailingLogs,
+			RaftSnapshotThreshold:           tc.raftSnapshotThreshold,
+			RaftSnapshotInterval:            tc.raftSnapshotInterval,
 			LeaderElectionRetryInterval:     tc.leaderElectionRetryInterval,
 		}, tc.proc, logger)
 		if err != nil {
@@ -4551,22 +4556,80 @@ func TestFragmentedRaftLogCompactsBeforeMultiNodeRecovery(t *testing.T) {
 		return result != nil && result.Status == types.TaskStatusDone
 	}, 30*time.Second, "pre-restart task final state")
 
+	// Build real live trailing logs, then snapshot while the original default
+	// still retains the entire window. Repeatedly overwriting the same tenant
+	// keeps the final FSM snapshot small while the Raft entries stay large.
+	historyName := strings.Repeat("h", 128<<10)
+	for index := 0; index < 64; index++ {
+		leader = tc.leaderIdx()
+		cmd := raftpkg.MustMarshalCommand(raftpkg.OpUpsertTenant, types.TenantConfig{
+			ID:         "storage-history",
+			Name:       fmt.Sprintf("%03d-%s", index, historyName),
+			MaxWorkers: 20,
+		})
+		if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(cmd, 5*time.Second).Error(); err != nil {
+			t.Fatalf("append retained history %d: %v", index, err)
+		}
+	}
+	finalHistory := raftpkg.MustMarshalCommand(raftpkg.OpUpsertTenant, types.TenantConfig{
+		ID: "storage-history", Name: "compacted", MaxWorkers: 20,
+	})
+	leader = tc.leaderIdx()
+	if err := tc.nodes[leader].RaftCluster().GetRaft().Apply(finalHistory, 5*time.Second).Error(); err != nil {
+		t.Fatalf("replace retained history: %v", err)
+	}
+	tc.waitFor(func() bool {
+		for _, current := range tc.nodes {
+			tenant, ok := current.RaftCluster().FSM().GetTenant("storage-history")
+			if !ok || tenant.Name != "compacted" {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, "large trailing history replicated")
+	for index, current := range tc.nodes {
+		if err := current.RaftCluster().GetRaft().Snapshot().Error(); err != nil {
+			t.Fatalf("take original voter %d snapshot: %v", index, err)
+		}
+	}
+
 	tc.stopAllForRestart()
 	beforeSizes := make([]int64, len(tc.dirs))
 	for index, directory := range tc.dirs {
 		logPath := filepath.Join(directory, "raft", "raft-log.db")
-		inflateClosedBoltWithFreePages(t, logPath)
 		info, statErr := os.Stat(logPath)
 		if statErr != nil {
-			t.Fatalf("stat fragmented voter %d: %v", index, statErr)
+			t.Fatalf("stat retained voter %d: %v", index, statErr)
 		}
 		beforeSizes[index] = info.Size()
-		if info.Size() < 32<<20 {
-			t.Fatalf("fragmented voter %d size = %d, want at least 32MiB", index, info.Size())
+		if info.Size() < 8<<20 {
+			t.Fatalf("retained voter %d size = %d, want at least 8MiB", index, info.Size())
 		}
 	}
 
 	tc.raftLogCompactionThreshold = 1
+	tc.raftTrailingLogs = 8
+	tc.raftSnapshotThreshold = 32
+	tc.raftSnapshotInterval = time.Hour
+	tc.recreateAllForRestart()
+	for index := range tc.nodes {
+		go func(nodeIndex int) { _ = tc.nodes[nodeIndex].Start() }(index)
+	}
+	tc.waitAnyLeader(30 * time.Second)
+	tc.waitNodes(3, 10*time.Second)
+	tc.waitFor(func() bool {
+		for _, current := range tc.nodes {
+			logRange, rangeErr := current.RaftCluster().LogRange()
+			if rangeErr != nil || logRange.Retained > 24 {
+				return false
+			}
+		}
+		return true
+	}, 30*time.Second, "all voters snapshot oversized live trailing logs")
+	tc.stopAllForRestart()
+
+	// The first tuned start safely deletes snapshot-covered keys. The second
+	// recreation runs the offline atomic Bolt rewrite before any mmap/replay.
 	tc.recreateAllForRestart()
 	for index, directory := range tc.dirs {
 		info, statErr := os.Stat(filepath.Join(directory, "raft", "raft-log.db"))
@@ -4574,7 +4637,7 @@ func TestFragmentedRaftLogCompactsBeforeMultiNodeRecovery(t *testing.T) {
 			t.Fatalf("stat compacted voter %d: %v", index, statErr)
 		}
 		if info.Size() >= beforeSizes[index]/2 {
-			t.Fatalf("voter %d compacted size = %d, fragmented = %d",
+			t.Fatalf("voter %d compacted size = %d, retained = %d",
 				index, info.Size(), beforeSizes[index])
 		}
 	}
@@ -4618,43 +4681,6 @@ func TestFragmentedRaftLogCompactsBeforeMultiNodeRecovery(t *testing.T) {
 	}
 	if count := tc.proc.processedTaskCount(afterTask.TaskID); count != 1 {
 		t.Fatalf("post-compaction task processed %d times, want once", count)
-	}
-}
-
-func inflateClosedBoltWithFreePages(t *testing.T, path string) {
-	t.Helper()
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
-	if err != nil {
-		t.Fatalf("open closed Raft log for fragmentation: %v", err)
-	}
-	defer db.Close()
-
-	const bucketName = "storage-001-fragmentation"
-	payload := bytes.Repeat([]byte("f"), 1<<20)
-	if err := db.Update(func(tx *bolt.Tx) error {
-		bucket, createErr := tx.CreateBucket([]byte(bucketName))
-		if createErr != nil {
-			return createErr
-		}
-		for index := 0; index < 48; index++ {
-			if putErr := bucket.Put(
-				[]byte(fmt.Sprintf("discarded-%03d", index)),
-				payload,
-			); putErr != nil {
-				return putErr
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("inflate closed Raft log: %v", err)
-	}
-	if err := db.Update(func(tx *bolt.Tx) error {
-		return tx.DeleteBucket([]byte(bucketName))
-	}); err != nil {
-		t.Fatalf("delete fragmentation bucket: %v", err)
-	}
-	if err := db.Sync(); err != nil {
-		t.Fatalf("sync fragmented Raft log: %v", err)
 	}
 }
 

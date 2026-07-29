@@ -2,12 +2,15 @@ package raft
 
 import (
 	"bytes"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	hashicorpraft "github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"go.uber.org/zap"
 )
 
 func TestCompactBoltStoreReclaimsDeletedRaftPagesAndPreservesLogs(t *testing.T) {
@@ -111,5 +114,59 @@ func TestCompactBoltStoreSkipsFileWithoutEnoughReclaimableSpace(t *testing.T) {
 	}
 	if result.Compacted {
 		t.Fatalf("live store was unnecessarily compacted: %+v", result)
+	}
+}
+
+func TestOversizedLogWindowUsesBoundedTrailingAllowance(t *testing.T) {
+	tests := []struct {
+		name     string
+		first    uint64
+		last     uint64
+		trailing uint64
+		want     bool
+	}{
+		{name: "empty", trailing: 1024},
+		{name: "at twice allowance", first: 1, last: 2048, trailing: 1024},
+		{name: "above twice allowance", first: 1, last: 2049, trailing: 1024, want: true},
+		{name: "nonzero first", first: 5000, last: 7048, trailing: 1024, want: true},
+		{name: "disabled", first: 1, last: 100, trailing: 0},
+		{name: "overflow safe", first: 1, last: ^uint64(0), trailing: ^uint64(0)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := oversizedLogWindow(test.first, test.last, test.trailing); got != test.want {
+				t.Fatalf("oversizedLogWindow(%d, %d, %d) = %v, want %v",
+					test.first, test.last, test.trailing, got, test.want)
+			}
+		})
+	}
+}
+
+func TestNewClusterUsesBoundedProductionSnapshotPolicy(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cluster, err := NewCluster(ClusterConfig{
+		NodeID:      "storage-policy",
+		RaftAddress: address,
+		DataDir:     t.TempDir(),
+		Logger:      zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cluster.Shutdown()
+
+	config := cluster.GetRaft().ReloadableConfig()
+	if config.TrailingLogs != 1024 ||
+		config.SnapshotThreshold != 4096 ||
+		config.SnapshotInterval != 30*time.Second {
+		t.Fatalf("snapshot policy = %+v", config)
 	}
 }

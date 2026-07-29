@@ -56,6 +56,9 @@ type Config struct {
 	// RaftLogCompactionThresholdBytes overrides the closed-store startup
 	// compaction threshold. Zero selects the production default.
 	RaftLogCompactionThresholdBytes int64
+	RaftTrailingLogs                uint64
+	RaftSnapshotThreshold           uint64
+	RaftSnapshotInterval            time.Duration
 	// LoadGeneratorAddress is the fixed, non-Raft HTTP endpoint used only to
 	// proxy synthetic workload parameters from the dashboard.
 	LoadGeneratorAddress string
@@ -147,6 +150,9 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 		Bootstrap:                   cfg.Bootstrap,
 		Logger:                      logger,
 		LogCompactionThresholdBytes: cfg.RaftLogCompactionThresholdBytes,
+		TrailingLogs:                cfg.RaftTrailingLogs,
+		SnapshotThreshold:           cfg.RaftSnapshotThreshold,
+		SnapshotInterval:            cfg.RaftSnapshotInterval,
 	}
 	cluster, err := raftpkg.NewCluster(raftCfg)
 	if err != nil {
@@ -297,6 +303,7 @@ func (n *Node) Start() error {
 	); err != nil {
 		n.logger.Warn("register node (non-fatal)", zap.Error(err))
 	}
+	go n.maintainRaftLogRetention()
 
 	allocatorInterval := n.cfg.AllocatorInterval
 	if allocatorInterval <= 0 {
@@ -336,6 +343,39 @@ func (n *Node) Start() error {
 	}
 
 	return n.Shutdown(30 * time.Second)
+}
+
+func (n *Node) maintainRaftLogRetention() {
+	const (
+		attempts = 30
+		interval = 2 * time.Second
+	)
+	for attempt := 1; attempt <= attempts; attempt++ {
+		result, err := n.raftCluster.SnapshotOversizedLogWindow()
+		if err != nil {
+			n.logger.Warn("raft log: retention snapshot failed",
+				zap.Int("attempt", attempt),
+				zap.Error(err))
+		} else if !result.Needed {
+			return
+		} else if result.SnapshotTaken {
+			n.logger.Info("raft log: retained window compacted",
+				zap.Uint64("first_index", result.FirstIndex),
+				zap.Uint64("last_index", result.LastIndex),
+				zap.Uint64("retained_before", result.RetainedBefore),
+				zap.Uint64("retained_after", result.RetainedAfter))
+			return
+		}
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-n.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+	n.logger.Warn("raft log: retained window remains oversized after startup retries")
 }
 
 func waitForRaftLeader(
