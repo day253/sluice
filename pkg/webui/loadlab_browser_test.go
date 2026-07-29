@@ -471,20 +471,23 @@ func TestWorkerPodLoadBrowserBuildsBoundedSessionChart(t *testing.T) {
 	defer cancel()
 
 	var state struct {
-		Summary          string `json:"summary"`
-		Legend           string `json:"legend"`
-		LegendItems      int    `json:"legendItems"`
-		Samples          int    `json:"samples"`
-		DownVisible      bool   `json:"downVisible"`
-		PanelInMonitor   bool   `json:"panelInMonitor"`
-		HasCanvas        bool   `json:"hasCanvas"`
-		HasTable         bool   `json:"hasTable"`
-		AverageCPU       string `json:"averageCPU"`
-		MaximumCPU       string `json:"maximumCPU"`
-		RunningTasks     string `json:"runningTasks"`
-		JSONLabel        string `json:"jsonLabel"`
-		JSONTarget       string `json:"jsonTarget"`
-		JSONRelationship string `json:"jsonRelationship"`
+		Summary          string  `json:"summary"`
+		Legend           string  `json:"legend"`
+		LegendItems      int     `json:"legendItems"`
+		Samples          int     `json:"samples"`
+		DownVisible      bool    `json:"downVisible"`
+		PanelInMonitor   bool    `json:"panelInMonitor"`
+		HasCanvas        bool    `json:"hasCanvas"`
+		HasTable         bool    `json:"hasTable"`
+		AverageCPU       string  `json:"averageCPU"`
+		MaximumCPU       string  `json:"maximumCPU"`
+		RunningTasks     string  `json:"runningTasks"`
+		JSONLabel        string  `json:"jsonLabel"`
+		JSONTarget       string  `json:"jsonTarget"`
+		JSONRelationship string  `json:"jsonRelationship"`
+		ChartMode        string  `json:"chartMode"`
+		ChartPeak        float64 `json:"chartPeak"`
+		ChartNote        string  `json:"chartNote"`
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
@@ -508,6 +511,9 @@ func TestWorkerPodLoadBrowserBuildsBoundedSessionChart(t *testing.T) {
 				jsonLabel: link.textContent.trim(),
 				jsonTarget: link.target,
 				jsonRelationship: link.rel,
+				chartMode: panel.querySelector("#worker-cpu-session-chart").dataset.chartMode,
+				chartPeak: Number(panel.querySelector("#worker-cpu-session-chart").dataset.chartPeak),
+				chartNote: panel.querySelector("#worker-cpu-session-note").textContent.trim(),
 			};
 		})()`, &state),
 	); err != nil {
@@ -516,10 +522,12 @@ func TestWorkerPodLoadBrowserBuildsBoundedSessionChart(t *testing.T) {
 	if state.Summary != "11 / 12 reporting" ||
 		state.LegendItems != 9 ||
 		!strings.Contains(state.Legend, "worker-2") ||
-		!strings.Contains(state.Legend, "Other 3 Pods (avg)") ||
+		!strings.Contains(state.Legend, "Other 3 Pods") ||
 		state.Samples < 2 || state.DownVisible || !state.PanelInMonitor ||
 		!state.HasCanvas || state.HasTable || state.AverageCPU == "—" ||
 		state.MaximumCPU != "72.0%" || state.RunningTasks != "15" ||
+		state.ChartMode != "stacked" || state.ChartPeak <= 0 ||
+		!strings.Contains(state.ChartNote, "stacked peak") ||
 		state.JSONLabel != "JSON ↗" ||
 		state.JSONTarget != "_blank" ||
 		!strings.Contains(state.JSONRelationship, "noopener") {
@@ -661,29 +669,36 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 	defer cancel()
 
 	var state struct {
-		WorkerLegendItems   int     `json:"workerLegendItems"`
-		TenantLegendItems   int     `json:"tenantLegendItems"`
-		SessionWorkerItems  int     `json:"sessionWorkerItems"`
-		SessionTenantItems  int     `json:"sessionTenantItems"`
-		WorkerLegend        string  `json:"workerLegend"`
-		TenantLegend        string  `json:"tenantLegend"`
-		SessionWorkerLegend string  `json:"sessionWorkerLegend"`
-		SessionTenantLegend string  `json:"sessionTenantLegend"`
-		WorkerSamples       int     `json:"workerSamples"`
-		TenantSamples       int     `json:"tenantSamples"`
-		SessionAfterCharts  bool    `json:"sessionAfterCharts"`
-		RaftAffinity        bool    `json:"raftAffinity"`
-		SchedulerAffinity   bool    `json:"schedulerAffinity"`
-		StandalonePressure  bool    `json:"standalonePressure"`
-		HasTable            bool    `json:"hasTable"`
-		SessionBadge        string  `json:"sessionBadge"`
-		SubmissionQueues    string  `json:"submissionQueues"`
-		SubmissionQueueNote string  `json:"submissionQueueNote"`
-		LegendGrid          bool    `json:"legendGrid"`
-		LegendDense         bool    `json:"legendDense"`
-		LegendNoOverlap     bool    `json:"legendNoOverlap"`
-		LegendOverflow      bool    `json:"legendOverflow"`
-		MaxLegendHeight     float64 `json:"maxLegendHeight"`
+		WorkerLegendItems    int     `json:"workerLegendItems"`
+		TenantLegendItems    int     `json:"tenantLegendItems"`
+		SessionWorkerItems   int     `json:"sessionWorkerItems"`
+		SessionTenantItems   int     `json:"sessionTenantItems"`
+		WorkerLegend         string  `json:"workerLegend"`
+		TenantLegend         string  `json:"tenantLegend"`
+		SessionWorkerLegend  string  `json:"sessionWorkerLegend"`
+		SessionTenantLegend  string  `json:"sessionTenantLegend"`
+		WorkerSamples        int     `json:"workerSamples"`
+		TenantSamples        int     `json:"tenantSamples"`
+		SessionAfterCharts   bool    `json:"sessionAfterCharts"`
+		RaftAffinity         bool    `json:"raftAffinity"`
+		SchedulerAffinity    bool    `json:"schedulerAffinity"`
+		StandalonePressure   bool    `json:"standalonePressure"`
+		HasTable             bool    `json:"hasTable"`
+		SessionBadge         string  `json:"sessionBadge"`
+		SubmissionQueues     string  `json:"submissionQueues"`
+		SubmissionQueueNote  string  `json:"submissionQueueNote"`
+		LegendGrid           bool    `json:"legendGrid"`
+		LegendDense          bool    `json:"legendDense"`
+		LegendNoOverlap      bool    `json:"legendNoOverlap"`
+		LegendOverflow       bool    `json:"legendOverflow"`
+		MaxLegendHeight      float64 `json:"maxLegendHeight"`
+		StackedCharts        bool    `json:"stackedCharts"`
+		CPUPeak              float64 `json:"cpuPeak"`
+		TenantPeak           float64 `json:"tenantPeak"`
+		CPUStackedTooltip    string  `json:"cpuStackedTooltip"`
+		TenantStackedTooltip string  `json:"tenantStackedTooltip"`
+		CPUStackedNote       string  `json:"cpuStackedNote"`
+		TenantStackedNote    string  `json:"tenantStackedNote"`
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
@@ -701,6 +716,19 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 					box.top < other.bottom - .5 && box.bottom > other.top + .5
 				));
 			};
+			const stackedTooltip = canvas => {
+				const rect = canvas.getBoundingClientRect();
+				canvas.dispatchEvent(new PointerEvent("pointermove", {
+					clientX: rect.left + rect.width * .7,
+					clientY: rect.top + 80,
+					bubbles: true
+				}));
+				return canvas.parentElement.querySelector(".chart-tooltip").textContent;
+			};
+			const cpuCanvas = document.querySelector("#worker-cpu-session-chart");
+			const tenantCanvas = document.querySelector("#tenant-allocation-session-chart");
+			const cpuTooltip = stackedTooltip(cpuCanvas);
+			const tenantTooltip = stackedTooltip(tenantCanvas);
 			return {
 				workerLegendItems: document.querySelectorAll("#worker-chart-legend .legend-item").length,
 				tenantLegendItems: document.querySelectorAll("#tenant-chart-legend .legend-item").length,
@@ -730,6 +758,14 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 				legendNoOverlap: legends.every(legend => !overlaps(legend)),
 				legendOverflow: legends.every(legend => getComputedStyle(legend).overflowY === "auto"),
 				maxLegendHeight: Math.max(...legends.map(legend => legend.getBoundingClientRect().height)),
+				stackedCharts: cpuCanvas.dataset.chartMode === "stacked" &&
+					tenantCanvas.dataset.chartMode === "stacked",
+				cpuPeak: Number(cpuCanvas.dataset.chartPeak),
+				tenantPeak: Number(tenantCanvas.dataset.chartPeak),
+				cpuStackedTooltip: cpuTooltip,
+				tenantStackedTooltip: tenantTooltip,
+				cpuStackedNote: document.querySelector("#worker-cpu-session-note").textContent,
+				tenantStackedNote: document.querySelector("#tenant-allocation-session-note").textContent,
 			};
 		})()`, &state),
 	); err != nil {
@@ -739,8 +775,8 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 		state.SessionWorkerItems != 9 || state.SessionTenantItems != 9 ||
 		!strings.Contains(state.WorkerLegend, "Other 4 Pods (avg)") ||
 		!strings.Contains(state.TenantLegend, "Other 4 tenants (avg)") ||
-		!strings.Contains(state.SessionWorkerLegend, "Other 4 Pods (avg)") ||
-		!strings.Contains(state.SessionTenantLegend, "Other 4 tenants (avg)") ||
+		!strings.Contains(state.SessionWorkerLegend, "Other 4 Pods") ||
+		!strings.Contains(state.SessionTenantLegend, "Other 4 tenants") ||
 		state.WorkerSamples < 2 || state.TenantSamples < 2 ||
 		!state.SessionAfterCharts || !state.RaftAffinity || !state.SchedulerAffinity ||
 		state.StandalonePressure || state.HasTable ||
@@ -748,7 +784,12 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 		state.SubmissionQueues != "1 · 3 · 2" ||
 		!strings.Contains(state.SubmissionQueueNote, "submit avg 500 tasks / 2 requests") ||
 		!state.LegendGrid || !state.LegendDense || !state.LegendNoOverlap ||
-		!state.LegendOverflow || state.MaxLegendHeight > 128 {
+		!state.LegendOverflow || state.MaxLegendHeight > 128 ||
+		!state.StackedCharts || state.CPUPeak <= 350 || state.TenantPeak != 90 ||
+		!strings.Contains(state.CPUStackedTooltip, "Stacked total") ||
+		!strings.Contains(state.TenantStackedTooltip, "Stacked total") ||
+		!strings.Contains(state.CPUStackedNote, "stacked peak") ||
+		!strings.Contains(state.TenantStackedNote, "stacked peak") {
 		t.Fatalf("dashboard trend browser state = %+v", state)
 	}
 }

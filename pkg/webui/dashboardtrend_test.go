@@ -93,6 +93,55 @@ func TestDashboardTrendCollapsesHighCardinalitySeries(t *testing.T) {
 	}
 }
 
+func TestDashboardTrendStacksCollapsedRemainderWithoutLosingTotal(t *testing.T) {
+	runtime := dashboardTrendRuntime(t)
+	result := evaluateJSON[struct {
+		Length       int       `json:"length"`
+		Hidden       int       `json:"hidden"`
+		OtherName    string    `json:"otherName"`
+		OtherCurrent float64   `json:"otherCurrent"`
+		OtherLimit   float64   `json:"otherLimit"`
+		Top          []float64 `json:"top"`
+		OtherBase    []float64 `json:"otherBase"`
+	}](t, runtime, `(() => {
+		const input = Array.from({length:12}, (_, index) => {
+			const value = 12-index;
+			return {
+				id:"worker-"+index,
+				name:"worker-"+index,
+				current:value,
+				limit:100,
+				history:{days:[],hours:[],mins:[],secs:[value,value+1]}
+			};
+		});
+		const collapsed = SluiceDashboardTrend.collapseSeries(
+			input, 8, "Pods", false, "sum"
+		);
+		const rows = SluiceDashboardTrend.stackRows(collapsed.series.map(item => ({
+			item:item,
+			data:item.history.secs
+		})));
+		const other = collapsed.series[collapsed.series.length-1];
+		return {
+			length:rows.length,
+			hidden:collapsed.hidden,
+			otherName:other.name,
+			otherCurrent:other.current,
+			otherLimit:other.limit,
+			top:rows[rows.length-1].top,
+			otherBase:rows[rows.length-1].base
+		};
+	})()`)
+	if result.Length != 9 || result.Hidden != 4 ||
+		result.OtherName != "Other 4 Pods" ||
+		result.OtherCurrent != 10 || result.OtherLimit != 400 ||
+		len(result.Top) != 2 || result.Top[0] != 78 || result.Top[1] != 90 ||
+		len(result.OtherBase) != 2 || result.OtherBase[0] != 68 ||
+		result.OtherBase[1] != 76 {
+		t.Fatalf("stacked collapsed chart = %+v", result)
+	}
+}
+
 func TestDashboardTrendDropsEmptySeries(t *testing.T) {
 	runtime := dashboardTrendRuntime(t)
 	result := evaluateJSON[struct {

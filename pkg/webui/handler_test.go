@@ -136,7 +136,7 @@ func TestDashboardTurnsCurrentWorkerPodLoadIntoSessionChart(t *testing.T) {
 		`id="worker-load-summary"`,
 		`id="worker-cpu-session-chart"`,
 		`id="worker-cpu-session-legend"`,
-		`aria-label="Worker Pod CPU trend recorded in this browser session"`,
+		`aria-label="Stacked Worker Pod CPU trend recorded in this browser session"`,
 		`aria-label="View current Worker Pod load as JSON"`,
 		`loads=scheduler.worker_telemetry||scheduler.worker_loads||{}`,
 		`cpu_utilization_millis`,
@@ -146,7 +146,7 @@ func TestDashboardTurnsCurrentWorkerPodLoadIntoSessionChart(t *testing.T) {
 		`TREND.recordSample`,
 		`renderSessionTrends()`,
 		`mode='server'`,
-		`'session'`,
+		`'session-stacked'`,
 	} {
 		if !strings.Contains(body, fragment) {
 			t.Errorf("dashboard is missing Worker Pod load fragment %q", fragment)
@@ -198,12 +198,12 @@ func TestDashboardChartsAggregateTenantSlotsWithoutPlacementMatrix(t *testing.T)
 		`Tenant allocated slots`,
 		`id="tenant-allocation-session-chart"`,
 		`id="tenant-allocation-session-legend"`,
-		`aria-label="Tenant allocated slots trend recorded in this browser session"`,
+		`aria-label="Stacked tenant allocated slots trend recorded in this browser session"`,
 		`S.tenantAllocationTotals`,
 		`totals[tenant.id]||0`,
 		`prefix=allocated-workers%3Atenant%3A&performance=0&current=1`,
 		`S.sessionHistory.tenants`,
-		`TREND.collapseSeries(tenantSeries,CHART_SERIES_LIMIT,'tenants',false,'average')`,
+		`TREND.collapseSeries(tenantSeries,CHART_SERIES_LIMIT,'tenants',false,'sum')`,
 		`limit:Number(tenant.max_workers||0)`,
 	} {
 		if !strings.Contains(body, fragment) {
@@ -317,8 +317,12 @@ func TestDashboardBoundsHighCardinalityChartsAndUsesEphemeralSessionHistory(t *t
 		`<script src="/assets/dashboardtrend.js"></script>`,
 		`SESSION_HISTORY_LIMIT=60`,
 		`CHART_SERIES_LIMIT=8`,
-		`TREND.collapseSeries(workerSeries,CHART_SERIES_LIMIT,'Pods',false,'average')`,
+		`TREND.collapseSeries(workerSeries,CHART_SERIES_LIMIT,'Pods',false,'sum')`,
 		`TREND.collapseSeries(tenantSeries,CHART_SERIES_LIMIT,'tenants',true,'average')`,
+		`TREND.collapseSeries(tenantSeries,CHART_SERIES_LIMIT,'tenants',false,'sum')`,
+		`'session-stacked'`,
+		`canvas.dataset.chartMode=stackedMode?'stacked':'lines'`,
+		`Stacked total`,
 		`.chart-legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(180px,100%),1fr))`,
 		`max-height:112px;overflow:auto;scrollbar-gutter:stable`,
 		`legend.classList.toggle('is-dense',series.length>4)`,

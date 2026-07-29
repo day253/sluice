@@ -811,7 +811,8 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **问题与需求**：90 Worker、数百 tenant 时，`Tenant allocation` 每秒读取约 1.18MiB
   的 `/admin/allocations`，在浏览器构造完整 placement chip 矩阵；这既不是主监控所需，
   也放大 Leader/网络/DOM 开销。页面现在只画每租户当前聚合 `Allocated slots` 的浏览器
-  会话趋势，虚线叠加配置 Limit，不再展示表格或每 Pod 分配详情。
+  会话趋势，最初用虚线叠加配置 Limit；UI-010 的堆叠视图改为在 legend 保留 Limit，
+  不再展示表格或每 Pod 分配详情。
 - **数据语义**：每租户槽位来自既有 `allocated-workers:tenant:<id>` collector 指标的
   最新一秒。`current=1` 在复制 ring 前只返回一个 `secs` 值，其他历史数组为空；这是
   allocation 当前镜像的轻量读法。浏览器内存每秒采样并最多保留 60 点，刷新清空，不新增
@@ -838,8 +839,9 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   tenant` 和 `Worker allocation by instance` 位于顶部；Performance 紧随其后；浏览器
   会话趋势放在下方。Raft 当前 Apply 值与 Raft 图共置，pending scan/dispatcher queue/
   CPU admission 与 scheduler 图共置，队列和容量当前值也分别归入对应的主图。
-- **标签收敛**：Worker、tenant 等高基数图按整个可见历史窗口的最大值降序选择 Top 8，
-  保证真正的热点不会因当前瞬时下降而跳出；剩余系列合成一条 `Other N ... (avg)`。
+- **标签收敛**：非堆叠的 Worker、unfinished 等高基数图按整个可见历史窗口的最大值降序
+  选择 Top 8，保证真正的热点不会因当前瞬时下降而跳出；剩余系列合成一条
+  `Other N ... (avg)`。
   使用平均值而非求和，避免大量低值系列的总和压扁 Top 8 的纵轴；legend 最多 9 项。
   legend 使用最小列宽的自适应 grid，而不是会在窄卡片内挤压重叠的 flex 行；超过四项
   进入 dense 布局，名称在单元格内省略但保留完整 `title`，值保持可见，容器高度有界并
@@ -854,8 +856,32 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **回归覆盖**：`dashboardtrend` 单测固定 60 点上限、实体清理、稳定 Top 8 与 remainder
   平均值；WebUI 组件测试固定图表顺序、指标亲和、零 `<table>`、无浏览器持久化和无新增
   API；真实 Chrome `TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends`
-  在 12 Worker/12 tenant 响应下验证 legend≤9、`Other (avg)`、grid/dense/滚动样式、
+  在 12 Worker/12 tenant 响应下验证非堆叠图 legend≤9、`Other (avg)`、
+  grid/dense/滚动样式、
   所有 legend item 几何不相交、至少两个会话采样、Performance 共置和页面零表格。
+
+### UI-010：CPU 与租户槽位使用守恒的堆叠总量
+
+- **需求与显示语义**：`Worker Pod CPU` 和 `Tenant allocated slots` 两张浏览器会话图改为
+  stacked area。每个时间点从零开始逐系列累加，最上边界就是该时刻所有 live/reporting
+  Pod CPU 百分比之和或所有租户 allocated slots 之和，纵轴上限取整个 60 点窗口的最高
+  总量；图下注明真实 stacked peak。CPU 总量可以超过 100%，含义是多个 Pod 归一化 CPU
+  百分比相加，不是单 Pod 利用率。
+- **高基数守恒**：仍按窗口峰值选择 Top 8，后续系列只显示成一个 `Other N` 图层，但必须
+  逐点求和，不能沿用 UI-009 的 remainder average，否则堆叠顶部会低于真实总量。省略的
+  是标签细节，不是数值。租户 remainder 的当前 allocation 和 Limit 也分别求和；单租户
+  Limit 在堆叠纵轴上没有共同基线，因此不再画多条水平虚线，只在 legend 保留
+  `current / Limit`。原始 JSON 仍能查看全部 Pod/tenant。
+- **交互与边界**：悬停按所在堆叠 band 选择系列，显示该层原始值并同时显示该时刻
+  `Stacked total`。这只是 Canvas 呈现和浏览器内 60 点采样变换，不增加 API、服务端历史、
+  Raft/FSM/Snapshot 写入，也不反馈给 HPA、CPU admission、allocator 或租户借用。顶部
+  174 点 Worker allocation/unfinished 和 Performance 线图继续使用 UI-009 的非堆叠语义。
+- **回归覆盖**：`TestDashboardTrendStacksCollapsedRemainderWithoutLosingTotal` 用
+  12 个系列固定 Top 8 + 4 个 remainder 后逐点总和仍为 78/90，Other current/Limit
+  为 10/400；组件测试锁定两个 `session-stacked` 入口、sum collapse、ARIA 和 total
+  tooltip。真实 Chrome 两个 Case 验证 CPU/slot canvas 均为 stacked、12 系列合并后
+  CPU peak 大于 350%、slot peak 恰为 90、tooltip 含 `Stacked total`，同时继续检查
+  缺失/down Worker 排除、legend 不重叠和零表格。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 

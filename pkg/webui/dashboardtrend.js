@@ -114,11 +114,34 @@ var SluiceDashboardTrend = (function () {
     };
   }
 
+  function stackRows(rows) {
+    var width = (rows || []).reduce(function (maximum, row) {
+      return Math.max(maximum, (row && row.data || []).length);
+    }, 0);
+    var cumulative = Array(width).fill(0);
+    return (rows || []).map(function (row) {
+      var data = Array.from({ length: width }, function (_, index) {
+        return number(row && row.data && row.data[index]);
+      });
+      var base = cumulative.slice();
+      var top = data.map(function (value, index) {
+        return base[index] + value;
+      });
+      cumulative = top;
+      return Object.assign({}, row, {
+        data: data,
+        base: base,
+        top: top
+      });
+    });
+  }
+
   return {
     PERIODS: PERIODS,
     recordSample: recordSample,
     prune: prune,
     score: score,
-    collapseSeries: collapseSeries
+    collapseSeries: collapseSeries,
+    stackRows: stackRows
   };
 })();
