@@ -1537,3 +1537,47 @@ error/unfinished/重复执行为 0/0/0。端到端比上一跑 14.088s 慢约 8.
 retention 门槛，维护 goroutine 立即退出，因此协议与 steady-state 路径不变，该差异按
 选举、磁盘和本机调度噪声记录，不宣称回退或提升。最终远程 2 GiB 稳定性、物理文件和
 Pod-side baseline 在下一 revision 重新记录。
+
+revision 80 使用 `ea256d8-20260729170400` 完成远程 2 GiB 验收。环境仍为 Tiger
+ThinkPad L14 Gen 2、单机 MicroK8s、5 voter/0 non-voter、workload autoscaler
+5..90、每 Worker 100 Processor slot、专用单副本 Load Generator Pod。按用户明确要求，
+先停止 control/Worker/autoscaler/loadgen 并删除 50 份旧 PVC，清除了前一轮测试留下的
+103 tenant、1,038,426 个长期 unfinished task；这是一次测试环境重置，不是任务恢复策略，
+不得用于生产自愈。空集群重建后 5 个 control 的 `raft-log.db` 均约 48 KiB；完成下述负载
+后约 14.1 MiB，control RSS/cgroup current 约 47–65 MiB，5/5 Ready、restart=0、
+2 GiB limit，未再出现 OOM。
+
+Pod-side Case 为 100 个新 tenant×200 task=20,000、约 10 ms 小 JSON Processor、
+round-robin、batch=1000、submission concurrency=12、单 wave。Load Generator 在
+1.294s 内 durable accepted，accepted 后 9.024s 排空，端到端 10.318s
+（1938.3 task/s），0 submit failure、0 remaining、峰值 backlog 19,000、0 backoff。
+workload autoscaler 实际把 Worker 从 5 扩至 15；排空和 60 秒演示稳定窗口后按
+15→12→9→7→6→5 收回，最终 capacity=500、allocated=100、reporting=5、
+unfinished/pending/running=0。
+
+同一 Leader 的只读诊断为：Create 20 次 Apply/20,000 item，平均/最大
+70.105/88.182 ms、平均 batch=1000；Claim 316 次/20,000 item，
+15.289/47.247 ms、平均 batch=63；Complete 331 次/20,000 item，
+15.554/38.294 ms、平均 batch=60。scheduler 共 scanned 20,354、selected 20,000，
+selection 平均/最大 149 µs/11.644 ms；Dispatcher、backlog、错误/lease 信号在页面和
+原始 JSON 保留。该结果使用集群内 Pod 客户端和全新 5-voter 状态，不能与 revision 75
+的 Mac 浏览器客户端或本地 3-voter/4-non-voter 固定 Case直接声称百分比改善。
+
+### 2026-07-30：CTRL-006 新成员入群失败门禁
+
+远程并行首启还复现一次 `sluice-sluice-3` 在旧 30×2 秒 join 循环耗尽后继续启动，
+使 Ready Pod 一度对应 4/5 membership；手工补 join 后 revision 80 才收敛为 5 voter。
+CTRL-006 让新 PVC 成员未收到 Leader join 成功响应时直接退出交给 Kubernetes 重试，
+不改变已有 voter 恢复、Raft Apply、提交、调度、Worker 或任务协议。focused Chart unit
+与执行生产入口脚本的 integration 均通过；完整 `make test` 在相同 Apple M4 Pro、
+14 logical CPU、48 GiB、darwin/arm64、Go 1.26.5 上以 `-race -count=1` 通过，
+integration 为 458.367s。
+
+同一进程内 PERF-001 仍为 7 replica（3 voter/4 non-voter）、每进程 80 槽、
+4 tenant×Limit 120、20,000 个约 10 ms 小 JSON task、Follower HTTP、
+batch=1000/concurrency=1：durable submit 2.920s、accepted 后排空 13.201s、端到端
+16.122s（1240.5 task/s），error/unfinished/重复执行为 0/0/0。相对上一跑
+15.315s 端到端慢约 5.3%；该测试不执行 Helm entrypoint，运行时二进制和热路径完全未改，
+所以差值按选举、磁盘和本机调度噪声记录，不宣称性能回退或提升。最终远程 revision 还需
+用新 Chart 重部署并验证无需人工 join 即保持 5 voter；由于数据面未变，不重复拿同一
+Pod-side workload 制造新的 A/B 结论。

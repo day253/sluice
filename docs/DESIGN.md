@@ -125,6 +125,27 @@
   retry window 再启动其余 voter，要求重新选主，并经真实 Follower HTTP、Leader Raft、
   allocation、Worker 和 final-state 路径 exactly-once 排空。
 
+### CTRL-006：新 voter 未入群时不能启动成孤立成员
+
+- **已复现故障**：清空旧 PVC 后并行创建 5 个全新 control，ordinal 1..4 最多尝试
+  30 次发现 Leader 并调用 join。远程 MicroK8s 上 `sluice-sluice-3` 在这 60 秒内没有
+  完成 join，但旧入口脚本在循环结束后仍然启动 control；进程随即创建本地
+  `raft-stable.db`，以后重启又被“已有持久状态”分支误认为正式成员，最终 Pod Ready
+  但 membership 只有 4 voter。该空成员不能通过健康、Ready 或本地 stable 文件证明已入群。
+- **修复与失败语义**：新成员只有收到当前 Leader 的 join 成功响应后才能 exec control。
+  有界尝试耗尽必须以非零状态退出，由 Kubernetes restart policy 从仍为空的 PVC 重新走
+  join；不得 bootstrap、不得自行形成新组、不得把失败写成 stable state。已有 PVC 的正式
+  voter 仍按 CTRL-005 立即启动参与恢复，不能等待 HTTP Leader，否则会制造恢复死锁。
+  30 次/2 秒是部署重试节奏而非 Raft lease、成员资格或业务超时；测试可通过环境变量缩短，
+  Chart 默认不变。
+- **协议边界与非目标**：成员选择仍由现有 Leader 的 `/cluster/join` 和 Raft configuration
+  决定；入口脚本不增加 voter、不修改日志、不重放任务，也不负责移除失联成员。生产仍为
+  5 voter 单 shard；Multi-Raft 和自动 membership replacement 不在本次范围。
+- **回归覆盖**：Chart 单测锁定“join 循环→失败 guard→exec”的顺序；integration 执行
+  Helm 中同一份生产 shell，先让 Kubernetes Service 可见但 Leader 始终不可达，要求进程
+  非零退出且 `sluice` 从未启动，再恢复 Leader/join 响应并要求 control 启动参数完整。
+  远程清空 50 份 legacy PVC 后用同一并行首启路径验收并最终确认 5 voter。
+
 ### DEPLOY-001：不可变 StatefulSet 迁移前的 server dry-run 必须隔离
 
 - **已复现故障**：CTRL-005 首次远程恢复时，完整远端集成已经通过，但部署脚本在 orphan

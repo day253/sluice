@@ -160,6 +160,39 @@ func TestControlEntrypointConfiguresBoundedSubmissionRaftIngress(t *testing.T) {
 	}
 }
 
+func TestNewControlMemberCannotStartBeforeJoinSucceeds(t *testing.T) {
+	configData, err := os.ReadFile("../templates/configmap.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(configData)
+	for _, required := range []string{
+		`JOINED=false`,
+		`JOIN_ATTEMPTS="${SLUICE_JOIN_ATTEMPTS:-30}"`,
+		`JOIN_RETRY_DELAY="${SLUICE_JOIN_RETRY_DELAY:-2}"`,
+		`JOINED=true`,
+		`if [ "${JOINED}" != "true" ]; then`,
+		`refusing to start an unjoined member`,
+		`exit 1`,
+	} {
+		if !strings.Contains(config, required) {
+			t.Fatalf("control entrypoint is missing join guard %q", required)
+		}
+	}
+
+	joinLoop := strings.Index(config, `JOINED=false`)
+	joinGuard := strings.Index(config, `if [ "${JOINED}" != "true" ]; then`)
+	joinedExec := strings.LastIndex(config, `exec sluice --id="${POD_NAME}"`)
+	if joinLoop < 0 || joinGuard <= joinLoop || joinedExec <= joinGuard {
+		t.Fatalf(
+			"new-member startup order is join-loop=%d guard=%d exec=%d, want loop < guard < exec",
+			joinLoop,
+			joinGuard,
+			joinedExec,
+		)
+	}
+}
+
 func TestDedicatedLoadGeneratorIsSingleStatelessPodOutsideRaft(t *testing.T) {
 	type values struct {
 		LoadGenerator struct {

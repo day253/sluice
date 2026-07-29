@@ -89,17 +89,26 @@ data:
       JOIN_PAYLOAD=$(printf '{"node_id":"%s","raft_address":"%s","http_address":"%s","total_workers":%s}' \
         "${POD_NAME}" "${RAFT_ADVERTISE}" "${API}" "0")
       echo "==> Joining the current Raft leader (discovered via sluice-0)"
-      for i in $(seq 1 30); do
+      JOINED=false
+      JOIN_ATTEMPTS="${SLUICE_JOIN_ATTEMPTS:-30}"
+      JOIN_RETRY_DELAY="${SLUICE_JOIN_RETRY_DELAY:-2}"
+      for i in $(seq 1 "${JOIN_ATTEMPTS}"); do
         LEADER_IP=$(resolve_leader_ip "${BOOTSTRAP_IP}" || true)
         if [ -n "${LEADER_IP}" ] && wget -qO- \
           --header="Content-Type: application/json" \
           --post-data="${JOIN_PAYLOAD}" \
           "http://${LEADER_IP}:{{ .Values.apiPort }}/api/v1/cluster/join" 2>/dev/null; then
           echo
+          JOINED=true
           break
         fi
-        echo "   waiting for a reachable Raft leader... ${i}"; sleep 2
+        echo "   waiting for a reachable Raft leader... ${i}"
+        sleep "${JOIN_RETRY_DELAY}"
       done
+      if [ "${JOINED}" != "true" ]; then
+        echo "ERROR: ${POD_NAME} could not join a reachable Raft leader; refusing to start an unjoined member" >&2
+        exit 1
+      fi
       # The join request above already registered this member on the current
       # leader. Do not send a second request to the bootstrap follower; it can
       # reject the duplicate while the member is already being replicated.
