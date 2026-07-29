@@ -1519,3 +1519,21 @@ exactly-once。
 STORAGE-001 端到端 14.200s 仅快约 0.8%，属于本机噪声；这证明缩短日志保留窗口未观察到
 steady-state 吞吐回退，不证明吞吐提升。远程 before/after 和 Pod-side baseline 仍需在
 最终 revision 下重新记录，不能沿用上面的 revision 77 数字。
+
+revision 78 第一阶段 rollout 使用 `05eaa84-20260729164116`、5 voter、5 Worker、
+control 临时 4 GiB。远程非 race integration 为 344.842s；五份启动压缩的
+before→after 分别约 1555→298、1242→300、1243→300、1560→300、1630→300 MiB，
+全部 Ready 且 restart=0。该观察同时发现第一次 retention snapshot 在两个恢复较慢的
+voter 上只把 10258 条降到 7920/7885 条：snapshot 本身正确，但 revision 78 的维护循环
+错误地把“成功一次”当作“达到 2048 以下”，且固定约 60 秒后不再检查。因此 revision 78
+仍不是最终修复，也未恢复 2 GiB/HPA 或运行 workload baseline。
+
+后续修订先等待 `AppliedIndex >= LastIndex-TrailingLogs`，再触发一次能够覆盖目标窗口的
+snapshot；后台检查跟随 Node context 直到收敛，每 30 次记录恢复进度。focused Raft/Node
+unit 与真实 STORAGE-001 integration 均通过，focused integration 为 13.538s。完整
+`make test` 以 race 通过，integration 为 441.674s；同一固定 PERF-001 的
+submit/drain/end-to-end 为 3.114s/12.200s/15.315s（1305.9 task/s），最终
+error/unfinished/重复执行为 0/0/0。端到端比上一跑 14.088s 慢约 8.7%；新建小日志未达到
+retention 门槛，维护 goroutine 立即退出，因此协议与 steady-state 路径不变，该差异按
+选举、磁盘和本机调度噪声记录，不宣称回退或提升。最终远程 2 GiB 稳定性、物理文件和
+Pod-side baseline 在下一 revision 重新记录。

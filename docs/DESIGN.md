@@ -1599,10 +1599,12 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **逻辑保留协议**：每个 voter 使用 `TrailingLogs=1024`、`SnapshotThreshold=4096`、
   `SnapshotInterval=30s`；追赶窗口不足的 follower 走 Hashicorp Raft 已有的 snapshot
   installation，不自行解释 global pending 或 task ownership。进程启动后若本地 retained
-  log 超过 2048 条，最多每 2 秒重试、共 60 秒请求一次本地 Raft snapshot；只有
-  Hashicorp snapshot 完整持久化并覆盖对应 applied index 后，库才按 1024 trailing
-  allowance 删除旧 key。`ErrNothingNewToSnapshot` 只等待新 committed entry 后重试，
-  不把未被 snapshot 覆盖的日志当作可回收空间。
+  log 超过 2048 条，每 2 秒检查一次；只有 `AppliedIndex >= LastIndex-1024` 才请求
+  snapshot，避免恢复中的 follower 用落后的 applied index 反复生成只能裁掉一小段历史的
+  snapshot。检查随 Node context 持续到收敛，每 30 次输出一次等待进度，不用固定 60 秒
+  截止掩盖慢恢复。只有 Hashicorp snapshot 完整持久化并覆盖对应 applied index 后，库才
+  按 1024 trailing allowance 删除旧 key。`ErrNothingNewToSnapshot` 继续等待新
+  committed entry，不把未被 snapshot 覆盖的日志当作可回收空间。
 - **物理压缩协议**：只在下一次进程启动、Hashicorp Raft/Bolt store 尚未打开时检查关闭的
   `raft-log.db`。生产门槛为文件至少 64 MiB，并且按 Bolt bucket allocation 估算可回收
   空间至少 64 MiB且超过文件 25%。满足时把全部 live bucket/key/value 复制到同目录
@@ -1618,8 +1620,9 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   物理压缩成功输出 path、before/after/reclaimed bytes 和 duration，失败只输出原因。
   两者不写 Raft/FSM 指标、snapshot payload 或 174 点历史。本轮不压缩 stable/queue DB，
   不在线重写已打开的 Bolt 文件，也不以长期增加 cgroup 上限掩盖文件膨胀。
-- **回归覆盖**：Raft 单测固定 2048/2049 边界、溢出安全、deleted-page 原子复制、最后
-  term/index/data 和 live store skip。真实三 voter integration 经 Follower HTTP 完成
+- **回归覆盖**：Raft/Node 单测固定 2048/2049 边界、applied coverage 边界、一次 partial
+  snapshot 不能提前收敛、溢出安全、deleted-page 原子复制、最后 term/index/data 和
+  live store skip。真实三 voter integration 经 Follower HTTP 完成
   任务，用 64 个真实 128 KiB Raft entry 构造 live trailing window 并在旧大 allowance
   下 snapshot；全停机后以 8 条 allowance 启动，验证三个 voter 都先 snapshot-covered
   再删 key，第二次启动物理文件缩小一半以上、旧 final state 保留，重新选主后 Follower

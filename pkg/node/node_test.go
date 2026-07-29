@@ -12,6 +12,28 @@ import (
 	"github.com/day253/sluice/pkg/types"
 )
 
+func TestRaftLogRetentionRequiresConvergenceAfterPartialSnapshot(t *testing.T) {
+	partial := raftpkg.LogRetentionResult{
+		Needed:         true,
+		SnapshotTaken:  true,
+		Remaining:      true,
+		RetainedBefore: 10258,
+		RetainedAfter:  7920,
+	}
+	if raftLogRetentionConverged(partial) {
+		t.Fatal("partial retention snapshot was treated as converged")
+	}
+
+	for _, converged := range []raftpkg.LogRetentionResult{
+		{},
+		{Needed: true, SnapshotTaken: true, Remaining: false},
+	} {
+		if !raftLogRetentionConverged(converged) {
+			t.Fatalf("retention result %+v should be converged", converged)
+		}
+	}
+}
+
 func TestNodeRejectsUnsafeSubmissionApplyLimit(t *testing.T) {
 	_, err := New(Config{
 		MaxRaftVoters:        1,

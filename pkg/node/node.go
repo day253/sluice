@@ -346,25 +346,38 @@ func (n *Node) Start() error {
 }
 
 func (n *Node) maintainRaftLogRetention() {
-	const (
-		attempts = 30
-		interval = 2 * time.Second
-	)
-	for attempt := 1; attempt <= attempts; attempt++ {
+	const interval = 2 * time.Second
+	for attempt := 1; ; attempt++ {
 		result, err := n.raftCluster.SnapshotOversizedLogWindow()
 		if err != nil {
 			n.logger.Warn("raft log: retention snapshot failed",
 				zap.Int("attempt", attempt),
 				zap.Error(err))
-		} else if !result.Needed {
+		} else if raftLogRetentionConverged(result) {
+			if result.SnapshotTaken {
+				n.logger.Info("raft log: retained window compacted",
+					zap.Uint64("first_index", result.FirstIndex),
+					zap.Uint64("last_index", result.LastIndex),
+					zap.Uint64("retained_before", result.RetainedBefore),
+					zap.Uint64("retained_after", result.RetainedAfter),
+					zap.Int("attempt", attempt))
+			}
 			return
 		} else if result.SnapshotTaken {
-			n.logger.Info("raft log: retained window compacted",
+			n.logger.Info("raft log: retained window compaction progressed",
 				zap.Uint64("first_index", result.FirstIndex),
 				zap.Uint64("last_index", result.LastIndex),
 				zap.Uint64("retained_before", result.RetainedBefore),
-				zap.Uint64("retained_after", result.RetainedAfter))
-			return
+				zap.Uint64("retained_after", result.RetainedAfter),
+				zap.Int("attempt", attempt))
+		} else if attempt%30 == 0 {
+			n.logger.Warn("raft log: retained window is waiting for apply convergence",
+				zap.Uint64("first_index", result.FirstIndex),
+				zap.Uint64("last_index", result.LastIndex),
+				zap.Uint64("retained", result.RetainedBefore),
+				zap.Uint64("applied_index", result.AppliedIndex),
+				zap.Uint64("required_applied_index", result.RequiredAppliedIndex),
+				zap.Int("attempt", attempt))
 		}
 
 		timer := time.NewTimer(interval)
@@ -375,7 +388,10 @@ func (n *Node) maintainRaftLogRetention() {
 		case <-timer.C:
 		}
 	}
-	n.logger.Warn("raft log: retained window remains oversized after startup retries")
+}
+
+func raftLogRetentionConverged(result raftpkg.LogRetentionResult) bool {
+	return !result.Needed || result.SnapshotTaken && !result.Remaining
 }
 
 func waitForRaftLeader(

@@ -142,6 +142,29 @@ func TestOversizedLogWindowUsesBoundedTrailingAllowance(t *testing.T) {
 	}
 }
 
+func TestRequiredSnapshotIndexWaitsForTrailingWindowCoverage(t *testing.T) {
+	tests := []struct {
+		name     string
+		last     uint64
+		trailing uint64
+		want     uint64
+	}{
+		{name: "empty", trailing: 1024},
+		{name: "shorter than allowance", last: 100, trailing: 1024},
+		{name: "exact allowance", last: 1024, trailing: 1024},
+		{name: "one beyond allowance", last: 1025, trailing: 1024, want: 1},
+		{name: "remote partial snapshot regression", last: 1310070, trailing: 1024, want: 1309046},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := requiredSnapshotIndex(test.last, test.trailing); got != test.want {
+				t.Fatalf("requiredSnapshotIndex(%d, %d) = %d, want %d",
+					test.last, test.trailing, got, test.want)
+			}
+		})
+	}
+}
+
 func TestNewClusterUsesBoundedProductionSnapshotPolicy(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

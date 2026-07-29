@@ -220,12 +220,15 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 // A successful snapshot durably covers the FSM state before obsolete Raft log
 // keys are deleted. The Bolt file is physically rewritten on the next startup.
 type LogRetentionResult struct {
-	Needed         bool
-	SnapshotTaken  bool
-	FirstIndex     uint64
-	LastIndex      uint64
-	RetainedBefore uint64
-	RetainedAfter  uint64
+	Needed               bool
+	SnapshotTaken        bool
+	Remaining            bool
+	FirstIndex           uint64
+	LastIndex            uint64
+	AppliedIndex         uint64
+	RequiredAppliedIndex uint64
+	RetainedBefore       uint64
+	RetainedAfter        uint64
 }
 
 type LogRange struct {
@@ -265,6 +268,12 @@ func (c *Cluster) SnapshotOversizedLogWindow() (LogRetentionResult, error) {
 		return result, nil
 	}
 	result.Needed = true
+	result.Remaining = true
+	result.AppliedIndex = c.raft.AppliedIndex()
+	result.RequiredAppliedIndex = requiredSnapshotIndex(logRange.Last, c.trailing)
+	if result.AppliedIndex < result.RequiredAppliedIndex {
+		return result, nil
+	}
 
 	if err := c.raft.Snapshot().Error(); err != nil {
 		if errors.Is(err, raft.ErrNothingNewToSnapshot) {
@@ -282,6 +291,7 @@ func (c *Cluster) SnapshotOversizedLogWindow() (LogRetentionResult, error) {
 		return result, fmt.Errorf("last log index after snapshot: %w", err)
 	}
 	result.RetainedAfter = retainedLogCount(afterFirst, afterLast)
+	result.Remaining = oversizedLogWindow(afterFirst, afterLast, c.trailing)
 	return result, nil
 }
 
@@ -301,6 +311,13 @@ func oversizedLogWindow(first, last, trailing uint64) bool {
 		return false
 	}
 	return retained > trailing*2
+}
+
+func requiredSnapshotIndex(last, trailing uint64) uint64 {
+	if last <= trailing {
+		return 0
+	}
+	return last - trailing
 }
 
 // ---------------------------------------------------------------------------
