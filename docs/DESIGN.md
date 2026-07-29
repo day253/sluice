@@ -885,6 +885,9 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 
 ### UI-011：全部时序图统一为累加堆叠
 
+- **历史决定**：该版本曾把六张 Canvas 全部改成 stacked；随后确认 latency 与 scheduler
+  work 不具备业务总量语义，UI-012 撤销其中两张 Performance 图的累加，仅保留四张可加
+  总量图。这里保留原决定与 Case，防止以后再次混淆“视觉合成”和“真实总负载”。
 - **业务总量图**：`Worker allocation by instance` 与 `Unfinished tasks by tenant` 的
   174 点历史逐点堆叠，最上边界和 `stacked ... peak` 等于所有 live Worker usage 或
   所有 tenant unfinished 的完整总量。Top 8 以外只省略标签，`Other N` 必须逐点求和；
@@ -905,6 +908,25 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   为 stacked，Worker usage peak=90、Total Limit=1200、unfinished peak=90、Raft
   envelope peak=6.003ms、scheduler envelope peak=54 records/s，四张服务端图的 tooltip
   都含 `Stacked total`，同时保持 legend 无重叠和页面零表格。
+
+### UI-012：只累加可解释为集群总负载的指标
+
+- **需求边界**：四张容量/负载图继续 stacked：tenant unfinished 的顶部是集群未完成任务
+  总数，Worker allocation 的顶部是已分配 execution slots 总数，Worker Pod CPU 的顶部
+  是各 Pod 归一化 CPU 百分比之和，tenant allocated slots 的顶部是集群已分配槽位总数。
+  Top 8 remainder 继续逐点求和，Worker 图继续只画一条累计 `Total Limit`。
+- **不累加的诊断图**：`Raft Apply latency` 的 Create/Claim/Complete 是不同操作的每秒
+  平均延迟，相加不代表任何请求延迟；`Scheduler work` 的 scanned/selected/selection/
+  write 等信号存在包含或因果关系，相加会重复计数。两张 Performance 图恢复独立折线，
+  纵轴取各原始系列最高值，tooltip 只显示最近系列的原始值，不显示 `Stacked total`。
+  标题明确为 `Independent operations/signals`。
+- **边界与非目标**：本次仅更正 Canvas 表示语义，不改变任何 metric、API、174 点存储、
+  每秒轮询、Raft/FSM、调度、HPA 或性能结论。Performance JSON 和每条原始序列保持不变。
+- **回归覆盖**：组件测试锁定四张总量图使用 stacked、两张 Performance 调用不带
+  stacked mode，并禁止对应调用重新出现 `server-stacked`。真实 Chrome 使用固定六图
+  数据验证四张总量图 `chartMode=stacked`、两张诊断图 `chartMode=lines`；业务 tooltip
+  含 `Stacked total`，诊断 tooltip 不含，同时继续验证 Worker peak=90/Limit=1200、
+  unfinished peak=90、legend 无重叠和零表格。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 

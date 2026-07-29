@@ -688,44 +688,44 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 	defer cancel()
 
 	var state struct {
-		WorkerLegendItems    int     `json:"workerLegendItems"`
-		TenantLegendItems    int     `json:"tenantLegendItems"`
-		SessionWorkerItems   int     `json:"sessionWorkerItems"`
-		SessionTenantItems   int     `json:"sessionTenantItems"`
-		WorkerLegend         string  `json:"workerLegend"`
-		TenantLegend         string  `json:"tenantLegend"`
-		SessionWorkerLegend  string  `json:"sessionWorkerLegend"`
-		SessionTenantLegend  string  `json:"sessionTenantLegend"`
-		WorkerSamples        int     `json:"workerSamples"`
-		TenantSamples        int     `json:"tenantSamples"`
-		SessionAfterCharts   bool    `json:"sessionAfterCharts"`
-		RaftAffinity         bool    `json:"raftAffinity"`
-		SchedulerAffinity    bool    `json:"schedulerAffinity"`
-		StandalonePressure   bool    `json:"standalonePressure"`
-		HasTable             bool    `json:"hasTable"`
-		SessionBadge         string  `json:"sessionBadge"`
-		SubmissionQueues     string  `json:"submissionQueues"`
-		SubmissionQueueNote  string  `json:"submissionQueueNote"`
-		LegendGrid           bool    `json:"legendGrid"`
-		LegendDense          bool    `json:"legendDense"`
-		LegendNoOverlap      bool    `json:"legendNoOverlap"`
-		LegendOverflow       bool    `json:"legendOverflow"`
-		MaxLegendHeight      float64 `json:"maxLegendHeight"`
-		StackedCharts        bool    `json:"stackedCharts"`
-		CPUPeak              float64 `json:"cpuPeak"`
-		TenantPeak           float64 `json:"tenantPeak"`
-		CPUStackedTooltip    string  `json:"cpuStackedTooltip"`
-		TenantStackedTooltip string  `json:"tenantStackedTooltip"`
-		CPUStackedNote       string  `json:"cpuStackedNote"`
-		TenantStackedNote    string  `json:"tenantStackedNote"`
-		AllChartsStacked     bool    `json:"allChartsStacked"`
-		WorkerPeak           float64 `json:"workerPeak"`
-		WorkerLimit          float64 `json:"workerLimit"`
-		UnfinishedPeak       float64 `json:"unfinishedPeak"`
-		RaftPeak             float64 `json:"raftPeak"`
-		SchedulerPeak        float64 `json:"schedulerPeak"`
-		ServerTooltips       string  `json:"serverTooltips"`
-		PerformanceNotes     string  `json:"performanceNotes"`
+		WorkerLegendItems      int     `json:"workerLegendItems"`
+		TenantLegendItems      int     `json:"tenantLegendItems"`
+		SessionWorkerItems     int     `json:"sessionWorkerItems"`
+		SessionTenantItems     int     `json:"sessionTenantItems"`
+		WorkerLegend           string  `json:"workerLegend"`
+		TenantLegend           string  `json:"tenantLegend"`
+		SessionWorkerLegend    string  `json:"sessionWorkerLegend"`
+		SessionTenantLegend    string  `json:"sessionTenantLegend"`
+		WorkerSamples          int     `json:"workerSamples"`
+		TenantSamples          int     `json:"tenantSamples"`
+		SessionAfterCharts     bool    `json:"sessionAfterCharts"`
+		RaftAffinity           bool    `json:"raftAffinity"`
+		SchedulerAffinity      bool    `json:"schedulerAffinity"`
+		StandalonePressure     bool    `json:"standalonePressure"`
+		HasTable               bool    `json:"hasTable"`
+		SessionBadge           string  `json:"sessionBadge"`
+		SubmissionQueues       string  `json:"submissionQueues"`
+		SubmissionQueueNote    string  `json:"submissionQueueNote"`
+		LegendGrid             bool    `json:"legendGrid"`
+		LegendDense            bool    `json:"legendDense"`
+		LegendNoOverlap        bool    `json:"legendNoOverlap"`
+		LegendOverflow         bool    `json:"legendOverflow"`
+		MaxLegendHeight        float64 `json:"maxLegendHeight"`
+		StackedCharts          bool    `json:"stackedCharts"`
+		CPUPeak                float64 `json:"cpuPeak"`
+		TenantPeak             float64 `json:"tenantPeak"`
+		CPUStackedTooltip      string  `json:"cpuStackedTooltip"`
+		TenantStackedTooltip   string  `json:"tenantStackedTooltip"`
+		CPUStackedNote         string  `json:"cpuStackedNote"`
+		TenantStackedNote      string  `json:"tenantStackedNote"`
+		AggregateChartsStacked bool    `json:"aggregateChartsStacked"`
+		DiagnosticsAreLines    bool    `json:"diagnosticsAreLines"`
+		WorkerPeak             float64 `json:"workerPeak"`
+		WorkerLimit            float64 `json:"workerLimit"`
+		UnfinishedPeak         float64 `json:"unfinishedPeak"`
+		AggregateTooltips      string  `json:"aggregateTooltips"`
+		DiagnosticTooltips     string  `json:"diagnosticTooltips"`
+		PerformanceNotes       string  `json:"performanceNotes"`
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
@@ -760,8 +760,8 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 			const schedulerCanvas = document.querySelector("#performance-scheduler-chart");
 			const cpuTooltip = stackedTooltip(cpuCanvas);
 			const tenantTooltip = stackedTooltip(tenantCanvas);
-			const serverTooltips = [workerCanvas, unfinishedCanvas, raftCanvas, schedulerCanvas]
-				.map(stackedTooltip).join(" | ");
+			const aggregateTooltips = [workerCanvas, unfinishedCanvas].map(stackedTooltip).join(" | ");
+			const diagnosticTooltips = [raftCanvas, schedulerCanvas].map(stackedTooltip).join(" | ");
 			return {
 				workerLegendItems: document.querySelectorAll("#worker-chart-legend .legend-item").length,
 				tenantLegendItems: document.querySelectorAll("#tenant-chart-legend .legend-item").length,
@@ -799,14 +799,15 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 				tenantStackedTooltip: tenantTooltip,
 				cpuStackedNote: document.querySelector("#worker-cpu-session-note").textContent,
 				tenantStackedNote: document.querySelector("#tenant-allocation-session-note").textContent,
-				allChartsStacked: [workerCanvas, unfinishedCanvas, raftCanvas, schedulerCanvas,
-					cpuCanvas, tenantCanvas].every(canvas => canvas.dataset.chartMode === "stacked"),
+				aggregateChartsStacked: [workerCanvas, unfinishedCanvas, cpuCanvas, tenantCanvas]
+					.every(canvas => canvas.dataset.chartMode === "stacked"),
+				diagnosticsAreLines: [raftCanvas, schedulerCanvas]
+					.every(canvas => canvas.dataset.chartMode === "lines"),
 				workerPeak: Number(workerCanvas.dataset.chartPeak),
 				workerLimit: Number(workerCanvas.dataset.chartLimit),
 				unfinishedPeak: Number(unfinishedCanvas.dataset.chartPeak),
-				raftPeak: Number(raftCanvas.dataset.chartPeak),
-				schedulerPeak: Number(schedulerCanvas.dataset.chartPeak),
-				serverTooltips,
+				aggregateTooltips,
+				diagnosticTooltips,
 				performanceNotes: document.querySelector("#performance-raft-chart-note").textContent +
 					" | " + document.querySelector("#performance-scheduler-chart-note").textContent,
 			};
@@ -833,10 +834,12 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 		!strings.Contains(state.TenantStackedTooltip, "Stacked total") ||
 		!strings.Contains(state.CPUStackedNote, "stacked peak") ||
 		!strings.Contains(state.TenantStackedNote, "stacked peak") ||
-		!state.AllChartsStacked || state.WorkerPeak != 90 || state.WorkerLimit != 1200 ||
-		state.UnfinishedPeak != 90 || state.RaftPeak != 6.003 || state.SchedulerPeak != 54 ||
-		strings.Count(state.ServerTooltips, "Stacked total") != 4 ||
-		strings.Count(state.PerformanceNotes, "peak") != 2 {
+		!state.AggregateChartsStacked || !state.DiagnosticsAreLines ||
+		state.WorkerPeak != 90 || state.WorkerLimit != 1200 ||
+		state.UnfinishedPeak != 90 ||
+		strings.Count(state.AggregateTooltips, "Stacked total") != 2 ||
+		strings.Contains(state.DiagnosticTooltips, "Stacked total") ||
+		strings.Count(state.PerformanceNotes, "Independent") != 2 {
 		t.Fatalf("dashboard trend browser state = %+v", state)
 	}
 }

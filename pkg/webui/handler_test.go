@@ -325,6 +325,10 @@ func TestDashboardBoundsHighCardinalityChartsAndUsesEphemeralSessionHistory(t *t
 		`'server-stacked-total-limit'`,
 		`'server-stacked'`,
 		`'session-stacked'`,
+		`Independent operations · milliseconds · per-second averages`,
+		`Independent signals · records per second`,
+		`aria-label="Raft Apply latency history by operation"`,
+		`aria-label="Pending scheduler scan and selection history"`,
 		`canvas.dataset.chartMode=stackedMode?'stacked':'lines'`,
 		`canvas.dataset.chartLimit=String(totalLimit)`,
 		`Stacked total`,
@@ -348,6 +352,8 @@ func TestDashboardBoundsHighCardinalityChartsAndUsesEphemeralSessionHistory(t *t
 		`autoscaling-counters`,
 		`submitted_tasks_total`,
 		`completed_tasks_total`,
+		`'No Raft Apply samples yet.',' ms','server-stacked'`,
+		`'No scheduler samples yet.',' records','server-stacked'`,
 		`<table`,
 	} {
 		if strings.Contains(body, forbidden) {
