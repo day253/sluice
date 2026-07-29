@@ -605,6 +605,12 @@ func (a *dashboardTrendBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Requ
 		a.tick++
 		tick := a.tick
 		a.mu.Unlock()
+		series := func(value int) map[string]any {
+			return map[string]any{
+				"days": []int{value}, "hours": []int{value},
+				"mins": []int{value}, "secs": []int{value, value + 1},
+			}
+		}
 		loads := make(map[string]any)
 		for index := 0; index < 12; index++ {
 			loads[fmt.Sprintf("worker-%02d", index)] = map[string]any{
@@ -636,7 +642,20 @@ func (a *dashboardTrendBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Requ
 					"worker_loads": loads,
 				},
 			},
-			"history": map[string]any{},
+			"history": map[string]any{
+				"performance:raft:create_task_batch:apply-us":         series(1000),
+				"performance:raft:claim_batch:apply-us":               series(2000),
+				"performance:raft:complete_batch:apply-us":            series(3000),
+				"performance:scheduler:submission-tasks":              series(1),
+				"performance:scheduler:submission-apply-inflight":     series(2),
+				"performance:scheduler:submission-apply-waiting":      series(3),
+				"performance:scheduler:submission-backpressure-waits": series(4),
+				"performance:scheduler:pending-scanned":               series(5),
+				"performance:scheduler:tasks-selected":                series(6),
+				"performance:scheduler:selection-rate":                series(7),
+				"performance:scheduler:allocation-plan-applies":       series(8),
+				"performance:scheduler:allocation-plan-noops":         series(9),
+			},
 		})
 	default:
 		http.NotFound(w, r)
@@ -699,6 +718,14 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 		TenantStackedTooltip string  `json:"tenantStackedTooltip"`
 		CPUStackedNote       string  `json:"cpuStackedNote"`
 		TenantStackedNote    string  `json:"tenantStackedNote"`
+		AllChartsStacked     bool    `json:"allChartsStacked"`
+		WorkerPeak           float64 `json:"workerPeak"`
+		WorkerLimit          float64 `json:"workerLimit"`
+		UnfinishedPeak       float64 `json:"unfinishedPeak"`
+		RaftPeak             float64 `json:"raftPeak"`
+		SchedulerPeak        float64 `json:"schedulerPeak"`
+		ServerTooltips       string  `json:"serverTooltips"`
+		PerformanceNotes     string  `json:"performanceNotes"`
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
@@ -727,8 +754,14 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 			};
 			const cpuCanvas = document.querySelector("#worker-cpu-session-chart");
 			const tenantCanvas = document.querySelector("#tenant-allocation-session-chart");
+			const workerCanvas = document.querySelector("#workers-chart");
+			const unfinishedCanvas = document.querySelector("#tenant-unfinished-chart");
+			const raftCanvas = document.querySelector("#performance-raft-chart");
+			const schedulerCanvas = document.querySelector("#performance-scheduler-chart");
 			const cpuTooltip = stackedTooltip(cpuCanvas);
 			const tenantTooltip = stackedTooltip(tenantCanvas);
+			const serverTooltips = [workerCanvas, unfinishedCanvas, raftCanvas, schedulerCanvas]
+				.map(stackedTooltip).join(" | ");
 			return {
 				workerLegendItems: document.querySelectorAll("#worker-chart-legend .legend-item").length,
 				tenantLegendItems: document.querySelectorAll("#tenant-chart-legend .legend-item").length,
@@ -766,6 +799,16 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 				tenantStackedTooltip: tenantTooltip,
 				cpuStackedNote: document.querySelector("#worker-cpu-session-note").textContent,
 				tenantStackedNote: document.querySelector("#tenant-allocation-session-note").textContent,
+				allChartsStacked: [workerCanvas, unfinishedCanvas, raftCanvas, schedulerCanvas,
+					cpuCanvas, tenantCanvas].every(canvas => canvas.dataset.chartMode === "stacked"),
+				workerPeak: Number(workerCanvas.dataset.chartPeak),
+				workerLimit: Number(workerCanvas.dataset.chartLimit),
+				unfinishedPeak: Number(unfinishedCanvas.dataset.chartPeak),
+				raftPeak: Number(raftCanvas.dataset.chartPeak),
+				schedulerPeak: Number(schedulerCanvas.dataset.chartPeak),
+				serverTooltips,
+				performanceNotes: document.querySelector("#performance-raft-chart-note").textContent +
+					" | " + document.querySelector("#performance-scheduler-chart-note").textContent,
 			};
 		})()`, &state),
 	); err != nil {
@@ -773,8 +816,8 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 	}
 	if state.WorkerLegendItems != 9 || state.TenantLegendItems != 9 ||
 		state.SessionWorkerItems != 9 || state.SessionTenantItems != 9 ||
-		!strings.Contains(state.WorkerLegend, "Other 4 Pods (avg)") ||
-		!strings.Contains(state.TenantLegend, "Other 4 tenants (avg)") ||
+		!strings.Contains(state.WorkerLegend, "Other 4 Pods") ||
+		!strings.Contains(state.TenantLegend, "Other 4 tenants") ||
 		!strings.Contains(state.SessionWorkerLegend, "Other 4 Pods") ||
 		!strings.Contains(state.SessionTenantLegend, "Other 4 tenants") ||
 		state.WorkerSamples < 2 || state.TenantSamples < 2 ||
@@ -789,7 +832,11 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 		!strings.Contains(state.CPUStackedTooltip, "Stacked total") ||
 		!strings.Contains(state.TenantStackedTooltip, "Stacked total") ||
 		!strings.Contains(state.CPUStackedNote, "stacked peak") ||
-		!strings.Contains(state.TenantStackedNote, "stacked peak") {
+		!strings.Contains(state.TenantStackedNote, "stacked peak") ||
+		!state.AllChartsStacked || state.WorkerPeak != 90 || state.WorkerLimit != 1200 ||
+		state.UnfinishedPeak != 90 || state.RaftPeak != 6.003 || state.SchedulerPeak != 54 ||
+		strings.Count(state.ServerTooltips, "Stacked total") != 4 ||
+		strings.Count(state.PerformanceNotes, "peak") != 2 {
 		t.Fatalf("dashboard trend browser state = %+v", state)
 	}
 }

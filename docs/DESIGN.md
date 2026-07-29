@@ -839,10 +839,10 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   tenant` 和 `Worker allocation by instance` 位于顶部；Performance 紧随其后；浏览器
   会话趋势放在下方。Raft 当前 Apply 值与 Raft 图共置，pending scan/dispatcher queue/
   CPU admission 与 scheduler 图共置，队列和容量当前值也分别归入对应的主图。
-- **标签收敛**：非堆叠的 Worker、unfinished 等高基数图按整个可见历史窗口的最大值降序
-  选择 Top 8，保证真正的热点不会因当前瞬时下降而跳出；剩余系列合成一条
-  `Other N ... (avg)`。
-  使用平均值而非求和，避免大量低值系列的总和压扁 Top 8 的纵轴；legend 最多 9 项。
+- **标签收敛**：最初的非堆叠 Worker、unfinished 高基数图按整个可见历史窗口的最大值
+  降序选择 Top 8，保证真正的热点不会因当前瞬时下降而跳出；剩余系列曾合成一条
+  `Other N ... (avg)`；UI-011 将全部图统一为守恒堆叠后改为逐点求和。
+  legend 仍最多 9 项。
   legend 使用最小列宽的自适应 grid，而不是会在窄卡片内挤压重叠的 flex 行；超过四项
   进入 dense 布局，名称在单元格内省略但保留完整 `title`，值保持可见，容器高度有界并
   独立滚动。图中曲线数量、Top/Other 语义和原始 JSON 均不因布局改变。
@@ -853,11 +853,10 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **正确性和非目标**：图只做汇总观测；`Other` 不能用于定位单实例，需通过原始 JSON
   查看完整当前/历史值。本轮不改变指标定义、174 点服务端保留策略、任务状态、分配协议
   或性能结论。
-- **回归覆盖**：`dashboardtrend` 单测固定 60 点上限、实体清理、稳定 Top 8 与 remainder
-  平均值；WebUI 组件测试固定图表顺序、指标亲和、零 `<table>`、无浏览器持久化和无新增
+- **回归覆盖**：`dashboardtrend` 单测固定 60 点上限、实体清理和稳定 Top 8；WebUI
+  组件测试固定图表顺序、指标亲和、零 `<table>`、无浏览器持久化和无新增
   API；真实 Chrome `TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends`
-  在 12 Worker/12 tenant 响应下验证非堆叠图 legend≤9、`Other (avg)`、
-  grid/dense/滚动样式、
+  在 12 Worker/12 tenant 响应下验证 legend≤9、grid/dense/滚动样式、
   所有 legend item 几何不相交、至少两个会话采样、Performance 共置和页面零表格。
 
 ### UI-010：CPU 与租户槽位使用守恒的堆叠总量
@@ -875,13 +874,37 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **交互与边界**：悬停按所在堆叠 band 选择系列，显示该层原始值并同时显示该时刻
   `Stacked total`。这只是 Canvas 呈现和浏览器内 60 点采样变换，不增加 API、服务端历史、
   Raft/FSM/Snapshot 写入，也不反馈给 HPA、CPU admission、allocator 或租户借用。顶部
-  174 点 Worker allocation/unfinished 和 Performance 线图继续使用 UI-009 的非堆叠语义。
+  174 点 Worker allocation/unfinished 和 Performance 最初继续使用 UI-009 的非堆叠
+  语义，随后由 UI-011 统一为堆叠。
 - **回归覆盖**：`TestDashboardTrendStacksCollapsedRemainderWithoutLosingTotal` 用
   12 个系列固定 Top 8 + 4 个 remainder 后逐点总和仍为 78/90，Other current/Limit
   为 10/400；组件测试锁定两个 `session-stacked` 入口、sum collapse、ARIA 和 total
   tooltip。真实 Chrome 两个 Case 验证 CPU/slot canvas 均为 stacked、12 系列合并后
   CPU peak 大于 350%、slot peak 恰为 90、tooltip 含 `Stacked total`，同时继续检查
   缺失/down Worker 排除、legend 不重叠和零表格。
+
+### UI-011：全部时序图统一为累加堆叠
+
+- **业务总量图**：`Worker allocation by instance` 与 `Unfinished tasks by tenant` 的
+  174 点历史逐点堆叠，最上边界和 `stacked ... peak` 等于所有 live Worker usage 或
+  所有 tenant unfinished 的完整总量。Top 8 以外只省略标签，`Other N` 必须逐点求和；
+  不再使用 remainder average。Worker allocation 继续显示当前每 Pod `usage / Limit`
+  legend，并将所有展示层 Limit 求和为唯一的 `Total Limit` 虚线，避免把互不共享基线的
+  单 Pod 限制横线叠在一起。
+- **性能图语义**：Raft Apply 图把 Create/Claim/Complete 每秒平均耗时堆成
+  `operation envelope`；Scheduler 图把九种 records/s 信号堆成 `activity envelope`。
+  两者顶部用于同时观察多类信号的合成峰值，但不是单请求端到端 latency，也不是去重后
+  的任务吞吐：例如 selected 是 scanned 的子集，直接相加会重复计数。原始值仍由
+  legend、hover band 和 JSON 提供，tooltip 同时给出该层值及显示层总和。
+- **边界与非目标**：六张 Canvas 共用同一 stacked renderer，但不改变指标单位、采样、
+  Top 8 排序、174/60 点保留长度、每秒轮询或任何服务端字段。合成峰值仅用于展示，不能
+  反馈给调度、HPA、Raft、FSM 或性能基线；本次不是服务端性能变更，不沿用或改写吞吐结论。
+- **回归覆盖**：组件测试锁定四个服务端入口的 `server-stacked`、Worker
+  `server-stacked-total-limit`、server Top 8 remainder sum、ARIA、峰值说明和 total
+  Limit。真实 Chrome 使用 12 Worker/12 tenant 和固定 performance 历史验证六张图全部
+  为 stacked，Worker usage peak=90、Total Limit=1200、unfinished peak=90、Raft
+  envelope peak=6.003ms、scheduler envelope peak=54 records/s，四张服务端图的 tooltip
+  都含 `Stacked total`，同时保持 legend 无重叠和页面零表格。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 

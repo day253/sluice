@@ -179,6 +179,8 @@ func TestWorkerChartUsesOnlyCurrentLiveWorkerNodes(t *testing.T) {
 		`getJSON('/api/v1/metrics?prefix=allocated-workers%3Anode%3A&performance=0')`,
 		`const capacity=liveWorkers.reduce((sum,node)=>sum+Number(node.total_workers||0),0)`,
 		`S.workerSeriesMeta.limitTotal`,
+		`'server-stacked-total-limit'`,
+		`Total Limit ${fmt(totalLimit)}`,
 	} {
 		if !strings.Contains(recorder.Body.String(), fragment) {
 			t.Fatalf("dashboard current Worker mirror is missing %q", fragment)
@@ -318,10 +320,13 @@ func TestDashboardBoundsHighCardinalityChartsAndUsesEphemeralSessionHistory(t *t
 		`SESSION_HISTORY_LIMIT=60`,
 		`CHART_SERIES_LIMIT=8`,
 		`TREND.collapseSeries(workerSeries,CHART_SERIES_LIMIT,'Pods',false,'sum')`,
-		`TREND.collapseSeries(tenantSeries,CHART_SERIES_LIMIT,'tenants',true,'average')`,
+		`TREND.collapseSeries(tenantSeries,CHART_SERIES_LIMIT,'tenants',true,'sum')`,
 		`TREND.collapseSeries(tenantSeries,CHART_SERIES_LIMIT,'tenants',false,'sum')`,
+		`'server-stacked-total-limit'`,
+		`'server-stacked'`,
 		`'session-stacked'`,
 		`canvas.dataset.chartMode=stackedMode?'stacked':'lines'`,
+		`canvas.dataset.chartLimit=String(totalLimit)`,
 		`Stacked total`,
 		`.chart-legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(180px,100%),1fr))`,
 		`max-height:112px;overflow:auto;scrollbar-gutter:stable`,
