@@ -262,7 +262,7 @@ func TestDashboardPrioritizesChartsAndGroupsRelatedValues(t *testing.T) {
 	}
 }
 
-func TestDashboardUsesMaximumSubmissionBatchesAndShowsIngressDiagnostics(t *testing.T) {
+func TestDashboardDelegatesBoundedSubmissionParametersAndShowsIngressDiagnostics(t *testing.T) {
 	handler := Handler(http.NotFoundHandler())
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -271,11 +271,13 @@ func TestDashboardUsesMaximumSubmissionBatchesAndShowsIngressDiagnostics(t *test
 	}
 	body := recorder.Body.String()
 	for _, fragment := range []string{
-		`const SUBMIT_BATCH_SIZE=1000`,
 		`id="submit-concurrency"`,
 		`Auto · 8 → 16`,
-		`LOAD.runRolling`,
-		`createSubmissionController`,
+		`getJSON('/api/v1/load-runs',{method:'POST'`,
+		`getJSON('/api/v1/load-runs/current')`,
+		`Load Generator Pod`,
+		`tenantIds:ids`,
+		`tasksPerTenant:count`,
 		`Queues S / A / C`,
 		`submission_queue_depth`,
 		`submission_apply_inflight`,
@@ -290,12 +292,16 @@ func TestDashboardUsesMaximumSubmissionBatchesAndShowsIngressDiagnostics(t *test
 			t.Errorf("submission batching diagnostics are missing %q", fragment)
 		}
 	}
-	if strings.Contains(body, `const SUBMIT_BATCH_SIZE=500`) {
-		t.Fatal("dashboard still emits half-filled submission batches")
-	}
-	if strings.Contains(body, `SUBMIT_BATCH_CONCURRENCY=4`) ||
-		strings.Contains(body, `Promise.allSettled(batches.map`) {
-		t.Fatal("dashboard still imposes fixed four-request submission waves")
+	for _, forbidden := range []string{
+		`const SUBMIT_BATCH_SIZE=`,
+		`LOAD.runRolling`,
+		`/api/v1/tasks/batch`,
+		`idempotency_key:`,
+		`Promise.allSettled(batches.map`,
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("browser still constructs or submits task batches via %q", forbidden)
+		}
 	}
 }
 
@@ -313,6 +319,9 @@ func TestDashboardBoundsHighCardinalityChartsAndUsesEphemeralSessionHistory(t *t
 		`CHART_SERIES_LIMIT=8`,
 		`TREND.collapseSeries(workerSeries,CHART_SERIES_LIMIT,'Pods',false,'average')`,
 		`TREND.collapseSeries(tenantSeries,CHART_SERIES_LIMIT,'tenants',true,'average')`,
+		`.chart-legend{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(180px,100%),1fr))`,
+		`max-height:112px;overflow:auto;scrollbar-gutter:stable`,
+		`legend.classList.toggle('is-dense',series.length>4)`,
 		`sampleSessionState()`,
 		`Up to 60 samples · reset on refresh`,
 		`id="session-charts"`,

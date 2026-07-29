@@ -6,7 +6,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -33,6 +36,7 @@ type Handler struct {
 	allWorkerCapacitiesFunc func(context.Context, int) (types.WorkerCapacityBatchResponse, error)
 	raftStatusFunc          func() (raftpkg.MembershipStatus, error)
 	performanceFunc         func(context.Context, bool, bool) (metrics.PerformanceDiagnostics, error)
+	loadGeneratorProxy      *httputil.ReverseProxy
 	collector               interface {
 		Query(name, includePrefix, excludePrefix string) ([]MetricsData, int)
 	}
@@ -100,6 +104,23 @@ func (h *Handler) SetPerformanceFunc(fn func(context.Context, bool, bool) (metri
 	h.performanceFunc = fn
 }
 
+// SetLoadGeneratorAddress configures a fixed internal reverse proxy. The
+// browser can submit a small parameter document through any control replica;
+// the dedicated Pod owns workload construction and request concurrency.
+func (h *Handler) SetLoadGeneratorAddress(address string) error {
+	target, err := url.Parse(address)
+	if err != nil || target.Scheme == "" || target.Host == "" {
+		return fmt.Errorf("invalid load generator address %q", address)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, proxyErr error) {
+		h.logger.Warn("load generator proxy unavailable", zap.Error(proxyErr))
+		h.writeError(w, http.StatusServiceUnavailable, "load generator unavailable")
+	}
+	h.loadGeneratorProxy = proxy
+	return nil
+}
+
 // RegisterRoutes attaches all endpoints to the given router.
 func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/tasks", h.submitTask).Methods("POST")
@@ -120,12 +141,21 @@ func (h *Handler) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/admin/capabilities", h.capabilities).Methods("GET")
 	r.HandleFunc("/api/v1/admin/performance", h.performance).Methods("GET")
 	r.HandleFunc("/api/v1/admin/autoscaling", h.autoscaling).Methods("GET")
+	r.PathPrefix("/api/v1/load-runs").HandlerFunc(h.loadRuns)
 
 	r.HandleFunc("/api/v1/cluster/join", h.joinCluster).Methods("POST")
 	r.HandleFunc("/api/v1/cluster/workers/register", h.registerWorker).Methods("POST")
 	r.HandleFunc("/api/v1/metrics", h.metrics).Methods("GET")
 	r.HandleFunc("/api/v1/metrics/{name}", h.metrics).Methods("GET")
 	r.HandleFunc("/api/v1/health", h.health).Methods("GET")
+}
+
+func (h *Handler) loadRuns(w http.ResponseWriter, r *http.Request) {
+	if h.loadGeneratorProxy == nil {
+		h.writeError(w, http.StatusServiceUnavailable, "load generator is not configured")
+		return
+	}
+	h.loadGeneratorProxy.ServeHTTP(w, r)
 }
 
 func (h *Handler) raftStatus(w http.ResponseWriter, _ *http.Request) {

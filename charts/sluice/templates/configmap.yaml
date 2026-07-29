@@ -34,6 +34,18 @@ data:
       printf '%s' "${LEADER_IP}"
     }
 
+    {{- if .Values.loadGenerator.enabled }}
+    LOAD_GENERATOR_IP=$(resolve_service_ip "{{ include "sluice.fullname" . }}-load-generator")
+    while [ -z "${LOAD_GENERATOR_IP}" ]; do
+      echo "   waiting for stable Load Generator service IP..."
+      sleep 2
+      LOAD_GENERATOR_IP=$(resolve_service_ip "{{ include "sluice.fullname" . }}-load-generator")
+    done
+    LOAD_GENERATOR_ARG="--load-generator=http://${LOAD_GENERATOR_IP}:{{ .Values.loadGenerator.apiPort }}"
+    {{- else }}
+    LOAD_GENERATOR_ARG=""
+    {{- end }}
+
     SELF_IP=$(resolve_service_ip "${POD_NAME}-raft")
     while [ -z "$SELF_IP" ]; do
       echo "   waiting for stable Raft service IP..."
@@ -50,6 +62,7 @@ data:
         --raft-voters={{ .Values.raftVoters }} \
         --raft-members={{ .Values.control.replicas }} \
         --submit-apply-limit={{ .Values.control.submitApplyLimit }} \
+        ${LOAD_GENERATOR_ARG} \
         --log-level={{ .Values.logLevel }}
     else
       # Existing members must start immediately after a full-cluster restart.
@@ -62,6 +75,7 @@ data:
           --raft-voters={{ .Values.raftVoters }} \
           --raft-members={{ .Values.control.replicas }} \
           --submit-apply-limit={{ .Values.control.submitApplyLimit }} \
+          ${LOAD_GENERATOR_ARG} \
           --log-level={{ .Values.logLevel }}
       fi
 
@@ -95,6 +109,7 @@ data:
         --raft-voters={{ .Values.raftVoters }} \
         --raft-members={{ .Values.control.replicas }} \
         --submit-apply-limit={{ .Values.control.submitApplyLimit }} \
+        ${LOAD_GENERATOR_ARG} \
         --log-level={{ .Values.logLevel }}
     fi
 

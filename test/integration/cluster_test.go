@@ -45,6 +45,7 @@ import (
 
 	workloadautoscaler "github.com/day253/sluice/internal/autoscaler"
 	"github.com/day253/sluice/internal/testutil"
+	"github.com/day253/sluice/pkg/loadgen"
 	metricspkg "github.com/day253/sluice/pkg/metrics"
 	"github.com/day253/sluice/pkg/node"
 	"github.com/day253/sluice/pkg/queue"
@@ -1811,6 +1812,110 @@ func TestAtomicHundredTenantLoadThroughFollowerHTTP(t *testing.T) {
 	for tenantID, tenant := range lastSnapshot {
 		if tenant.Inflight != 0 {
 			t.Fatalf("%s has %d unfinished tasks after convergence", tenantID, tenant.Inflight)
+		}
+	}
+}
+
+// TestDedicatedLoadGeneratorThroughFollowerRaftAndWorkers preserves
+// UI-LOAD-007 at the real production boundary. The client sends only bounded
+// workload parameters to the dedicated service; that process creates the
+// round-robin batches through a Follower, and the real three-node Raft,
+// allocation, execution and durable final-state paths drain them exactly once.
+func TestDedicatedLoadGeneratorThroughFollowerRaftAndWorkers(t *testing.T) {
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader found")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	clusterClient, err := loadgen.NewHTTPClusterClient(tc.httpAddrs[follower])
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := loadgen.NewManager(clusterClient, loadgen.ManagerConfig{
+		PrepareConcurrency: 4,
+		BatchSize:          7,
+		PollInterval:       20 * time.Millisecond,
+		WaveInterval:       10 * time.Millisecond,
+		DrainDeadline:      30 * time.Second,
+		ZeroConfirmations:  2,
+		RetryDelay:         10 * time.Millisecond,
+	})
+	defer manager.Close()
+	loadServer := httptest.NewServer(loadgen.NewHandler(manager))
+	defer loadServer.Close()
+
+	const tenantCount = 10
+	const tasksPerTenant = 2
+	parameterDocument := strings.NewReader(`{
+		"name":"real follower pipeline",
+		"recipe":"ui-load-007",
+		"operation":"load",
+		"options":{
+			"tenantCount":10,
+			"tasksPerTenant":2,
+			"quota":2,
+			"quotaProfile":"equal",
+			"loadShape":"even",
+			"delivery":"waves",
+			"waves":2,
+			"submissionMode":"4"
+		}
+	}`)
+	response, err := http.Post(
+		loadServer.URL+"/api/v1/load-runs",
+		"application/json",
+		parameterDocument,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("Load Generator start status=%s body=%s", response.Status, body)
+	}
+	var started struct {
+		Run loadgen.Run `json:"run"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&started); err != nil {
+		t.Fatal(err)
+	}
+	run, err := manager.Wait(started.Run.ID, 40*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "completed" ||
+		run.TenantCount != tenantCount ||
+		run.TotalTasks != tenantCount*tasksPerTenant ||
+		run.Submitted != tenantCount*tasksPerTenant ||
+		run.Failed != 0 ||
+		run.Remaining != 0 {
+		t.Fatalf("Load Generator final state = %+v", run)
+	}
+
+	tc.waitFor(func() bool {
+		return len(tc.fsms().GetAllTenants()) == tenantCount
+	}, 10*time.Second, "Load Generator tenants replicated to every Raft member")
+	for tenantIndex := 0; tenantIndex < tenantCount; tenantIndex++ {
+		tenantID := fmt.Sprintf("load-lab-%03d", tenantIndex+1)
+		if count := tc.proc.processedByTenant(tenantID); count != tasksPerTenant {
+			t.Fatalf("%s processed %d tasks, want %d", tenantID, count, tasksPerTenant)
+		}
+	}
+	processed := tc.proc.processedTaskCounts()
+	if len(processed) != tenantCount*tasksPerTenant {
+		t.Fatalf("unique processed tasks = %d, want %d", len(processed), tenantCount*tasksPerTenant)
+	}
+	for taskID, count := range processed {
+		if count != 1 {
+			t.Fatalf("task %s processed %d times, want exactly once", taskID, count)
+		}
+		if result := tc.fsms().GetResult(taskID); result == nil ||
+			result.Status != types.TaskStatusDone {
+			t.Fatalf("task %s lacks durable done result: %+v", taskID, result)
 		}
 	}
 }

@@ -97,6 +97,11 @@ func TestLoadLabComposesHotspotAndWaveAtomicOperations(t *testing.T) {
 	); err == nil || !strings.Contains(err.Error(), "browser safety limit") {
 		t.Fatalf("oversized workload error = %v", err)
 	}
+	if _, err := runtime.RunString(
+		`SluiceLoadLab.buildTenantSpecs({tenantCount:2,tasksPerTenant:100,loadShape:"hotspot"}, "Too hot")`,
+	); err == nil || !strings.Contains(err.Error(), "per-tenant safety limit") {
+		t.Fatalf("oversized tenant error = %v", err)
+	}
 }
 
 func TestLoadLabBuildsBoundedUniqueRandomTenantConfigs(t *testing.T) {
@@ -211,7 +216,7 @@ func TestDashboardExposesAtomicLoadLabAndOnlyTheActiveOperation(t *testing.T) {
 		`id="capacity-trend-panel"`, `Worker signals related to allocation capacity`,
 		`id="autoscaling-queue"`, `id="autoscaling-cpu"`,
 		`id="autoscaling-telemetry"`, `/api/v1/admin/autoscaling`,
-		`idempotency_key:`, `buildRoundRobinJobs`,
+		`/api/v1/load-runs`, `Load Generator Pod`,
 		`Add random tenants`, `buildRandomTenantConfigs`,
 		`<script src="/assets/loadlab.js"></script>`,
 	} {
@@ -225,6 +230,8 @@ func TestDashboardExposesAtomicLoadLabAndOnlyTheActiveOperation(t *testing.T) {
 		`Clear history`,
 		`id="autoscaling-execution"`,
 		`View saved workload run as JSON`,
+		`/api/v1/tasks/batch`,
+		`idempotency_key:`,
 	} {
 		if strings.Contains(recorder.Body.String(), forbidden) {
 			t.Errorf("dashboard still exposes removed execution history %q", forbidden)

@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
+
+	"github.com/day253/sluice/pkg/loadgen"
 )
 
 type loadLabBrowserAPI struct {
@@ -34,19 +36,41 @@ type loadLabBrowserAPI struct {
 	firstSubmitEnded              bool
 	submitDelay                   time.Duration
 	firstSubmitDelay              time.Duration
+	loadManager                   *loadgen.Manager
+	loadHandler                   http.Handler
+	loadRunRequests               int
+	directTaskBatchRequests       int
 }
 
 func newLoadLabBrowserAPI() *loadLabBrowserAPI {
-	return &loadLabBrowserAPI{
+	api := &loadLabBrowserAPI{
 		tenants:        make(map[string]map[string]any),
 		idempotencyKey: make(map[string]bool),
 		workerCapacity: 100,
 	}
+	api.loadManager = loadgen.NewManager(api, loadgen.ManagerConfig{
+		BatchSize:          1000,
+		PollInterval:       5 * time.Millisecond,
+		WaveInterval:       5 * time.Millisecond,
+		DrainDeadline:      10 * time.Second,
+		ZeroConfirmations:  1,
+		RetryDelay:         time.Millisecond,
+		PrepareConcurrency: 12,
+	})
+	api.loadHandler = loadgen.NewHandler(api.loadManager)
+	return api
 }
 
 func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
+	case strings.HasPrefix(r.URL.Path, "/api/v1/load-runs"):
+		if r.Method == http.MethodPost {
+			a.mu.Lock()
+			a.loadRunRequests++
+			a.mu.Unlock()
+		}
+		a.loadHandler.ServeHTTP(w, r)
 	case r.URL.Path == "/api/v1/health":
 		writeBrowserJSON(w, map[string]any{
 			"status": "ok", "node_id": "control-0", "leader": "127.0.0.1:7000",
@@ -194,6 +218,9 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		a.mu.Unlock()
 		writeBrowserJSON(w, snapshot)
 	case r.Method == http.MethodPost && r.URL.Path == "/api/v1/tasks/batch":
+		a.mu.Lock()
+		a.directTaskBatchRequests++
+		a.mu.Unlock()
 		var request struct {
 			Tasks []struct {
 				TenantID       string `json:"tenant_id"`
@@ -252,6 +279,90 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeBrowserJSON(w, map[string]any{"tasks": tasks})
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+func (a *loadLabBrowserAPI) ListTenants(
+	context.Context,
+) (map[string]loadgen.TenantSnapshot, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	result := make(map[string]loadgen.TenantSnapshot, len(a.tenants))
+	for id, tenant := range a.tenants {
+		result[id] = loadgen.TenantSnapshot{
+			ID:         id,
+			Name:       fmt.Sprint(tenant["name"]),
+			MaxWorkers: browserInt(tenant["max_workers"]),
+			Inflight:   browserInt(tenant["inflight"]),
+		}
+	}
+	return result, nil
+}
+
+func (a *loadLabBrowserAPI) UpsertTenant(
+	_ context.Context, spec loadgen.TenantSpec,
+) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tenants[spec.ID] = map[string]any{
+		"id": spec.ID, "name": spec.Name, "max_workers": spec.MaxWorkers,
+		"inflight": 0,
+	}
+	return nil
+}
+
+func (a *loadLabBrowserAPI) SubmitBatch(
+	_ context.Context, tasks []loadgen.Task,
+) (int, int, error) {
+	a.mu.Lock()
+	requestIndex := a.submitRequests
+	a.submitRequests++
+	a.activeSubmits++
+	a.maxActiveSubmits = max(a.maxActiveSubmits, a.activeSubmits)
+	if !a.firstSubmitEnded {
+		a.startedBeforeFirstSubmitEnded++
+	}
+	delay := a.submitDelay
+	if requestIndex == 0 && a.firstSubmitDelay > 0 {
+		delay = a.firstSubmitDelay
+	}
+	a.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	defer func() {
+		a.mu.Lock()
+		a.activeSubmits--
+		if requestIndex == 0 {
+			a.firstSubmitEnded = true
+		}
+		a.mu.Unlock()
+	}()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, task := range tasks {
+		if task.IdempotencyKey != "" && a.idempotencyKey[task.IdempotencyKey] {
+			return 0, http.StatusConflict, fmt.Errorf("duplicate idempotency key")
+		}
+		if task.IdempotencyKey != "" {
+			a.idempotencyKey[task.IdempotencyKey] = true
+		}
+		a.submitted++
+	}
+	return len(tasks), http.StatusAccepted, nil
+}
+
+func browserInt(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	default:
+		return 0
 	}
 }
 
@@ -550,24 +661,29 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 	defer cancel()
 
 	var state struct {
-		WorkerLegendItems   int    `json:"workerLegendItems"`
-		TenantLegendItems   int    `json:"tenantLegendItems"`
-		SessionWorkerItems  int    `json:"sessionWorkerItems"`
-		SessionTenantItems  int    `json:"sessionTenantItems"`
-		WorkerLegend        string `json:"workerLegend"`
-		TenantLegend        string `json:"tenantLegend"`
-		SessionWorkerLegend string `json:"sessionWorkerLegend"`
-		SessionTenantLegend string `json:"sessionTenantLegend"`
-		WorkerSamples       int    `json:"workerSamples"`
-		TenantSamples       int    `json:"tenantSamples"`
-		SessionAfterCharts  bool   `json:"sessionAfterCharts"`
-		RaftAffinity        bool   `json:"raftAffinity"`
-		SchedulerAffinity   bool   `json:"schedulerAffinity"`
-		StandalonePressure  bool   `json:"standalonePressure"`
-		HasTable            bool   `json:"hasTable"`
-		SessionBadge        string `json:"sessionBadge"`
-		SubmissionQueues    string `json:"submissionQueues"`
-		SubmissionQueueNote string `json:"submissionQueueNote"`
+		WorkerLegendItems   int     `json:"workerLegendItems"`
+		TenantLegendItems   int     `json:"tenantLegendItems"`
+		SessionWorkerItems  int     `json:"sessionWorkerItems"`
+		SessionTenantItems  int     `json:"sessionTenantItems"`
+		WorkerLegend        string  `json:"workerLegend"`
+		TenantLegend        string  `json:"tenantLegend"`
+		SessionWorkerLegend string  `json:"sessionWorkerLegend"`
+		SessionTenantLegend string  `json:"sessionTenantLegend"`
+		WorkerSamples       int     `json:"workerSamples"`
+		TenantSamples       int     `json:"tenantSamples"`
+		SessionAfterCharts  bool    `json:"sessionAfterCharts"`
+		RaftAffinity        bool    `json:"raftAffinity"`
+		SchedulerAffinity   bool    `json:"schedulerAffinity"`
+		StandalonePressure  bool    `json:"standalonePressure"`
+		HasTable            bool    `json:"hasTable"`
+		SessionBadge        string  `json:"sessionBadge"`
+		SubmissionQueues    string  `json:"submissionQueues"`
+		SubmissionQueueNote string  `json:"submissionQueueNote"`
+		LegendGrid          bool    `json:"legendGrid"`
+		LegendDense         bool    `json:"legendDense"`
+		LegendNoOverlap     bool    `json:"legendNoOverlap"`
+		LegendOverflow      bool    `json:"legendOverflow"`
+		MaxLegendHeight     float64 `json:"maxLegendHeight"`
 	}
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
@@ -577,6 +693,14 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 			const charts = document.querySelector("#primary-charts");
 			const session = document.querySelector("#session-charts");
 			const performanceCards = document.querySelectorAll(".performance-chart");
+			const legends = [...document.querySelectorAll(".chart-legend")];
+			const overlaps = legend => {
+				const boxes = [...legend.querySelectorAll(".legend-item")].map(item => item.getBoundingClientRect());
+				return boxes.some((box, index) => boxes.slice(index + 1).some(other =>
+					box.left < other.right - .5 && box.right > other.left + .5 &&
+					box.top < other.bottom - .5 && box.bottom > other.top + .5
+				));
+			};
 			return {
 				workerLegendItems: document.querySelectorAll("#worker-chart-legend .legend-item").length,
 				tenantLegendItems: document.querySelectorAll("#tenant-chart-legend .legend-item").length,
@@ -600,6 +724,12 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 				sessionBadge: document.querySelector(".session-badge").textContent.trim(),
 				submissionQueues: document.querySelector("#performance-queues").textContent.trim(),
 				submissionQueueNote: document.querySelector("#performance-queues-note").textContent.trim(),
+				legendGrid: legends.every(legend => getComputedStyle(legend).display === "grid"),
+				legendDense: legends.filter(legend => legend.querySelectorAll(".legend-item").length > 4)
+					.every(legend => legend.classList.contains("is-dense")),
+				legendNoOverlap: legends.every(legend => !overlaps(legend)),
+				legendOverflow: legends.every(legend => getComputedStyle(legend).overflowY === "auto"),
+				maxLegendHeight: Math.max(...legends.map(legend => legend.getBoundingClientRect().height)),
 			};
 		})()`, &state),
 	); err != nil {
@@ -616,7 +746,9 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 		state.StandalonePressure || state.HasTable ||
 		state.SessionBadge != "Up to 60 samples · reset on refresh" ||
 		state.SubmissionQueues != "1 · 3 · 2" ||
-		!strings.Contains(state.SubmissionQueueNote, "submit avg 500 tasks / 2 requests") {
+		!strings.Contains(state.SubmissionQueueNote, "submit avg 500 tasks / 2 requests") ||
+		!state.LegendGrid || !state.LegendDense || !state.LegendNoOverlap ||
+		!state.LegendOverflow || state.MaxLegendHeight > 128 {
 		t.Fatalf("dashboard trend browser state = %+v", state)
 	}
 }
@@ -856,13 +988,15 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	); err != nil {
 		t.Fatal(err)
 	}
+	waitForLoadRunRequests(t, api, 3, 5*time.Second)
 	waitForLoadLabStatus(t, ctx, "completed", 10*time.Second)
 
 	var currentText string
 	if err := chromedp.Run(ctx, chromedp.Text("#load-run-current", &currentText, chromedp.ByQuery)); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(currentText, "6") || !strings.Contains(currentText, "All 6 tasks drained") {
+	if !strings.Contains(currentText, "6") ||
+		!strings.Contains(currentText, "All 6 tasks submitted by the Load Generator Pod drained") {
 		t.Fatalf("current execution did not show completed load: %q", currentText)
 	}
 	var jsonControls struct {
@@ -918,12 +1052,13 @@ func TestLoadLabBrowserCreatesTenantsSubmitsAndShowsCompletedJSON(t *testing.T) 
 	if len(api.tenants) != 0 || api.submitted != 7 ||
 		len(api.idempotencyKey) != 7 || api.capacityWrites != 1 ||
 		api.allCapacityWrites != 1 || api.clearTenantWrites != 1 ||
-		api.allocationReads != 0 {
+		api.allocationReads != 0 || api.loadRunRequests != 3 ||
+		api.directTaskBatchRequests != 0 {
 		t.Fatalf(
-			"browser operations = %d tenants, %d tasks, %d keys, %d single/%d all capacity writes, %d tenant clears, %d allocation reads",
+			"browser operations = %d tenants, %d tasks, %d keys, %d single/%d all capacity writes, %d tenant clears, %d allocation reads, %d parameter runs, %d direct task batches",
 			len(api.tenants), api.submitted, len(api.idempotencyKey),
 			api.capacityWrites, api.allCapacityWrites, api.clearTenantWrites,
-			api.allocationReads,
+			api.allocationReads, api.loadRunRequests, api.directTaskBatchRequests,
 		)
 	}
 }
@@ -982,13 +1117,17 @@ func TestLoadLabBrowserUsesRollingSubmissionConcurrency(t *testing.T) {
 	requests := api.submitRequests
 	maxActive := api.maxActiveSubmits
 	startedBeforeFirstEnded := api.startedBeforeFirstSubmitEnded
+	loadRunRequests := api.loadRunRequests
+	directTaskBatches := api.directTaskBatchRequests
 	api.mu.Unlock()
 	if submitted != 20_000 || requests != 20 ||
-		maxActive < 5 || maxActive > 6 || startedBeforeFirstEnded != 20 ||
-		configuredConcurrency != 16 {
+		maxActive != 16 || startedBeforeFirstEnded != 20 ||
+		configuredConcurrency != 16 || loadRunRequests != 1 ||
+		directTaskBatches != 0 {
 		t.Fatalf(
-			"rolling submits tasks=%d requests=%d configured=%d max-active=%d before-slow-first-ended=%d",
+			"Pod rolling submits tasks=%d requests=%d configured=%d max-active=%d before-slow-first-ended=%d parameter-runs=%d direct-browser-batches=%d",
 			submitted, requests, configuredConcurrency, maxActive, startedBeforeFirstEnded,
+			loadRunRequests, directTaskBatches,
 		)
 	}
 }
@@ -1175,6 +1314,26 @@ func waitForSubmitted(t *testing.T, api *loadLabBrowserAPI, want int, deadline t
 	got := api.submitted
 	api.mu.Unlock()
 	t.Fatalf("submitted tasks = %d, want %d", got, want)
+}
+
+func waitForLoadRunRequests(
+	t *testing.T, api *loadLabBrowserAPI, want int, deadline time.Duration,
+) {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		api.mu.Lock()
+		got := api.loadRunRequests
+		api.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	api.mu.Lock()
+	got := api.loadRunRequests
+	api.mu.Unlock()
+	t.Fatalf("Load Generator parameter requests = %d, want %d", got, want)
 }
 
 func waitForWorkerCapacity(

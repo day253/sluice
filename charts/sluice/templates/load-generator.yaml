@@ -1,0 +1,93 @@
+{{- if .Values.loadGenerator.enabled }}
+{{- if ne (int .Values.loadGenerator.replicas) 1 }}
+{{- fail "loadGenerator.replicas must be exactly 1 because run progress is process-local current state" }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sluice.fullname" . }}-load-generator
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: load-generator
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.loadGenerator.apiPort }}
+      targetPort: {{ .Values.loadGenerator.apiPort }}
+  selector:
+    {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: load-generator
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sluice.fullname" . }}-load-generator
+  labels:
+    {{- include "sluice.labels" . | nindent 4 }}
+    app.kubernetes.io/component: load-generator
+spec:
+  replicas: {{ .Values.loadGenerator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "sluice.labels" . | nindent 6 }}
+      app.kubernetes.io/component: load-generator
+  template:
+    metadata:
+      labels:
+        {{- include "sluice.labels" . | nindent 8 }}
+        app.kubernetes.io/component: load-generator
+    spec:
+      terminationGracePeriodSeconds: 15
+      {{- with .Values.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: load-generator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              NAMESPACE="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+              SVC="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}"
+              resolve_service_ip() {
+                wget -qO- --header="Authorization: Bearer ${TOKEN}" --no-check-certificate \
+                  "${SVC}/api/v1/namespaces/${NAMESPACE}/services/$1" 2>/dev/null \
+                  | sed -n 's/.*"clusterIP"\s*:\s*"\([0-9.]*\)".*/\1/p'
+              }
+              CONTROLLER_IP=$(resolve_service_ip "{{ include "sluice.fullname" . }}")
+              while [ -z "${CONTROLLER_IP}" ]; do
+                echo "   waiting for stable controller service IP..."
+                sleep 2
+                CONTROLLER_IP=$(resolve_service_ip "{{ include "sluice.fullname" . }}")
+              done
+              exec sluice --role=loadgen \
+                --id="${HOSTNAME}" \
+                --api="0.0.0.0:{{ .Values.loadGenerator.apiPort }}" \
+                --controller="${CONTROLLER_IP}:{{ .Values.apiPort }}" \
+                --log-level={{ .Values.logLevel }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.loadGenerator.apiPort }}
+          {{- with .Values.loadGenerator.resources }}
+          resources: {{ toYaml . | nindent 12 }}
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: {{ .Values.loadGenerator.apiPort }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: {{ .Values.loadGenerator.apiPort }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+{{- end }}

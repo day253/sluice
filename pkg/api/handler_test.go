@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,6 +128,64 @@ func newRouter(h *Handler) *mux.Router {
 	r := mux.NewRouter()
 	h.RegisterRoutes(r)
 	return r
+}
+
+func TestLoadGeneratorProxyPreservesCompactRunRequest(t *testing.T) {
+	var upstreamMethod, upstreamPath, upstreamBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamMethod = r.Method
+		upstreamPath = r.URL.Path
+		data := new(bytes.Buffer)
+		if _, err := data.ReadFrom(r.Body); err != nil {
+			t.Fatal(err)
+		}
+		upstreamBody = data.String()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"run":{"id":"load-1","status":"preparing"}}`))
+	}))
+	defer upstream.Close()
+
+	handler := NewHandler("control-0", nil, zap.NewNop())
+	if err := handler.SetLoadGeneratorAddress(upstream.URL); err != nil {
+		t.Fatal(err)
+	}
+	router := mux.NewRouter()
+	handler.RegisterRoutes(router)
+	requestBody := `{"operation":"load","tenantIds":["acme"],"options":{"tasksPerTenant":5}}`
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(
+		recorder,
+		httptest.NewRequest(
+			http.MethodPost,
+			"/api/v1/load-runs",
+			strings.NewReader(requestBody),
+		),
+	)
+	if recorder.Code != http.StatusAccepted ||
+		upstreamMethod != http.MethodPost ||
+		upstreamPath != "/api/v1/load-runs" ||
+		upstreamBody != requestBody {
+		t.Fatalf(
+			"proxy status=%d method=%q path=%q body=%q",
+			recorder.Code, upstreamMethod, upstreamPath, upstreamBody,
+		)
+	}
+}
+
+func TestLoadGeneratorProxyReturnsUnavailableWhenNotConfigured(t *testing.T) {
+	handler := NewHandler("control-0", nil, zap.NewNop())
+	router := mux.NewRouter()
+	handler.RegisterRoutes(router)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/api/v1/load-runs/current", nil),
+	)
+	if recorder.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(recorder.Body.String(), "not configured") {
+		t.Fatalf("unconfigured status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
 }
 
 // ---------------------------------------------------------------------------

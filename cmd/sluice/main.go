@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
+	"github.com/day253/sluice/pkg/loadgen"
 	"github.com/day253/sluice/pkg/node"
 )
 
@@ -23,7 +24,7 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	role             = flag.String("role", "combined", "Process role: combined, control, or worker")
+	role             = flag.String("role", "combined", "Process role: combined, control, worker, or loadgen")
 	nodeID           = flag.String("id", "node-1", "Unique node identifier")
 	apiAddr          = flag.String("api", "127.0.0.1:9090", "API listen address (cmux: HTTP+gRPC single port)")
 	raftAddr         = flag.String("raft", "127.0.0.1:7000", "Raft transport address")
@@ -38,9 +39,13 @@ var (
 		"submit-apply-limit", 16,
 		"Maximum unresolved Submit Raft Apply futures on the Leader",
 	)
-	controllerAddr = flag.String("controller", "", "Stable control-plane API address used by stateless workers")
-	workerSession  = flag.String("session", "", "Worker process session ID; generated when empty")
-	logLevel       = flag.String("log-level", "info", "Log level: debug, info, warn, error")
+	controllerAddr    = flag.String("controller", "", "Stable control-plane API address used by stateless workers")
+	loadGeneratorAddr = flag.String(
+		"load-generator", "",
+		"Dedicated Load Generator HTTP address proxied by control nodes",
+	)
+	workerSession = flag.String("session", "", "Worker process session ID; generated when empty")
+	logLevel      = flag.String("log-level", "info", "Log level: debug, info, warn, error")
 )
 
 // ---------------------------------------------------------------------------
@@ -66,6 +71,21 @@ func main() {
 	// ---- Use the demo processor (replace with your own) ----
 	processor := &DemoProcessor{logger: logger}
 
+	if *role == "loadgen" {
+		if *controllerAddr == "" {
+			logger.Fatal("loadgen role requires --controller")
+		}
+		client, err := loadgen.NewHTTPClusterClient(*controllerAddr)
+		if err != nil {
+			logger.Fatal("invalid load generator controller", zap.Error(err))
+		}
+		manager := loadgen.NewManager(client, loadgen.ManagerConfig{})
+		server := loadgen.NewServer(*apiAddr, manager, logger)
+		if err := server.Start(); err != nil {
+			logger.Fatal("load generator exited with error", zap.Error(err))
+		}
+		return
+	}
 	if *role == "worker" {
 		w, err := node.NewStatelessWorker(node.StatelessWorkerConfig{
 			NodeID: *nodeID, SessionID: *workerSession, APIAddress: *apiAddr,
@@ -106,6 +126,7 @@ func main() {
 		MaxRaftVoters:        *maxRaftVoters,
 		MaxRaftMembers:       *maxRaftMembers,
 		SubmissionApplyLimit: *submitApplyLimit,
+		LoadGeneratorAddress: *loadGeneratorAddr,
 	}
 
 	// ---- Create node ----

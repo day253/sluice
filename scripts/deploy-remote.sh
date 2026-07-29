@@ -384,6 +384,12 @@ microk8s kubectl rollout status "statefulset/${WORKER_STATEFULSET}" \
 microk8s kubectl rollout status "deployment/${RELEASE}-sluice-worker-autoscaler" \
   --namespace "${NAMESPACE}" \
   --timeout "${ROLLOUT_TIMEOUT}"
+if microk8s kubectl get deployment "${RELEASE}-sluice-load-generator" \
+  --namespace "${NAMESPACE}" >/dev/null 2>&1; then
+  microk8s kubectl rollout status "deployment/${RELEASE}-sluice-load-generator" \
+    --namespace "${NAMESPACE}" \
+    --timeout "${ROLLOUT_TIMEOUT}"
+fi
 
 printf '\n==> Verifying control recovery remains stable under persisted state\n'
 control_selector="app.kubernetes.io/name=sluice,app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/component=control"

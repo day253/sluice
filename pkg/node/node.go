@@ -53,6 +53,9 @@ type Config struct {
 	// SubmissionApplyLimit bounds unresolved Submit Raft Apply futures on the
 	// Leader. Zero selects grpc.DefaultSubmissionApplyLimit.
 	SubmissionApplyLimit int
+	// LoadGeneratorAddress is the fixed, non-Raft HTTP endpoint used only to
+	// proxy synthetic workload parameters from the dashboard.
+	LoadGeneratorAddress string
 	// DisableVoterReconciliation is reserved for externally managed embedded
 	// clusters and protocol tests. Production leaves it false.
 	DisableVoterReconciliation bool
@@ -231,6 +234,14 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 	httpHandler.SetWorkerRegisterFunc(n.registerWorker)
 	httpHandler.SetWorkerCapacityFunc(n.setWorkerCapacity)
 	httpHandler.SetAllWorkerCapacitiesFunc(n.setAllWorkerCapacities)
+	if cfg.LoadGeneratorAddress != "" {
+		if err := httpHandler.SetLoadGeneratorAddress(cfg.LoadGeneratorAddress); err != nil {
+			cancel()
+			_ = cluster.Shutdown()
+			_ = q.Close()
+			return nil, fmt.Errorf("load generator proxy: %w", err)
+		}
+	}
 
 	// ---- API server (cmux or legacy HTTP) ----
 	if cfg.APIAddress != "" {

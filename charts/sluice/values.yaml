@@ -139,3 +139,18 @@ workloadAutoscaler:
     limits:
       cpu: 100m
       memory: 128Mi
+
+# Dedicated synthetic workload ingress. The browser submits only bounded
+# parameters; this stateless Pod creates tenants, batches tasks and monitors
+# drain through the same production HTTP API as any other client.
+loadGenerator:
+  enabled: true
+  replicas: 1
+  apiPort: 9091
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 256Mi

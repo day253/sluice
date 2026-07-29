@@ -160,6 +160,84 @@ func TestControlEntrypointConfiguresBoundedSubmissionRaftIngress(t *testing.T) {
 	}
 }
 
+func TestDedicatedLoadGeneratorIsSingleStatelessPodOutsideRaft(t *testing.T) {
+	type values struct {
+		LoadGenerator struct {
+			Enabled  bool `json:"enabled"`
+			Replicas int  `json:"replicas"`
+			APIPort  int  `json:"apiPort"`
+		} `json:"loadGenerator"`
+	}
+	valuesData, err := os.ReadFile("../values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chartValues values
+	if err := yaml.Unmarshal(valuesData, &chartValues); err != nil {
+		t.Fatal(err)
+	}
+	if !chartValues.LoadGenerator.Enabled ||
+		chartValues.LoadGenerator.Replicas != 1 ||
+		chartValues.LoadGenerator.APIPort != 9091 {
+		t.Fatalf("loadGenerator defaults = %+v", chartValues.LoadGenerator)
+	}
+
+	deploymentData, err := os.ReadFile("../templates/load-generator.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment := string(deploymentData)
+	for _, required := range []string{
+		"kind: Service",
+		"kind: Deployment",
+		"app.kubernetes.io/component: load-generator",
+		`loadGenerator.replicas must be exactly 1`,
+		`--role=loadgen`,
+		`--controller="${CONTROLLER_IP}:`,
+		"resolve_service_ip",
+		"path: /api/v1/health",
+	} {
+		if !strings.Contains(deployment, required) {
+			t.Fatalf("Load Generator template is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"kind: StatefulSet",
+		"volumeClaimTemplates:",
+		"--raft=",
+		"--join=",
+		"--bootstrap",
+	} {
+		if strings.Contains(deployment, forbidden) {
+			t.Fatalf("stateless Load Generator contains %q", forbidden)
+		}
+	}
+
+	configData, err := os.ReadFile("../templates/configmap.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(configData)
+	if strings.Count(
+		config,
+		`--load-generator=http://${LOAD_GENERATOR_IP}:{{ .Values.loadGenerator.apiPort }}`,
+	) != 1 ||
+		strings.Count(config, `${LOAD_GENERATOR_ARG}`) != 3 {
+		t.Fatal("bootstrap, restart and join control paths do not share one Load Generator proxy target")
+	}
+
+	deployData, err := os.ReadFile("../../../scripts/deploy-remote.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(
+		string(deployData),
+		`rollout status "deployment/${RELEASE}-sluice-load-generator"`,
+	) {
+		t.Fatal("remote deployment does not wait for the Load Generator Pod")
+	}
+}
+
 func TestControlStatefulSetCanRecoverAllRaftVotersInParallel(t *testing.T) {
 	data, err := os.ReadFile("../templates/statefulset.yaml")
 	if err != nil {

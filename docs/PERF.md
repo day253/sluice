@@ -1418,3 +1418,38 @@ queue 平均约 5.401ms，累计最大分别 120.246ms/83.666ms。排空为 3.64
 前一轮短 25.5% 只说明相同 control/请求量下滚动流水线没有被旧 wave barrier 阻塞，
 仍不是严格冷态 A/B。最终 100 个租户 unfinished=0，Leader pressure
 in-flight=0、waiting=0，在线配置 limit=16。
+
+## 2026-07-29：UI-LOAD-007 专用 Load Generator 与高基数图例
+
+本轮把 workload task 数组、round-robin、batch=1000、wave timer 和滚动提交并发从
+浏览器迁到一个单副本 stateless Load Generator Pod。control 只透明代理有界参数，
+生产 tenant/task HTTP、Follower→Leader、Raft Apply、Allocator/Worker 和 final commit
+均未改变；图例的 Top 8 + Other 数据也未改变，只把布局从 flex 改为有界可滚动 grid。
+新增 Pod 的 run/current 诊断是进程内当前镜像，不进入 Raft、Snapshot 或调度决策。
+
+完整 `make test` 在 Apple M4 Pro、14 logical CPU、48GiB、darwin/arm64、Go 1.26.5
+上以 `-race -count=1` 通过，真实 integration 阶段为 408.871s。新增真实 Case 使用
+3 个 voter/每节点 20 槽、10 tenant×2 task、小 JSON payload、Follower HTTP、
+Load Generator batch=7/concurrency=4/two waves，3.33s 内完成建租户、提交和排空，
+最终 20/20 durable done、0 error、0 unfinished、每 task 一次。该小 Case 是正确性
+覆盖，不作为吞吐基线。
+
+按仓库固定形状单独重跑 PERF-001：7 replica（3 voter/4 non-voter）、每进程 80 槽、
+4 tenant×Limit 120、20000 个约 10ms 小 JSON task、Follower HTTP、batch=1000/
+concurrency=1；客户端仍直接使用固定 benchmark 路径，因此没有经过新增 Load Generator：
+
+| 阶段 | SUBMIT-006 上一轮 | UI-LOAD-007 |
+|---|---:|---:|
+| durable submit | 2.767s | 2.832s |
+| accepted 后排空 | 12.001s | 10.800s |
+| 端到端 | 14.768s（1354.3 task/s） | 13.632s（1467.1 task/s） |
+| 错误 / unfinished / 重复执行 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+submit 单轮慢约 2.3%，排空快约 10.0%，端到端快约 7.7%。固定 Case 的协议、请求形状和
+服务端实现没有变化，也不经过 Load Generator；差值按本机选举、磁盘和调度噪声记录，
+不能宣称本轮改变了 Raft 或消费吞吐。真正受影响的是浏览器客户端位置：真实 Chrome
+回归以 4 tenant×5000=20000、20 个满批、固定 concurrency=16 证明在途请求发生在
+Load Generator fake process，最大并发 16，浏览器直接 `/tasks/batch` 请求为 0；这是
+客户端职责/连接隔离证据，不与生产吞吐数字混比。远程部署后应另记同一 100 tenant×200
+形状的 Pod-side accepted/drain、Create Apply、submission queue/pressure 和最终
+unfinished，再与 revision 75 动态拓扑结果分栏比较。

@@ -119,6 +119,12 @@ var SluiceLoadLab = (function () {
     for (let index = 0; index < options.tenantCount; index++) {
       const ordinal = index + 1;
       const taskCount = tasksFor(options, index);
+      if (taskCount > LIMITS.maxTasksPerTenant) {
+        throw new Error(
+          `Tenant ${LIMITS.tenantPrefix}${String(ordinal).padStart(3, '0')} contains ` +
+          `${taskCount} tasks; the per-tenant safety limit is ${LIMITS.maxTasksPerTenant}.`
+        );
+      }
       totalTasks += taskCount;
       specs.push({
         id: LIMITS.tenantPrefix + String(ordinal).padStart(3, '0'),

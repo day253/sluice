@@ -820,6 +820,9 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **标签收敛**：Worker、tenant 等高基数图按整个可见历史窗口的最大值降序选择 Top 8，
   保证真正的热点不会因当前瞬时下降而跳出；剩余系列合成一条 `Other N ... (avg)`。
   使用平均值而非求和，避免大量低值系列的总和压扁 Top 8 的纵轴；legend 最多 9 项。
+  legend 使用最小列宽的自适应 grid，而不是会在窄卡片内挤压重叠的 flex 行；超过四项
+  进入 dense 布局，名称在单元格内省略但保留完整 `title`，值保持可见，容器高度有界并
+  独立滚动。图中曲线数量、Top/Other 语义和原始 JSON 均不因布局改变。
 - **存储和轮询**：已有 174 点仍由服务端 bounded collector 返回。Worker CPU 和 tenant
   allocated slots 原本只有当前镜像，页面用 JavaScript 进程内对象形成最多 60 点会话图，
   实体消失时立即 prune；不使用 `localStorage`/`sessionStorage`，刷新即丢失。这项变化
@@ -830,8 +833,8 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **回归覆盖**：`dashboardtrend` 单测固定 60 点上限、实体清理、稳定 Top 8 与 remainder
   平均值；WebUI 组件测试固定图表顺序、指标亲和、零 `<table>`、无浏览器持久化和无新增
   API；真实 Chrome `TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends`
-  在 12 Worker/12 tenant 响应下验证 legend≤9、`Other (avg)`、至少两个会话采样、
-  Performance 共置和页面零表格。
+  在 12 Worker/12 tenant 响应下验证 legend≤9、`Other (avg)`、grid/dense/滚动样式、
+  所有 legend item 几何不相交、至少两个会话采样、Performance 共置和页面零表格。
 
 ### RESULT-001：每节点完成流放大 Raft 日志
 
@@ -1548,6 +1551,41 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
 - **回归覆盖**：组件测试固定 sidebar token、无阴影外壳、group/图标和 48px rail；真实
   Chrome 检查 computed background/shadow/radius/accent/toggle 尺寸，同时重跑双栏折叠、
   刷新恢复、tenant/capacity/quick load/Load Lab 与排空。
+
+### UI-LOAD-007：专用 Load Generator Pod 承担发压
+
+- **需求与角色边界**：浏览器不再构造十万条 task、维护批次数组或占用同源 HTTP 连接。
+  它只向任意 control 的 `/api/v1/load-runs` 提交一个小参数文档；control 用固定内部地址
+  反向代理到一个专用 `loadgen` 进程。Helm 部署恰好一个 stateless Load Generator
+  Deployment/Service；该进程不加入 Raft、不持有 FSM/Queue/PVC、不接收 allocation，也
+  不执行业务 Processor。Raft Leader 仍是唯一选择 task→Worker ownership 并提交状态的
+  control。
+- **负载与安全边界**：Load Generator 在 Pod 内生成稳定
+  `load-lab-001..100`、quota/load shape、跨 tenant round-robin、最多 20 个 wave 和
+  batch=1000；单次最多 100 tenant、每 tenant 5000、合计 100000 task。已有 tenant 的
+  quick load 只验证 ID，不改 Limit。生成池存在 unfinished 时拒绝覆盖。AIMD
+  `Auto 8→16` 或固定 4/8/16/32 只控制客户端提交并发；服务端
+  SUBMIT-006 Apply slot/queue/429 继续是共识入口的最终容量边界。
+- **任务正确性与故障模型**：每条任务使用 `runID:tenant:index` 幂等键并且仍走生产
+  tenant PUT 和 `/api/v1/tasks/batch`。未知/429/503 结果只重试一次，同一个键避免重复
+  durable task。Stop 只阻止尚未开始的 batch；已经 accepted 的 task 继续由 Raft/Worker
+  排空。Load Generator 或浏览器失联不撤销 committed work，Worker/Leader 故障仍走既有
+  lease、重派和 exactly-once final commit。
+- **状态与存储**：run progress 是 Load Generator 进程内的一个 current-state mirror，
+  通过 `/api/v1/load-runs/current` 每秒读取；不是 174 点历史，不写 Raft/FSM/Snapshot、
+  浏览器存储或 PVC。为避免 Service 随机路由到不同内存镜像，Chart 强制单副本。Pod
+  重启会丢失 progress/Stop 控制，但不会丢失已经 durable accepted 的 tenant/task；
+  本轮明确不实现可恢复的场景编排历史。
+- **非目标**：这不是新的调度协议、benchmark 存储、任意脚本执行接口、文件批量导入，
+  也不自动修改 HPA、tenant Limit 或 Worker Pod capacity。参数端点只接受有界 JSON，
+  不能上传已展开的 task 数组。
+- **回归覆盖**：`pkg/loadgen` 单测固定参数上限、稳定 ID、round-robin/wave、并发 tenant
+  准备、Pod 内 rolling batch、退避/幂等、共享池忙时拒绝和 current API；
+  API/Chart 单测固定透明代理、未配置 503、单副本 stateless Deployment 及 rollout
+  等待。真实 Chrome 证明页面只发 parameter run、零直接 task batch，并验证 20000 条
+  workload 的并发发生在 fake Load Generator；真实
+  `TestDedicatedLoadGeneratorThroughFollowerRaftAndWorkers` 从专用 HTTP handler 经
+  Follower、三节点 Raft、Allocator/Worker 到 durable done，断言每 task 只执行一次。
 
 ### TENANT-001：空闲时原子清除全部租户配置
 
