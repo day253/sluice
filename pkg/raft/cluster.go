@@ -24,6 +24,8 @@ import (
 // not extend the quorum critical path.
 const DefaultMaxVoters = 5
 
+const defaultRaftLogCompactionThresholdBytes int64 = 64 << 20
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -36,6 +38,10 @@ type ClusterConfig struct {
 	DataDir         string // directory for Raft logs, stable store, snapshots
 	Bootstrap       bool   // true = create a single-node cluster
 	Logger          *zap.Logger
+	// LogCompactionThresholdBytes controls offline BoltDB compaction before
+	// Raft opens its log store. Zero selects the production default. Tests may
+	// lower it to reproduce long-running free-page growth without huge files.
+	LogCompactionThresholdBytes int64
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +85,27 @@ func NewCluster(cfg ClusterConfig) (*Cluster, error) {
 
 	// ---- log store (BoltDB) ----
 	logStorePath := filepath.Join(cfg.DataDir, "raft-log.db")
+	compactionThreshold := cfg.LogCompactionThresholdBytes
+	if compactionThreshold == 0 {
+		compactionThreshold = defaultRaftLogCompactionThresholdBytes
+	}
+	if compactionThreshold > 0 {
+		if result, compactErr := compactBoltStore(logStorePath, compactionThreshold); compactErr != nil {
+			// Compaction is an offline storage optimization. Its temporary copy
+			// never replaces the source unless fully synced, so a failure can
+			// safely fall back to the original durable log.
+			logger.Warn("raft log: startup compaction skipped",
+				zap.String("path", logStorePath),
+				zap.Error(compactErr))
+		} else if result.Compacted {
+			logger.Info("raft log: startup compaction complete",
+				zap.String("path", logStorePath),
+				zap.Int64("before_bytes", result.BeforeBytes),
+				zap.Int64("after_bytes", result.AfterBytes),
+				zap.Int64("reclaimed_bytes", result.BeforeBytes-result.AfterBytes),
+				zap.Duration("duration", result.Duration))
+		}
+	}
 	logStore, err := raftboltdb.New(raftboltdb.Options{Path: logStorePath})
 	if err != nil {
 		return nil, fmt.Errorf("bolt log store: %w", err)

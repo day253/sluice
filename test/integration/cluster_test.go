@@ -32,6 +32,7 @@ import (
 
 	"github.com/go-logr/logr"
 	hashicorpraft "github.com/hashicorp/raft"
+	bolt "go.etcd.io/bbolt"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -95,6 +96,7 @@ type testCluster struct {
 	disableVoterReconciliation  bool
 	allocatorInterval           time.Duration
 	submissionApplyLimit        int
+	raftLogCompactionThreshold  int64
 	leaderElectionRetryInterval time.Duration
 
 	mu      sync.Mutex
@@ -526,17 +528,18 @@ func (tc *testCluster) recreateAllForRestart() {
 	}
 	for i := range tc.nodes {
 		nd, err := node.New(node.Config{
-			NodeID:                      fmt.Sprintf("node-%d", i),
-			APIAddress:                  tc.httpAddrs[i],
-			RaftAddress:                 tc.raftAddrs[i],
-			DataDir:                     tc.dirs[i],
-			Bootstrap:                   i == 0,
-			TotalWorkers:                tc.workers,
-			MaxRaftVoters:               tc.maxVoters,
-			DisableVoterReconciliation:  tc.disableVoterReconciliation,
-			AllocatorInterval:           tc.allocatorInterval,
-			SubmissionApplyLimit:        tc.submissionApplyLimit,
-			LeaderElectionRetryInterval: tc.leaderElectionRetryInterval,
+			NodeID:                          fmt.Sprintf("node-%d", i),
+			APIAddress:                      tc.httpAddrs[i],
+			RaftAddress:                     tc.raftAddrs[i],
+			DataDir:                         tc.dirs[i],
+			Bootstrap:                       i == 0,
+			TotalWorkers:                    tc.workers,
+			MaxRaftVoters:                   tc.maxVoters,
+			DisableVoterReconciliation:      tc.disableVoterReconciliation,
+			AllocatorInterval:               tc.allocatorInterval,
+			SubmissionApplyLimit:            tc.submissionApplyLimit,
+			RaftLogCompactionThresholdBytes: tc.raftLogCompactionThreshold,
+			LeaderElectionRetryInterval:     tc.leaderElectionRetryInterval,
 		}, tc.proc, logger)
 		if err != nil {
 			tc.tb.Fatalf("recreate node-%d: %v", i, err)
@@ -4487,6 +4490,171 @@ func TestStaggeredFullClusterRestartKeepsVotersAliveAcrossElectionRetryWindows(t
 	}, 30*time.Second, "staggered restart task final state")
 	if count := tc.proc.processedTaskCount(task.TaskID); count != 1 {
 		t.Fatalf("staggered restart task processed %d times, want once", count)
+	}
+}
+
+// TestFragmentedRaftLogCompactsBeforeMultiNodeRecovery preserves STORAGE-001.
+// Long-running BoltDB files retain free pages after Raft snapshots delete old
+// log entries. Every voter must atomically compact its closed store before
+// mapping it, then recover the same FSM and accept new work through the real
+// follower HTTP -> Leader Raft -> Worker -> final-state path.
+func TestFragmentedRaftLogCompactsBeforeMultiNodeRecovery(t *testing.T) {
+	tc := newTestCluster(t, 3, 20)
+	defer tc.shutdown()
+
+	leader := tc.leaderIdx()
+	if leader < 0 {
+		t.Fatal("no leader before fragmented-log restart")
+	}
+	follower := (leader + 1) % len(tc.nodes)
+	client := &http.Client{Timeout: 5 * time.Second}
+	tenantBody := []byte(`{"name":"Storage recovery","max_workers":20}`)
+	tenantRequest, err := http.NewRequest(
+		http.MethodPut,
+		"http://"+tc.httpAddrs[follower]+"/api/v1/admin/tenants/storage-recovery",
+		bytes.NewReader(tenantBody),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantRequest.Header.Set("Content-Type", "application/json")
+	tenantResponse, err := client.Do(tenantRequest)
+	if err != nil {
+		t.Fatalf("tenant PUT through follower: %v", err)
+	}
+	_ = tenantResponse.Body.Close()
+	if tenantResponse.StatusCode != http.StatusOK {
+		t.Fatalf("tenant PUT status = %d, want 200", tenantResponse.StatusCode)
+	}
+	tc.waitAllocation(10 * time.Second)
+
+	beforeBody := []byte(`{"tenant_id":"storage-recovery","payload":{"phase":"before"}}`)
+	beforeResponse, err := client.Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks",
+		"application/json",
+		bytes.NewReader(beforeBody),
+	)
+	if err != nil {
+		t.Fatalf("pre-restart POST through follower: %v", err)
+	}
+	var beforeTask types.TaskResponse
+	if err := json.NewDecoder(beforeResponse.Body).Decode(&beforeTask); err != nil {
+		_ = beforeResponse.Body.Close()
+		t.Fatalf("decode pre-restart task: %v", err)
+	}
+	_ = beforeResponse.Body.Close()
+	if beforeResponse.StatusCode != http.StatusAccepted {
+		t.Fatalf("pre-restart POST status = %d, want 202", beforeResponse.StatusCode)
+	}
+	tc.waitFor(func() bool {
+		result := tc.fsms().GetResult(beforeTask.TaskID)
+		return result != nil && result.Status == types.TaskStatusDone
+	}, 30*time.Second, "pre-restart task final state")
+
+	tc.stopAllForRestart()
+	beforeSizes := make([]int64, len(tc.dirs))
+	for index, directory := range tc.dirs {
+		logPath := filepath.Join(directory, "raft", "raft-log.db")
+		inflateClosedBoltWithFreePages(t, logPath)
+		info, statErr := os.Stat(logPath)
+		if statErr != nil {
+			t.Fatalf("stat fragmented voter %d: %v", index, statErr)
+		}
+		beforeSizes[index] = info.Size()
+		if info.Size() < 32<<20 {
+			t.Fatalf("fragmented voter %d size = %d, want at least 32MiB", index, info.Size())
+		}
+	}
+
+	tc.raftLogCompactionThreshold = 1
+	tc.recreateAllForRestart()
+	for index, directory := range tc.dirs {
+		info, statErr := os.Stat(filepath.Join(directory, "raft", "raft-log.db"))
+		if statErr != nil {
+			t.Fatalf("stat compacted voter %d: %v", index, statErr)
+		}
+		if info.Size() >= beforeSizes[index]/2 {
+			t.Fatalf("voter %d compacted size = %d, fragmented = %d",
+				index, info.Size(), beforeSizes[index])
+		}
+	}
+	for index := range tc.nodes {
+		go func(nodeIndex int) { _ = tc.nodes[nodeIndex].Start() }(index)
+	}
+	tc.waitAnyLeader(30 * time.Second)
+	tc.waitNodes(3, 10*time.Second)
+	tc.waitFor(func() bool {
+		result := tc.fsms().GetResult(beforeTask.TaskID)
+		return result != nil && result.Status == types.TaskStatusDone
+	}, 10*time.Second, "pre-compaction final state survives")
+
+	leader = tc.leaderIdx()
+	follower = (leader + 1) % len(tc.nodes)
+	afterBody := []byte(`{"tenant_id":"storage-recovery","payload":{"phase":"after"}}`)
+	afterResponse, err := client.Post(
+		"http://"+tc.httpAddrs[follower]+"/api/v1/tasks",
+		"application/json",
+		bytes.NewReader(afterBody),
+	)
+	if err != nil {
+		t.Fatalf("post-restart POST through follower: %v", err)
+	}
+	defer afterResponse.Body.Close()
+	if afterResponse.StatusCode != http.StatusAccepted {
+		data, _ := io.ReadAll(afterResponse.Body)
+		t.Fatalf("post-restart POST status = %d, want 202; body=%s",
+			afterResponse.StatusCode, data)
+	}
+	var afterTask types.TaskResponse
+	if err := json.NewDecoder(afterResponse.Body).Decode(&afterTask); err != nil {
+		t.Fatalf("decode post-restart task: %v", err)
+	}
+	tc.waitFor(func() bool {
+		result := tc.fsms().GetResult(afterTask.TaskID)
+		return result != nil && result.Status == types.TaskStatusDone
+	}, 30*time.Second, "post-compaction task final state")
+	if count := tc.proc.processedTaskCount(beforeTask.TaskID); count != 1 {
+		t.Fatalf("pre-compaction task processed %d times, want once", count)
+	}
+	if count := tc.proc.processedTaskCount(afterTask.TaskID); count != 1 {
+		t.Fatalf("post-compaction task processed %d times, want once", count)
+	}
+}
+
+func inflateClosedBoltWithFreePages(t *testing.T, path string) {
+	t.Helper()
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("open closed Raft log for fragmentation: %v", err)
+	}
+	defer db.Close()
+
+	const bucketName = "storage-001-fragmentation"
+	payload := bytes.Repeat([]byte("f"), 1<<20)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		bucket, createErr := tx.CreateBucket([]byte(bucketName))
+		if createErr != nil {
+			return createErr
+		}
+		for index := 0; index < 48; index++ {
+			if putErr := bucket.Put(
+				[]byte(fmt.Sprintf("discarded-%03d", index)),
+				payload,
+			); putErr != nil {
+				return putErr
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("inflate closed Raft log: %v", err)
+	}
+	if err := db.Update(func(tx *bolt.Tx) error {
+		return tx.DeleteBucket([]byte(bucketName))
+	}); err != nil {
+		t.Fatalf("delete fragmentation bucket: %v", err)
+	}
+	if err := db.Sync(); err != nil {
+		t.Fatalf("sync fragmented Raft log: %v", err)
 	}
 }
 

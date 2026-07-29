@@ -53,6 +53,9 @@ type Config struct {
 	// SubmissionApplyLimit bounds unresolved Submit Raft Apply futures on the
 	// Leader. Zero selects grpc.DefaultSubmissionApplyLimit.
 	SubmissionApplyLimit int
+	// RaftLogCompactionThresholdBytes overrides the closed-store startup
+	// compaction threshold. Zero selects the production default.
+	RaftLogCompactionThresholdBytes int64
 	// LoadGeneratorAddress is the fixed, non-Raft HTTP endpoint used only to
 	// proxy synthetic workload parameters from the dashboard.
 	LoadGeneratorAddress string
@@ -137,12 +140,13 @@ func New(cfg Config, processor worker.Processor, logger *zap.Logger) (*Node, err
 
 	// ---- Raft cluster ----
 	raftCfg := raftpkg.ClusterConfig{
-		NodeID:          cfg.NodeID,
-		RaftAddress:     cfg.RaftAddress,
-		RaftBindAddress: cfg.RaftBindAddress,
-		DataDir:         cfg.DataDir + "/raft",
-		Bootstrap:       cfg.Bootstrap,
-		Logger:          logger,
+		NodeID:                      cfg.NodeID,
+		RaftAddress:                 cfg.RaftAddress,
+		RaftBindAddress:             cfg.RaftBindAddress,
+		DataDir:                     cfg.DataDir + "/raft",
+		Bootstrap:                   cfg.Bootstrap,
+		Logger:                      logger,
+		LogCompactionThresholdBytes: cfg.RaftLogCompactionThresholdBytes,
 	}
 	cluster, err := raftpkg.NewCluster(raftCfg)
 	if err != nil {

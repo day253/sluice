@@ -1587,6 +1587,36 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   `TestDedicatedLoadGeneratorThroughFollowerRaftAndWorkers` 从专用 HTTP handler 经
   Follower、三节点 Raft、Allocator/Worker 到 durable done，断言每 task 只执行一次。
 
+### STORAGE-001：Raft Bolt 日志启动压缩
+
+- **故障与数据边界**：Raft snapshot 会删除 snapshot index 之前的大部分 log key，但
+  BoltDB 只把页加入 freelist，不缩小 `raft-log.db`。远程约 129 万次 Apply 后，每个
+  voter 的 FSM snapshot 只有约 2.8 MiB，关闭后的日志文件却达到 1.5–1.7 GiB；启动
+  mmap/replay 的 cgroup current 达到 1.2–2.1 GiB，两个 2 GiB control 在 revision 76
+  rollout 时真实 `OOMKilled`。这份文件是 durable Raft log store，不是指标历史，也
+  不能通过删除 tenant/task 或丢 PVC 来“恢复”。
+- **压缩协议**：只在进程启动、Hashicorp Raft/Bolt store 尚未打开时检查关闭的
+  `raft-log.db`。生产门槛为文件至少 64 MiB，并且按 Bolt bucket allocation 估算可回收
+  空间至少 64 MiB且超过文件 25%。满足时把全部 live bucket/key/value 复制到同目录
+  `.compact` 临时库，完整 `Sync`、关闭 source 后原子 rename，再 fsync 父目录；只有
+  完整副本能够替换源文件。遗留临时文件在下一次启动删除。压缩失败记录 warning 并继续
+  打开原始 durable store，不能把空间优化变成集群不可用。
+- **正确性和故障模型**：压缩不解释或改写 Raft entry、term/index、stable store、FSM
+  snapshot、membership、task lifecycle 或 idempotency key。单 voter 启动压缩期间只是
+  尚未加入 quorum；其余 voter 继续服务。进程在复制、sync 或 rename 前崩溃时源文件
+  不变；rename 后的文件已经完整同步。全控制面重启时每个 voter 独立压缩自己的同源日志，
+  随后仍按正常选举、Follower 转发、Leader Apply、Worker execution 和 exactly-once
+  final commit 恢复。
+- **可观测性与非目标**：成功日志固定输出 path、before/after/reclaimed bytes 和 duration；
+  失败输出原因但不输出 log 内容。该诊断是启动时 process log，不写 Raft/FSM/snapshot
+  或 174 点历史。本轮不改变 snapshot threshold/trailing logs，不做在线压缩、不压缩
+  stable/queue DB，也不以临时增加 cgroup 上限掩盖长期文件膨胀。
+- **回归覆盖**：Raft 单测构造写入后删除的大 payload logs，断言文件显著缩小、最后一个
+  term/index/data 完整且临时文件消失，并固定 live store 不被无意义重写。真实三 voter
+  integration 经 Follower HTTP 提交并完成任务，全停机后给每个关闭的生产 Raft Bolt
+  store 制造超过 32 MiB free-page 膨胀，重新创建节点触发原子压缩，验证三份文件缩小、
+  旧 final state 保留、重新选主后 Follower HTTP 新任务仍只执行一次。
+
 ### TENANT-001：空闲时原子清除全部租户配置
 
 - **需求边界**：左侧配置栏提供一个 `Clear all tenants` 危险操作。浏览器只发一次

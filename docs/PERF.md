@@ -1453,3 +1453,44 @@ Load Generator fake process，最大并发 16，浏览器直接 `/tasks/batch` �
 客户端职责/连接隔离证据，不与生产吞吐数字混比。远程部署后应另记同一 100 tenant×200
 形状的 Pod-side accepted/drain、Create Apply、submission queue/pressure 和最终
 unfinished，再与 revision 75 动态拓扑结果分栏比较。
+
+## 2026-07-30：STORAGE-001 Raft Bolt 启动压缩
+
+revision 76 首次部署 `067ab72-20260729154455` 时，远程完整非 race
+`go test ./...` 通过，integration 为 327.520s，Helm 76 和全部 workload 已 rollout；
+但 persisted-state 稳定性门禁正确阻断发布完成：`sluice-sluice-3/4` 各发生一次
+`OOMKilled`。远程仍是 Tiger ThinkPad L14 Gen 2、单机 MicroK8s、5 voter/0
+non-voter、90 个 stateless Worker、control limit 2 CPU/2 GiB。故障时五份 FSM
+snapshot 约 2.8 MiB，而 `raft-log.db` 为 1.5–1.7 GiB；恢复后的 control cgroup
+current 分别约 1.69、1.97、1.26、1.46、1.13 GiB（采样顺序会受 mmap page fault
+变化），其中一个后续采样已接近 2 GiB 上限。该轮未执行 workload baseline，不能把
+Helm Ready 当成稳定发布。
+
+STORAGE-001 在 Raft 打开前对满足 `file>=64MiB && reclaimable>=64MiB &&
+reclaimable/file>=25%` 的关闭 Bolt log 做同步临时副本和原子替换。成功时记录
+before/after/reclaimed/duration，失败保留源库继续启动；它不改变 Apply、snapshot、
+task 或 Worker 路径。本地 focused unit 通过；真实 3-voter integration 给每份关闭日志
+制造至少 32 MiB free-page 膨胀，三份均在 Node 创建时缩小到原文件一半以下，重新选主
+后旧 final state 保留，新 Follower HTTP task 在 8.81s Case 内 exactly-once 完成。
+
+完整 `make test` 在 Apple M4 Pro、14 logical CPU、48 GiB、darwin/arm64、Go 1.26.5
+上以 `-race -count=1` 通过，真实 integration 为 435.185s；其中 STORAGE-001 Case
+为 8.81s。相同测试进程内的固定 PERF-001 仍为 7 replica（3 voter/4 non-voter）、
+每进程 80 槽、4 tenant×Limit 120、20000 个约 10ms 小 JSON task、Follower HTTP、
+batch=1000/concurrency=1：
+
+| 阶段 | UI-LOAD-007 | STORAGE-001 |
+|---|---:|---:|
+| durable submit | 2.832s | 2.599s |
+| accepted 后排空 | 10.800s | 11.601s |
+| 端到端 | 13.632s（1467.1 task/s） | 14.200s（1408.4 task/s） |
+| 错误 / unfinished / 重复执行 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+本轮固定 Case 使用新进程/小日志，未满足 64 MiB 门槛，因此 steady-state 路径与上轮相同。
+submit 快约 8.2%、排空慢约 7.4%、端到端慢约 4.2%，方向相反且协议/请求形状没有变化，
+按选举、磁盘和本机调度噪声记录，不能宣称启动压缩改善或降低 steady-state 吞吐。
+
+由于这是启动/恢复存储路径，仍需在修复镜像远程 rollout 后记录五份 before/after、
+启动峰值/重启次数，并重跑同形 100 tenant×200 Pod-side baseline。该结果将与
+revision 75 的浏览器流水线分栏：客户端已从 Mac 浏览器迁到集群 Pod，拓扑和请求来源
+不同，不能宣称百分比改善。
