@@ -16,6 +16,7 @@ import (
 
 	"github.com/chromedp/chromedp"
 
+	"github.com/day253/sluice/internal/testutil"
 	"github.com/day253/sluice/pkg/loadgen"
 )
 
@@ -35,7 +36,7 @@ type loadLabBrowserAPI struct {
 	startedBeforeFirstSubmitEnded int
 	firstSubmitEnded              bool
 	submitDelay                   time.Duration
-	firstSubmitDelay              time.Duration
+	submitGate                    *testutil.OverlapGate
 	loadManager                   *loadgen.Manager
 	loadHandler                   http.Handler
 	loadRunRequests               int
@@ -242,9 +243,6 @@ func (a *loadLabBrowserAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			a.startedBeforeFirstSubmitEnded++
 		}
 		delay := a.submitDelay
-		if requestIndex == 0 && a.firstSubmitDelay > 0 {
-			delay = a.firstSubmitDelay
-		}
 		a.mu.Unlock()
 		if delay > 0 {
 			time.Sleep(delay)
@@ -323,10 +321,15 @@ func (a *loadLabBrowserAPI) SubmitBatch(
 		a.startedBeforeFirstSubmitEnded++
 	}
 	delay := a.submitDelay
-	if requestIndex == 0 && a.firstSubmitDelay > 0 {
-		delay = a.firstSubmitDelay
-	}
+	gate := a.submitGate
 	a.mu.Unlock()
+	// Holding the early batches inside the gate makes the observed peak a
+	// consequence of the rolling ingress instead of the test machine's speed:
+	// a correct pipeline fills the gate immediately, a serial or wave-barrier
+	// one can only let it time out.
+	if gate != nil {
+		gate.Arrive(requestIndex)
+	}
 	if delay > 0 {
 		time.Sleep(delay)
 	}
@@ -467,7 +470,10 @@ func TestWorkerPodLoadBrowserBuildsBoundedSessionChart(t *testing.T) {
 	defer cancelAllocator()
 	browserContext, cancelBrowser := chromedp.NewContext(allocator)
 	defer cancelBrowser()
-	ctx, cancel := context.WithTimeout(browserContext, 15*time.Second)
+	// Deliberately wider than the work itself: a -race browser test shares a
+	// 2 vCPU CI runner with every other package's test binary, and the inner
+	// waits below stay condition-based with their own deadlines.
+	ctx, cancel := context.WithTimeout(browserContext, 45*time.Second)
 	defer cancel()
 
 	var state struct {
@@ -492,8 +498,17 @@ func TestWorkerPodLoadBrowserBuildsBoundedSessionChart(t *testing.T) {
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
 		chromedp.WaitVisible("#worker-cpu-session-chart", chromedp.ByQuery),
-		chromedp.Sleep(1200*time.Millisecond),
-		chromedp.Evaluate(`(() => {
+	); err != nil {
+		t.Fatal(err)
+	}
+	// The dashboard samples the session history on its own timer, so wait for
+	// the samples the assertions need instead of sleeping a fixed amount that a
+	// loaded CI runner can outrun.
+	waitForBrowserExpression(t, ctx,
+		`Boolean(S.sessionHistory.workers["worker-2"] && S.sessionHistory.workers["worker-2"].cpu.length >= 2)`,
+		20*time.Second,
+	)
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`(() => {
 			const panel = document.querySelector("#worker-session-panel");
 			const link = panel.querySelector(".json-link");
 			return {
@@ -684,7 +699,7 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 	defer cancelAllocator()
 	browserContext, cancelBrowser := chromedp.NewContext(allocator)
 	defer cancelBrowser()
-	ctx, cancel := context.WithTimeout(browserContext, 15*time.Second)
+	ctx, cancel := context.WithTimeout(browserContext, 45*time.Second)
 	defer cancel()
 
 	var state struct {
@@ -730,8 +745,16 @@ func TestDashboardBrowserGroupsChartsBoundsLabelsAndSamplesSessionTrends(t *test
 	if err := chromedp.Run(ctx,
 		chromedp.Navigate(server.URL),
 		chromedp.WaitVisible("#tenant-allocation-session-chart", chromedp.ByQuery),
-		chromedp.Sleep(2200*time.Millisecond),
-		chromedp.Evaluate(`(() => {
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Session series are filled by the dashboard's own sampling timer; wait for
+	// the two samples the assertions require instead of a fixed sleep.
+	waitForBrowserExpression(t, ctx,
+		`Boolean(S.sessionHistory.workers["worker-00"] && S.sessionHistory.workers["worker-00"].cpu.length >= 2 && S.sessionHistory.tenants["tenant-00"] && S.sessionHistory.tenants["tenant-00"].allocated.length >= 2)`,
+		20*time.Second,
+	)
+	if err := chromedp.Run(ctx, chromedp.Evaluate(`(() => {
 			const charts = document.querySelector("#primary-charts");
 			const session = document.querySelector("#session-charts");
 			const performanceCards = document.querySelectorAll(".performance-chart");
@@ -1161,7 +1184,10 @@ func TestLoadLabBrowserUsesRollingSubmissionConcurrency(t *testing.T) {
 	}
 	api := newLoadLabBrowserAPI()
 	api.submitDelay = 20 * time.Millisecond
-	api.firstSubmitDelay = 400 * time.Millisecond
+	// SUBMIT-007: 20 batches at concurrency 16 must overlap because the ingress
+	// really holds 16 batches in flight, not because this machine happened to
+	// schedule them before the first one finished.
+	api.submitGate = testutil.NewOverlapGate(16, 20, 3*time.Second)
 	server := httptest.NewServer(Handler(api))
 	defer server.Close()
 
@@ -1211,14 +1237,15 @@ func TestLoadLabBrowserUsesRollingSubmissionConcurrency(t *testing.T) {
 	loadRunRequests := api.loadRunRequests
 	directTaskBatches := api.directTaskBatchRequests
 	api.mu.Unlock()
+	overlapMiss, totalMiss := api.submitGate.Missed()
 	if submitted != 20_000 || requests != 20 ||
 		maxActive != 16 || startedBeforeFirstEnded != 20 ||
 		configuredConcurrency != 16 || loadRunRequests != 1 ||
-		directTaskBatches != 0 {
+		directTaskBatches != 0 || overlapMiss || totalMiss {
 		t.Fatalf(
-			"Pod rolling submits tasks=%d requests=%d configured=%d max-active=%d before-slow-first-ended=%d parameter-runs=%d direct-browser-batches=%d",
+			"Pod rolling submits tasks=%d requests=%d configured=%d max-active=%d before-first-ended=%d parameter-runs=%d direct-browser-batches=%d overlap-miss=%v total-miss=%v",
 			submitted, requests, configuredConcurrency, maxActive, startedBeforeFirstEnded,
-			loadRunRequests, directTaskBatches,
+			loadRunRequests, directTaskBatches, overlapMiss, totalMiss,
 		)
 	}
 }
@@ -1510,6 +1537,30 @@ func waitForLoadLabStatus(t *testing.T, ctx context.Context, want string, deadli
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("Load Lab status = %q, want %q", got, want)
+}
+
+// waitForBrowserExpression polls a page condition until it becomes truthy. It
+// replaces fixed sleeps so a slow or loaded browser machine extends the wait
+// instead of turning into a spurious failure, while the deadline keeps a real
+// regression (data that never arrives) failing in bounded time.
+func waitForBrowserExpression(
+	t *testing.T, ctx context.Context, expression string, deadline time.Duration,
+) {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	var ready bool
+	var lastErr error
+	for time.Now().Before(end) {
+		lastErr = chromedp.Run(ctx, chromedp.Evaluate(expression, &ready))
+		if lastErr == nil && ready {
+			return
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("browser context ended while waiting for %s: %v", expression, lastErr)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("browser condition %s not met within %s: %v", expression, deadline, lastErr)
 }
 
 func findChrome() string {

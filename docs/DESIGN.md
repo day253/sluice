@@ -1034,8 +1034,10 @@ Worker 恢复为自发抢任务。当前版本不实现跨 shard 事务、公平
   要求同时进入 Raft 的调用恰好为 2；deadline 测试要求等待者未 Apply；有界队列测试要求
   第 6 个调用在 `limit=1` 时得到 ResourceExhausted。metrics/API/Chart 测试固定指标、
   429 映射和三种 control 启动路径。纯 JS 测试固定 AIMD/手动模式；真实 Chrome
-  `TestLoadLabBrowserUsesRollingSubmissionConcurrency` 用一个慢首请求证明 20 个 batch
-  均在它结束前启动。真实三 voter `TestConcurrentFullHTTPBatchesRetainRaftIngress`
+  `TestLoadLabBrowserUsesRollingSubmissionConcurrency` 用 SUBMIT-007 的受控重叠门证明
+  进程内 rolling ingress 真的同时保持 16 个 batch 在飞，并让 20 个 batch 全部在第一个
+  结束前启动（原先靠“慢首请求加调度运气”观测峰值，在 2 vCPU runner 上会误报 15）。
+  真实三 voter `TestConcurrentFullHTTPBatchesRetainRaftIngress`
   以 `limit=2` 经两个 Follower 提交 4×1000，要求配置镜像、队列归零、4 次 Create
   和全部任务 exactly once。
 
